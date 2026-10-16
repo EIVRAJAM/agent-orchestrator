@@ -79,6 +79,13 @@ flipped, so a change fails closed and loudly instead of exporting silently.
       propagation from aliases in blocks/functions/callbacks, destructuring
       write targets, and `++`/`--`/`delete` distinguished from read-only unary
       operators.
+  12. `89d925b5d` — call arguments linked to parameters (declaration/arrow/
+      expression, alias chains, rest), `for`/`for…of`/`for…in` header
+      bindings modelled as their own scopes, and named function expressions
+      binding their own name.
+  13. `87fc8276d` — call arguments linked to parameters through default values
+      and object/array destructuring patterns, integrated with the call
+      fixpoint.
 
 ## 3. Inventory of mechanisms
 
@@ -329,14 +336,44 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      (`Object.assign`/`Object.defineProperty`/`Reflect.set`) on the helper
      invalidates it, **and** the invalidation propagates to every identifier alias
      that shares the object, at **any scope depth** (a block, a function, a
-     callback), including alias chains and cycles. Bindings are identified by
-     their declaration, not by text, so same-text bindings in different scopes
-     stay distinct: shadowing neither hides a real mutation nor invalidates an
-     unrelated helper, and an alias that is never written invalidates nothing.
-     Unmutated aliases stay trusted (`const p = path; p.resolve(__dirname, "src")`
-     works). A mutation observed anywhere in a function is propagated even if the
-     function is not proven to run (conservative). `new URL` is trusted only as
-     the un-shadowed global or a `node:url`/`url` import.
+     callback, a loop header), including alias chains and cycles. Bindings are
+     identified by their declaration, not by text, so same-text bindings in
+     different scopes (including a loop header's binding) stay distinct:
+     shadowing neither hides a real mutation nor invalidates an unrelated helper,
+     and an alias that is never written invalidates nothing. Unmutated aliases
+     stay trusted (`const p = path; p.resolve(__dirname, "src")` works).
+   - **scopes**: the module, blocks, function bodies, `switch` case blocks,
+     `catch` clauses and `for`/`for…of`/`for…in` headers. A `var` belongs to the
+     nearest function; `let`/`const` to the nearest block or loop header. Classes
+     and static blocks are covered through their method bodies and static-block
+     `Block`; a named function expression binds its own name inside its body.
+   - **argument → parameter**: for a statically-resolvable local function
+     (declaration, arrow or function expression assigned to a binding, plus simple
+     alias chains), a direct call relates its arguments to parameters by
+     declaration identity, covering:
+     - **identifier parameters** bound to a positional argument;
+     - **default values**: when the argument is absent the parameter is bound to
+       its initializer, so `function f(helper = path) { helper.resolve = … }
+       f()` invalidates `path`. A default that names an earlier parameter follows
+       left-to-right evaluation order (`(first = path, second = first)`); a
+       reference to a later or ambiguous parameter is not trusted;
+     - **object and array patterns** matched structurally against a static object
+       or array literal (inline or one level of a `const` literal initializer),
+       including renamed properties (`{ source: helper }`), nested patterns,
+       omitted elements and defaults inside the pattern. Only static keys
+       (identifier, string, numeric) are matched; a spread, a computed key, a
+       rest element (a shallow copy, not an alias) or an unresolvable structure
+       yields no relation rather than a guessed one. A mutation of one binding
+       invalidates only its corresponding value.
+     A mutation of a parameter binding (or an alias of it) invalidates the value
+     it was bound to, with a fixpoint over call chains (`outer(path)` →
+     `inner(h)`, including a forwarded destructured binding). A rest *parameter*
+     invalidates every remaining identifier argument (conservative). A callee
+     that is not an identifier binding (dynamic, a member access, a higher-order
+     callback) is not attributed, and a call with a spread argument is not mapped
+     positionally. A mutation is propagated even if the function is not proven to
+     run (conservative). `new URL` is trusted only as the
+     un-shadowed global or a `node:url`/`url` import.
    - **`__dirname` / `__filename`**: treated as an implicit base only when not
      declared, shadowed or reassigned; a static local `const` is resolved and
      analysed (a `const __dirname = "node_modules/@sentry"` is caught), while a
@@ -428,7 +465,27 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    object destructuring write to a helper member, directly or through an alias
    (fail) versus normal destructuring (pass); **unary operators** — prefix and
    postfix `++`/`--` and `delete` (fail) versus `void`/`typeof`/`!`/`+`/`-`/`~`
-   (pass); **`__dirname`/`__filename`** — the
+   (pass); **argument → parameter** — a parameter mutation in a function
+   declaration, arrow, function expression, through a parameter alias or
+   `Object.assign`, in a call chain, and a shadowed function binding (fail)
+   versus a read-only parameter, a function mutating an independent object, two
+   same-name functions in different scopes, and a dynamic callee (pass);
+   **default values** — mutating a defaulted parameter (identifier default,
+   `Object.assign`, or a default naming an earlier parameter) invalidates the
+   default (fail) versus a read-only default, an explicit independent argument
+   that avoids the default, and an independent default (pass); **destructured
+   parameters** — an object/array pattern, a renamed property, a nested pattern,
+   a default inside the pattern, a forwarded call chain and `Object.assign` on an
+   extracted binding (fail) versus a read-only pattern, an independent property
+   or array element mutated beside the helper, and an explicit argument
+   overriding a pattern default (pass);
+   **loop scopes** — a mutated `for` header alias, `for…of [path]`, a nested loop
+   alias and `Object.assign` on a loop alias (fail) versus an independent
+   same-name outer binding, a function-scoped `var`, two homonymous loops, and a
+   read-only loop (pass); **class static blocks / named function expressions** —
+   a class static block that mutates the import (fail) versus a static-block
+   local and a named function expression whose name shadows the import (pass);
+   **`__dirname`/`__filename`** — the
    implicit bases and `import.meta.url` (pass) versus a local const pointing at
    an SDK, a mutable `let`, and a parameter (fail), plus a benign static local
    const (pass); **relative re-exports and Vitest** — a Vitest config re-exporting
@@ -480,18 +537,43 @@ mandatory part.
   `path`/`url` helper whose provenance is not a real `node:path`/`node:url`
   binding (or whose members are mutated), and to a `__dirname`/`__filename`
   rebound to a non-static value. Mutation invalidation propagates through
-  **identifier aliases at any scope depth** (blocks, functions, callbacks; chains
-  and cycles included) using declaration identity, so a mutated alias invalidates
-  the original helper. A mutation the scanner cannot attribute to a helper — a
-  target computed at runtime, or a member reachable only through a value the
-  scanner cannot resolve (e.g. an element access whose object comes from a
-  computed expression) — is not detected; such a case is rejected fail-closed when
-  it appears as an alias target, but a mutation hidden behind it is not. Further
-  deliberate limits: a destructuring *declaration* (`const { a } = x`) is a new
-  binding, not a write, so it never invalidates `x`; `Reflect.deleteProperty`,
-  computed property names on the assignment target itself and other exotic write
-  forms are not modelled; and a helper modelled only through a value the scanner
-  cannot follow is treated as unresolvable rather than trusted. The deliberate
+  **identifier aliases at any scope depth** (blocks, functions, callbacks, loop
+  headers; chains and cycles included) using declaration identity, and through
+  **call arguments linked to parameters** of statically-resolvable local
+  functions, so a mutated alias or parameter invalidates the original helper. A
+  mutation the scanner cannot attribute to a helper — a target computed at
+  runtime, or a member reachable only through a value the scanner cannot resolve
+  (e.g. an element access whose object comes from a computed expression) — is not
+  detected; such a case is rejected fail-closed when it appears as an alias
+  target, but a mutation hidden behind it is not. Further deliberate limits:
+  a destructuring *declaration* (`const { a } = x`) is a new binding, not a write,
+  so it never invalidates `x`; `Reflect.deleteProperty`, computed property names
+  on the assignment target itself and other exotic write forms are not modelled;
+  a `for…of`/`for…in` whose iterable is not an array literal has no element
+  attribution (the loop binding is still its own scope); a function invoked as a
+  callback by higher-order code, or whose reference is stored and called through
+  a member, is not linked to its arguments; a call with a spread argument is not
+  mapped positionally; a destructuring pattern matched against a non-literal, a
+  mutable or reassigned binding, a spread, a computed key or a rest element (a
+  shallow copy, not an alias) yields no relation; and a helper modelled only
+  through a value the scanner cannot follow is treated as unresolvable rather
+  than trusted.
+  **Reachability through a container is not modelled.** Storing a helper in an
+  array or object literal and mutating it through the container
+  (`const a = [path]; a[0].resolve = fake;` or
+  `const o = { p: path }; o.p.resolve = fake;`) is not detected, because the
+  container is not an identity alias of the helper and the guard deliberately
+  does not add a reachability relation (it would invalidate the helper on a
+  plain `a[0] = …` slot write and create false positives in valid configs).
+  The `for…of [path]` case *is* covered because each iteration binds the helper
+  itself, which is a true identity alias. Destructuring a literal that holds the
+  helper is also covered (the extracted binding *is* the helper), even one level
+  through a `const` literal initializer; only mutating *through* the container,
+  without extracting the helper into its own binding, is not. This is a
+  pre-existing limitation, not
+  a regression: the repo's own configs are static-guard-clean, and the threat
+  model is an accidental re-enable by a future change, not adversarial
+  obfuscation. The deliberate
   exception is Metro `resolver.resolveRequest`, a function the repo already uses,
   where a fully computed module name cannot be rejected without breaking it.
 - Upstream merges therefore still require **code review** and, where warranted,
@@ -516,7 +598,9 @@ environment):
   touched packages reports 0 issues; `go test ./internal/daemon/...` passes;
   the privacy tests assert the local-only sink, the blank Sentry DSN, and the
   closed policy assertion.
-- Frontend: `npm run typecheck` passes; the privacy/release-target tests pass.
+- Frontend: `npm run typecheck` passes (needs
+  `NODE_OPTIONS=--max-old-space-size=4096` in this memory-constrained container;
+  the default heap is OOM-killed); the privacy/release-target tests pass.
 - Mobile: `npm run typecheck` passes; the mobile privacy tests pass.
 - Guard: `scripts/privacy-guard.test.sh` passes (clean tree passes; the
   single-condition reintroductions — including the multiline, alias, and
@@ -539,10 +623,12 @@ fail-closed classification of alias targets, shorthand/spread/indirection),
 provenance), `0764a0c3` (`require` provenance, helper invalidation on member
 mutation, `__dirname`/`__filename`, Vite+Vitest discovery), `ff604abc`
 (helper mutation propagation through identifier aliases; writes restricted to
-assignment operators), and `07eea972` (scope-aware declaration-identity model:
+assignment operators), `07eea972` (scope-aware declaration-identity model:
 aliases in blocks/functions/callbacks, destructuring write targets, and
-`++`/`--`/`delete` vs read-only unary operators). None of those commits
-change the daemon
+`++`/`--`/`delete` vs read-only unary operators), `89d925b5d` (call arguments
+linked to parameters; `for`/`for…of`/`for…in` header scopes, named function
+expressions), and `87fc8276d` (arguments linked through default values and
+destructuring patterns). None of those commits change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
@@ -574,6 +660,29 @@ difference in this container). Both fail **identically on the base SHA**
 `7dceb0ec7` in an isolated worktree, and neither is in a file this change
 touches. They are recorded as environment/locale limitations, not as verified
 passes.
+
+### 8.1 Verification status matrix
+
+Statuses: **I** implemented · **VS** verified statically · **VT** verified by the
+automated tests · **VD** verified dynamically from the current HEAD · **P**
+pending (environment limitation). No row is marked **VD** from the historical
+`6bfdccd2d` run.
+
+| Area | Status | Evidence |
+| --- | --- | --- |
+| Daemon Go (local-only telemetry sink, blank Sentry DSN) | I, VS, VT | `newTelemetrySink`/`newDaemonSentryConfig` + `go test ./internal/daemon/...`, guard |
+| Electron main + renderer (PostHog/Sentry off) | I, VS, VT | `initTelemetry`/`initMainSentry` + vitest privacy tests, guard |
+| Mobile app (PostHog/Sentry off) | I, VS, VT | `fork-privacy.ts` + mobile vitest privacy tests |
+| PostHog (renderer, daemon, mobile) | I, VS, VT | composition tests + guard static gates; no client is built |
+| Sentry (daemon, main, renderer, mobile) | I, VS, VT | composition tests; `sentryobs.Enabled()` false with a DSN present |
+| Environment variables cannot re-enable export | I, VS, VT | gate/tests for `AO_TELEMETRY_*`, `AO_SENTRY_DSN`, `VITE_AO_*`, `EXPO_PUBLIC_*` |
+| Internal events and local logs preserved | I, VS, VT | daemon local SQLite sink test; controlled run recorded local events |
+| Updater + authorized release target | I, VS, VT | `release-target.ts` tests + guard; **VD pending** (packaged artifact) |
+| Privacy guard + CI | I, VS, VT | `privacy-guard.test.sh` (217 fixtures), `privacy-guard.sh`; **CI remote pending** |
+| Codex/OpenCode, sessions, worktrees, GitHub/PR/CI | — | **P** (not exercised in this environment) |
+| Full system/desktop traffic capture | — | **P** (no Xvfb/`tcpdump`/`strace`) |
+| Real Electron desktop app | — | **P** |
+| Packaged artifact build/install + updater | — | **P** |
 
 ## 9. Syncing with upstream
 
