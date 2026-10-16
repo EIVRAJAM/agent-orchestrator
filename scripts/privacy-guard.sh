@@ -10,12 +10,14 @@
 #      must not initialize a client/transport, no matter the config or env.
 #   2. Static gates — a reintroduced exporter, an upstream/unauthorized update
 #      feed, or a new observability dependency FAILS the guard (not just warns).
-#      scripts/lib/privacy-scan.mjs matches observability SDK *module specifiers*
-#      (so an aliased import is caught regardless of the local identifier) across
-#      backend/**, frontend/**, packages/** and scripts/**, and discovers every
-#      package.json under those roots. An explicit allowlist pins the
-#      deliberately-dormant files, and those files must still carry their
-#      fork-policy guard.
+#      scripts/lib/privacy-scan.mjs parses JS/TS with the repository's own
+#      TypeScript compiler, so it reads only real import positions (strings,
+#      templates, comments and regex literals are not imports), across
+#      backend/**, frontend/**, packages/** and scripts/**. It also discovers
+#      every package.json under those roots and checks npm aliases, the
+#      package.json "imports" map, and tsconfig/Vite alias targets. An explicit
+#      allowlist pins the deliberately-dormant files, and those files must still
+#      carry their fork-policy guard.
 #   3. The documented policy — see docs/privacy-fork.md — which states what is
 #      and is not allowed to leave the machine.
 #
@@ -39,6 +41,10 @@
 set -uo pipefail
 
 root="${PRIVACY_GUARD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# The scanner is always run from the repo, never from a fixture copy: it loads the
+# repository's own TypeScript parser. `root` (which may be a fixture) is the tree
+# it inspects; the scanner location stays anchored to this script.
+guard_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$root" || exit 2
 
 static_only="${PRIVACY_GUARD_STATIC_ONLY:-0}"
@@ -98,7 +104,7 @@ require_false packages/mobile/lib/fork-privacy.ts 'MOBILE_EXTERNAL_DIAGNOSTICS_E
 # any package (product-ui, cloud-client, …) fails unless reviewed.
 
 note "==> static: observability imports, call sites, and dependencies"
-if ! node scripts/lib/privacy-scan.mjs "$root"; then
+if ! node "$guard_dir/lib/privacy-scan.mjs" "$root"; then
   bad "privacy-scan found unauthorized observability imports/constructions or an unreviewed dependency"
 fi
 

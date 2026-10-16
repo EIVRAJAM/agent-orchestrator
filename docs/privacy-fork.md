@@ -53,8 +53,12 @@ flipped, so a change fails closed and loudly instead of exporting silently.
      return, release-target authority, Go policy coherence.
   3. `cecf213db` — import-specifier scanner, widened coverage (`packages/**`),
      per-condition guard self-tests, doc/evidence precision.
-  4. The commit that adds multiline import/require detection and package-name
-     boundary fixes (the child of `cecf213db`; this document is part of it).
+  4. `ff51dbbe5` — multiline import/require detection, package-name boundaries,
+     backtick specifiers, `overrides`/`resolutions` dependency scanning.
+  5. *(this commit)* — AST-based import analysis (no false positives from
+     strings/templates/comments/regex) and indirection-alias detection (npm
+     `npm:` aliases, `package.json` `imports`, tsconfig `paths`, Vite
+     `resolve.alias`).
 
 ## 3. Inventory of mechanisms
 
@@ -226,18 +230,18 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
 
 1. **Failing static gates** (not warnings):
    - policy constants closed (Go, frontend, mobile);
-   - `scripts/lib/privacy-scan.mjs` matches observability SDK **module
-     specifiers** over the whole file content (comments blanked first), so an
-     aliased import is caught regardless of the local identifier, and a specifier
-     on a different line from `import`/`from`/`require`/`import(` is still
-     caught. It scans `backend/**`, `frontend/**`, `packages/**` and
-     `scripts/**` for `.go`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, and
-     covers `import`, `export … from`, bare `import "x"`, dynamic `import(...)`
-     (including a backtick-delimited specifier) and `require(...)` in TS/JS plus
-     Go import paths (any alias). Provider
-     matching uses package-name boundaries — the exact unscoped name or a
-     `/subpath`, or a `@scope/` — so an unrelated name that only shares a prefix
-     (`posthog-analytics`) is not a false positive, while real subpaths
+   - `scripts/lib/privacy-scan.mjs` uses the repository's own TypeScript
+     compiler (`frontend/node_modules/typescript`) to parse each covered JS/TS
+     file and reads only real import positions, so ordinary strings, template
+     literals, comments and regex literals containing an SDK name are **not**
+     imports. It catches `import … from`, `export … from`, bare `import "x"`,
+     dynamic `import(...)` (including a backtick-delimited specifier), `require()`
+     and TS `import = require`, across lines, under any local identifier. It scans
+     `backend/**`, `frontend/**`, `packages/**` and `scripts/**` for `.go`, `.ts`,
+     `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`; Go imports are matched by path (any
+     alias). Provider matching uses package-name boundaries — the exact unscoped
+     name or a `/subpath`, or a `@scope/` — so an unrelated name that only shares
+     a prefix (`posthog-analytics`) is not a false positive, while real subpaths
      (`posthog-js/dist/...`) and scopes (`@sentry/*`) still match. Only exact,
      reviewed files are allowlisted: the dormant implementations and their
      tests (`sentryobs.go`, `posthog.go`, `renderer/lib/telemetry.ts`,
@@ -248,13 +252,17 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      not read a Sentry DSN from configuration;
    - the release target is the authorized fork repo and every consumer routes
      through the shared authority;
-   - **dependency discovery**: every `package.json` under `backend/`,
+   - **dependency and alias discovery**: every `package.json` under `backend/`,
      `frontend/`, `packages/`, `scripts/` and the repo root (excluding
-     `node_modules`, fixtures and generated output) is checked; an observability
-     dependency anywhere — including `packages/product-ui/package.json` or
-     `packages/cloud-client/package.json`, and via `resolutions`/`overrides`
-     (selectors like `**/pkg` are reduced to the package name) — fails unless it
-     is in the reviewed allowlist.
+     `node_modules`, fixtures and generated output) is checked for observability
+     packages by both name and **alias target**: npm aliases
+     (`"reporter": "npm:@sentry/electron@^7.0.0"`), `resolutions`/`overrides`/
+     `pnpm.overrides`, and the `package.json` `imports` map
+     (`"#reporter": "@sentry/electron"`). An alias that renames an observability
+     package is flagged even when the target is an allowlisted dormant
+     dependency, because it hides the import site; a self-alias is not. The
+     repository's own module aliases are also covered: observability targets in
+     tsconfig `paths` or Vite `resolve.alias` fail.
 2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): one fixture per
    condition, each built from the real policy files with a single injection, so
    a working pattern cannot hide a broken one. Covered: direct `Sentry.init`;
@@ -270,9 +278,16 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    `segment-analytics`, `@sentryfoo/thing`) that must **not** false-positive; a
    legitimate subpath import outside the allowlist (fails); a backtick
    `import(...)`; an observability package pinned via `overrides` or a
-   `resolutions` selector (fails); mobile telemetry
-   reactivation (guard removed / constant flipped); an upstream and an
-   unauthorized release target. A clean tree must pass, including the dormant
+   `resolutions` selector (fails); **npm aliases** (`npm:posthog-js`,
+   `npm:@sentry/electron`) in `dependencies`/`devDependencies`/`overrides`/
+   `resolutions`/`pnpm.overrides` (fail); the `package.json` `imports` map,
+   including a conditional value, and an alias import followed by an
+   arbitrary-identifier call (fail); a tsconfig `paths` and a Vite
+   `resolve.alias` pointing at an SDK (fail); a non-SDK npm alias and a
+   self-alias of an allowlisted dependency (pass); and the benign-literal set —
+   SDK names inside ordinary strings, template-literal examples, comments, regex
+   literals, the plain word `from`, and mixed inner delimiters — which must
+   **not** false-positive. A clean tree must pass, including the dormant
    implementations and their reviewed tests.
 3. **Behavioral tests** for the known composition points: daemon composition (no
    remote sink even when configured against a live `httptest` server; Sentry
@@ -290,11 +305,14 @@ mandatory part.
 - The behavioral tests protect the **known** composition points. They cannot
   vouch for a new module that those tests never import.
 - The **import allowlist** detects new uses of the reviewed SDKs (under any
-  alias) anywhere in the covered tree, and the **dependency analysis** detects
-  new known observability SDKs in any discovered manifest.
+  alias) anywhere in the covered tree, and the **dependency/alias analysis**
+  detects new known observability SDKs, npm aliases, `imports` maps and
+  tsconfig/Vite aliases in any discovered manifest or config.
 - **No static search is a guarantee.** A hand-written HTTP exporter with no SDK
-  and no known marker, or a mechanism not yet in the provider list, is not
-  detectable here; the scan showing "OK" proves nothing about absence.
+  and no known marker, a module specifier computed at runtime
+  (`require(name)`), a Go raw-string/URL import, or a resolver alias the scanner
+  does not know are not detectable here; the scan showing "OK" proves nothing
+  about absence.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -327,20 +345,22 @@ environment):
 **Historical / comparative execution evidence (NOT the current HEAD):** the
 controlled daemon-run traffic observation
 ([privacy-fork-traffic-report.md](privacy-fork-traffic-report.md)) was performed
-on commit **`6bfdccd2d`**. The branch has since moved through two review cycles —
-`d77f30f26` (guard gates, mobile Sentry early return, release-target authority,
-Go policy coherence) and `cecf213db` (import-specifier scanner, widened
-coverage, per-condition self-tests) — and then this commit, which adds multiline
-import/require detection and package-name boundaries. None of those commits
-change the daemon outbound paths the run exercised (`newTelemetrySink`
-local-only, renderer/mobile init, daemon env-stamping), and the Go Sentry change
-made the DSN path strictly tighter (always blank), so the run remains relevant
-as **historical / comparative** evidence for those paths.
+on commit **`6bfdccd2d`**. The branch has since moved through a series of
+hardening commits — `d77f30f26` (guard gates, mobile Sentry early return,
+release-target authority, Go policy coherence), `cecf213db` (import-specifier
+scanner, widened coverage, per-condition self-tests), `ff51dbbe5` (multiline
+import/require detection, package-name boundaries, backtick, `overrides`/
+`resolutions`), and *this commit* (AST-based import analysis and
+indirection-alias detection). None of those commits change the daemon outbound
+paths the run exercised (`newTelemetrySink` local-only, renderer/mobile init,
+daemon env-stamping), and the Go Sentry change made the DSN path strictly
+tighter (always blank), so the run remains relevant as **historical /
+comparative** evidence for those paths.
 
-There is **no full traffic capture on the final HEAD**, and the final commit's
-own binary has **not been observed**. Do not read the historical run as dynamic
-validation of the final artifact; repeat it on the final commit (method in the
-traffic report) before claiming execution evidence for it.
+There is **no full traffic capture of the final HEAD**, and the binary built from
+the final commit has **not been observed**. Do not read the historical run as
+dynamic validation of the final artifact; repeat it on the final commit (method
+in the traffic report) before claiming execution evidence for it.
 
 **Pending / not verifiable in this environment:**
 

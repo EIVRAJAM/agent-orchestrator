@@ -5,20 +5,22 @@ observation of this fork's outbound behavior. It is deliberately explicit about
 what was and was not observed, and about the limits of the method.
 
 > **Evidence scope / historical classification.** This run was performed on
-> commit **`6bfdccd2d`**. The branch has since moved through two review cycles —
-> `d77f30f26` (guard gates, mobile Sentry early return, release-target authority,
-> Go policy coherence) and `cecf213db` (import-specifier scanner, widened
-> coverage, per-condition self-tests) — and then a further hardening commit that
-> adds multiline import/require detection and package-name boundaries. It is kept
-> as **historical / comparative** evidence, not as execution evidence of the
-> current HEAD. It stays relevant because the daemon outbound paths it exercised
-> — `newTelemetrySink` (local-only), the renderer/mobile init, and the daemon
-> env-stamping — are unchanged by those commits, and the Go change made the
-> Sentry DSN path strictly tighter (always blank instead of a branch), so it
-> cannot widen the surface. The **binary for the final commit has not itself been
-> observed**, and there is no full traffic capture on the final HEAD. Repeat the
-> run on the final commit before claiming execution evidence for the definitive
-> artifact; the method below is the reproducible procedure.
+> commit **`6bfdccd2d`**. The branch has since moved through a series of hardening
+> commits — `d77f30f26` (guard gates, mobile Sentry early return, release-target
+> authority, Go policy coherence), `cecf213db` (import-specifier scanner, widened
+> coverage, per-condition self-tests), `ff51dbbe5` (multiline import/require
+> detection, package-name boundaries, backtick, `overrides`/`resolutions`), and
+> the following commit (AST-based import analysis and indirection-alias
+> detection). It is kept as **historical / comparative** evidence, not as
+> execution evidence of the current HEAD. It stays relevant because the daemon
+> outbound paths it exercised — `newTelemetrySink` (local-only), the
+> renderer/mobile init, and the daemon env-stamping — are unchanged by those
+> commits, and the Go change made the Sentry DSN path strictly tighter (always
+> blank instead of a branch), so it cannot widen the surface. The **binary built
+> from the final commit has not been observed**, and there is no full traffic
+> capture of the final HEAD. Repeat the run on the final commit before claiming
+> execution evidence for the definitive artifact; the method below is the
+> reproducible procedure.
 
 ## Verdict
 
@@ -123,5 +125,5 @@ Three layers, because no single one is a full capture:
   of scope.
 - Traffic of the **agent harnesses** and of the **host system** is not
   attributed here; only the daemon process's sockets were inspected.
-- **This run predates the final commit** (`d77f30f26`); it observed the binary
-  of `6bfdccd2d`. See the scope note at the top.
+- **This run predates the current HEAD**; it observed the binary built from
+  `6bfdccd2d`. See the scope note at the top.

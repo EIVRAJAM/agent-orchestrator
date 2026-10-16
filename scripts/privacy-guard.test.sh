@@ -42,7 +42,6 @@ files=(
   packages/mobile/package.json
   package.json
   desktop-version-floor.json
-  scripts/lib/privacy-scan.mjs
 )
 
 make_fixture() {
@@ -286,6 +285,131 @@ put "$d/frontend/package.json" <<'EOF'
 { "name": "agent-orchestrator", "version": "0.0.0", "resolutions": { "**/posthog-node": "4.0.0" } }
 EOF
 check "observability package pinned via a resolutions selector" fail "$d"
+
+# --- npm alias indirection (a name search misses the real package) -----------
+
+d="$base/npm-alias-unscoped"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "reporter": "npm:posthog-js@1.2.3" } }
+EOF
+check "npm alias of an unscoped observability package" fail "$d"
+
+d="$base/npm-alias-scoped"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "reporter": "npm:@sentry/electron@^7.0.0" } }
+EOF
+check "npm alias of a scoped observability package" fail "$d"
+
+d="$base/npm-alias-dev"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "devDependencies": { "reporter": "npm:@sentry/electron@7.0.0" } }
+EOF
+check "npm alias inside devDependencies" fail "$d"
+
+d="$base/npm-alias-overrides"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "overrides": { "reporter": "npm:posthog-node@4.0.0" } }
+EOF
+check "npm alias inside overrides" fail "$d"
+
+d="$base/npm-alias-resolutions"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "resolutions": { "reporter": "npm:@sentry/node@10.0.0" } }
+EOF
+check "npm alias inside resolutions" fail "$d"
+
+d="$base/npm-alias-pnpm-overrides"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "pnpm": { "overrides": { "reporter": "npm:mixpanel@0.18.0" } } }
+EOF
+check "npm alias inside pnpm.overrides" fail "$d"
+
+d="$base/imports-map-alias"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "imports": { "#reporter": "@sentry/electron" } }
+EOF
+check "package.json imports map aliasing an SDK" fail "$d"
+
+d="$base/imports-map-conditional"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "imports": { "#reporter": { "node": "./local.ts", "default": "@sentry/electron" } } }
+EOF
+check "conditional package.json imports map aliasing an SDK" fail "$d"
+
+d="$base/alias-import-indirect-call"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "imports": { "#reporter": "@sentry/electron" } }
+EOF
+put "$d/frontend/src/telemetry-via-alias.ts" <<'EOF'
+import * as Reporter from "#reporter";
+export const report = (error: unknown) => Reporter.init({ dsn: String(error) });
+EOF
+check "import via an alias followed by an arbitrary-identifier call" fail "$d"
+
+d="$base/tsconfig-path-alias"; make_fixture "$d"
+put "$d/frontend/tsconfig.json" <<'EOF'
+{ "compilerOptions": { "baseUrl": ".", "paths": { "@reporter": ["@sentry/electron"] } } }
+EOF
+check "tsconfig paths alias to an SDK" fail "$d"
+
+d="$base/vite-alias"; make_fixture "$d"
+put "$d/frontend/vite.renderer.config.ts" <<'EOF'
+export default { resolve: { alias: { "#reporter": "@sentry/electron" } } };
+EOF
+check "Vite resolve.alias to an SDK" fail "$d"
+
+d="$base/normal-dependency-values"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "react": "^19.0.0", "reporter": "npm:some-lib@1.0.0" }, "resolutions": { "**/left-pad": "1.3.0" } }
+EOF
+check "normal ranges and a non-SDK npm alias are allowed" pass "$d"
+
+d="$base/self-alias-allowlisted-dep"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "@sentry/electron": "npm:@sentry/electron@7.0.0" } }
+EOF
+check "self-alias of an allowlisted dormant dependency is allowed" pass "$d"
+
+# --- Benign literals must not false-positive ---------------------------------
+
+d="$base/benign-string"; make_fixture "$d"
+put "$d/frontend/src/benign-string.ts" <<'EOF'
+const explanation = 'data from "@sentry/electron" is not an import';
+EOF
+check "SDK name inside an ordinary string" pass "$d"
+
+d="$base/benign-template"; make_fixture "$d"
+put "$d/frontend/src/benign-template.ts" <<'EOF'
+const example = `import x from "@sentry/electron";`;
+EOF
+check "SDK name inside a template literal example" pass "$d"
+
+d="$base/benign-comment"; make_fixture "$d"
+put "$d/frontend/src/benign-comment.ts" <<'EOF'
+// import y from "@sentry/electron";
+/* const p = require("posthog-js"); */
+EOF
+check "SDK name inside comments" pass "$d"
+
+d="$base/benign-regex"; make_fixture "$d"
+put "$d/frontend/src/benign-regex.ts" <<'EOF'
+const re = /from "@sentry\/electron"/;
+EOF
+check "SDK name inside a regex literal" pass "$d"
+
+d="$base/benign-from-word"; make_fixture "$d"
+put "$d/frontend/src/benign-from-word.ts" <<'EOF'
+const text = "the from source";
+const fromFallback = 1;
+EOF
+check "the word 'from' in ordinary text" pass "$d"
+
+d="$base/benign-mixed-quotes"; make_fixture "$d"
+put "$d/frontend/src/benign-mixed-quotes.ts" <<'EOF'
+const single = "from '@sentry/electron'";
+const double = 'from "posthog-js"';
+EOF
+check "SDK name with different inner delimiters" pass "$d"
 
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
