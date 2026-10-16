@@ -662,23 +662,31 @@ init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
 comparative** evidence for those paths.
 
-There is **no full traffic capture of the final HEAD**, and the binary built from
-the final commit has **not been observed**. Do not read the historical run as
-dynamic validation of the final artifact; repeat it on the final commit (method
-in the traffic report) before claiming execution evidence for it.
+**Dynamic execution evidence on the current HEAD:** the controlled daemon,
+Electron and packaged-artifact runs were repeated on the final HEAD and are
+recorded in
+[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md#re-run-on-the-final-head-c0aa7f660).
+They observed **zero** PostHog/Sentry requests with the export enabled by
+environment, the daemon's external destinations named as functional
+(`raw.githubusercontent.com`, `registry.npmjs.org`, `chatgpt.com`, `github.com`),
+a real `opencode-v2` session and a packaged `deb` whose `app-update.yml` points at
+`EIVRAJAM/agent-orchestrator`. There is still **no full packet capture** of the
+HEAD (no `tcpdump`/`strace`/root).
 
 **Pending / not verifiable in this environment:**
 
-- Full system/desktop traffic capture. Requires a supported desktop OS with a
-  display; this environment has no Xvfb, `tcpdump`, or `strace`. The daemon
-  observation is destination-canary + socket inspection, not a full capture.
-- Re-run of the controlled daemon traffic test on the **final** commit.
-- Real Electron desktop app run (launch, create/stop/restore a session, create
-  and clean up worktrees, reconnect, packaged-equivalent and dev).
-- Real launches of Codex and OpenCode; GitHub / PR / CI flows.
-- Packaged artifact build and install, and effective updater behavior
-  (download/install from the fork release target).
-- Mobile app runtime (code-level disable only; no Expo build).
+- Full system/desktop traffic capture. Requires `tcpdump`/`strace`/root; the
+  observation is destination-canary + socket inspection + CONNECT-proxy naming,
+  not a full capture.
+- Packaged artifact **signing, notarization and installation** (no root for
+  `dpkg -i`; macOS unavailable), and the **effective updater download** from the
+  fork feed (no published release to fetch).
+- **rpm/AppImage and all macOS artifacts** (missing `rpmbuild`/`appimagetool`).
+- **Codex chat mode** (installed Codex version is below AO's tested minimum);
+  Codex TUI was exercised.
+- GitHub **PR/CI** flows end-to-end and `agent-ci run --all` (Docker absent); the
+  GitHub client was verified only for loading/auth and local git operations.
+- Mobile app runtime (code-level disable only; no Expo build, no simulator).
 - Cloud: out of scope, not exercised.
 
 **Comparative limitation (pre-existing, not a pass):** the full frontend suite
@@ -693,24 +701,25 @@ passes.
 
 Statuses: **I** implemented · **VS** verified statically · **VT** verified by the
 automated tests · **VD** verified dynamically from the current HEAD · **P**
-pending (environment limitation). No row is marked **VD** from the historical
-`6bfdccd2d` run.
+pending (environment limitation). Rows marked **VD** come from the re-run in
+[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md#re-run-on-the-final-head-c0aa7f660),
+not from the historical `6bfdccd2d` run.
 
 | Area | Status | Evidence |
 | --- | --- | --- |
-| Daemon Go (local-only telemetry sink, blank Sentry DSN) | I, VS, VT | `newTelemetrySink`/`newDaemonSentryConfig` + `go test ./internal/daemon/...`, guard |
-| Electron main + renderer (PostHog/Sentry off) | I, VS, VT | `initTelemetry`/`initMainSentry` + vitest privacy tests, guard |
-| Mobile app (PostHog/Sentry off) | I, VS, VT | `fork-privacy.ts` + mobile vitest privacy tests |
-| PostHog (renderer, daemon, mobile) | I, VS, VT | composition tests + guard static gates; no client is built |
-| Sentry (daemon, main, renderer, mobile) | I, VS, VT | composition tests; `sentryobs.Enabled()` false with a DSN present |
-| Environment variables cannot re-enable export | I, VS, VT | gate/tests for `AO_TELEMETRY_*`, `AO_SENTRY_DSN`, `VITE_AO_*`, `EXPO_PUBLIC_*` |
-| Internal events and local logs preserved | I, VS, VT | daemon local SQLite sink test; controlled run recorded local events |
-| Updater + authorized release target | I, VS, VT | `release-target.ts` tests + guard; **VD pending** (packaged artifact) |
-| Privacy guard + CI | I, VS, VT | `privacy-guard.test.sh` (236 fixtures), `privacy-guard.sh`; **CI remote pending** |
-| Codex/OpenCode, sessions, worktrees, GitHub/PR/CI | — | **P** (not exercised in this environment) |
-| Full system/desktop traffic capture | — | **P** (no Xvfb/`tcpdump`/`strace`) |
-| Real Electron desktop app | — | **P** |
-| Packaged artifact build/install + updater | — | **P** |
+| Daemon Go (local-only telemetry sink, blank Sentry DSN) | I, VS, VT, VD | `newTelemetrySink`/`newDaemonSentryConfig` + `go test ./internal/daemon/...`, guard; live run hit **zero** canary requests |
+| Electron main + renderer (PostHog/Sentry off) | I, VS, VT, VD | `initTelemetry`/`initMainSentry` + vitest privacy tests; real dev + packaged app, zero canary requests, no install id |
+| Mobile app (PostHog/Sentry off) | I, VS, VT | `fork-privacy.ts` + mobile vitest privacy tests; **runtime P** (no simulator/Expo) |
+| PostHog (renderer, daemon, mobile) | I, VS, VT, VD | composition tests + guard; no client built; zero canary requests |
+| Sentry (daemon, main, renderer, mobile) | I, VS, VT, VD | composition tests; `sentryobs.Enabled()` false with a DSN present; zero canary requests |
+| Environment variables cannot re-enable export | I, VS, VT, VD | gate/tests for `AO_TELEMETRY_*`, `AO_SENTRY_DSN`, `VITE_AO_*`, `EXPO_PUBLIC_*`; export "enabled" by env produced no request |
+| Internal events and local logs preserved | I, VS, VT, VD | daemon local SQLite sink test; run recorded `ao.daemon.started` etc.; `change_log`/`conversation_provider_events` |
+| Updater + authorized release target | I, VS, VT, VD | `release-target.ts` tests + guard; packaged `app-update.yml` → `EIVRAJAM/agent-orchestrator`, version floor → fork, upstream/unauthorized/malformed rejected at runtime. **Signing/install/effective download P** |
+| Privacy guard + CI | I, VS, VT, VD | `privacy-guard.test.sh` (236 fixtures), `privacy-guard.sh` incl. `CI=true`; bypasses exit 2. **Remote CI P** |
+| Codex/OpenCode, sessions, worktrees | I, VS, VT, VD (partial) | real `opencode-v2` session + worktree + stop/cleanup + restart/recovery; Codex **TUI** ran (chat blocked by installed version) |
+| GitHub / PR / CI flows | I, VS, VT | client loads + `gh` auth verified; local git/worktrees OK. **PR/CI + `agent-ci` P** (Docker absent) |
+| Full system/desktop traffic capture | — | **P** (no `tcpdump`/`strace`/root) |
+| Packaged artifact build/install + updater | I, VS, VT, VD (partial) | local `deb` built and booted under canaries; **signing/notarization/install/updater-download P** (no root, macOS unavailable) |
 
 ## 9. Syncing with upstream
 

@@ -31,11 +31,10 @@ what was and was not observed, and about the limits of the method.
 > relevant because the daemon outbound paths it exercised — `newTelemetrySink`
 > (local-only), the renderer/mobile init, and the daemon env-stamping — are
 > unchanged by those commits, and the Go change made the Sentry DSN path strictly
-> tighter (always blank instead of a branch), so it cannot widen the surface. The
-> **binary built from the final commit has not been observed**, and there is no
-> full traffic capture of the final HEAD. Repeat the run on the final commit
-> before claiming execution evidence for the definitive artifact; the method
-> below is the reproducible procedure.
+> tighter (always blank instead of a branch), so it cannot widen the surface.
+> **This historical run is superseded for evidence purposes by the re-run on the
+> final HEAD recorded in [Re-run on the final HEAD](#re-run-on-the-final-head-c0aa7f660)
+> below.** The method described here is the reproducible procedure.
 
 ## Verdict
 
@@ -142,3 +141,116 @@ Three layers, because no single one is a full capture:
   attributed here; only the daemon process's sockets were inspected.
 - **This run predates the current HEAD**; it observed the binary built from
   `6bfdccd2d`. See the scope note at the top.
+
+## Re-run on the final HEAD (`c0aa7f660`)
+
+**Date:** 2026-10-16. **HEAD:** `c0aa7f660` (docs) / `9a962153b` (last code
+commit). This is the dynamic re-run the historical scope note called for; it
+supersedes the run above for evidence purposes.
+
+### Environment
+
+- Debian GNU/Linux 13 (trixie), Linux 6.12.90, x86_64; real X11 display
+  (`DISPLAY=:0`, KWin).
+- Go 1.27.1, Node 24.21.0, npm 11.19.0, Electron 33.4.11.
+- Available: `lsof`, `ss`, `nc`, `socat`, `import`/`spectacle`, `python3`.
+  **Not** available: `tcpdump`, `strace`, `ltrace`, `tshark`, `mitmproxy`,
+  `Xvfb`, Docker; no root (`sudo` needs a password).
+- Codex and OpenCode CLIs present; `gh` authenticated as the fork owner.
+- **Isolation:** a detached worktree at `/home/master-chief/ao-privacy-lab`, lab
+  `AO_DATA_DIR`/`AO_DEV_ELECTRON_DIR`, a synthetic git repo plus a local bare
+  origin, and a temporary `HOME` for the packaged app (whose `~/.ao/electron` is
+  deliberately not overridable). The real `~/.ao` was never read or written.
+
+### Method
+
+1. **HTTP canaries** on `127.0.0.1`: one served as `AO_TELEMETRY_POSTHOG_HOST`
+   (`:19001`) and `AO_SENTRY_DSN` (`:19002`). Zero requests arrived except a
+   single `curl` self-test proving the listener works.
+2. **Daemon run** (binary built from the HEAD) with the export "enabled" by
+   environment: `AO_TELEMETRY_EVENTS=1`, `AO_TELEMETRY_METRICS=1`,
+   `AO_TELEMETRY_REMOTE=posthog`, `AO_TELEMETRY_POSTHOG_KEY`,
+   `AO_TELEMETRY_POSTHOG_HOST=<canary>`, `AO_SENTRY_DSN=<canary>`,
+   `AO_TELEMETRY_RENDERER=1`, `VITE_AO_TELEMETRY=1`, `EXPO_PUBLIC_AO_TELEMETRY=1`.
+3. **Socket inspection + CONNECT proxy.** `ss -tnp`/`lsof` listed the daemon's
+   sockets; a local CONNECT-logging proxy named every external destination (Go
+   never proxies loopback, so this only reveals external hosts).
+4. **Real Electron app** (dev, isolated worktree) and the **packaged artifact**
+   were run under the canaries with `ELECTRON_ENABLE_LOGGING=1` and driven
+   through the Chrome DevTools Protocol (no `xdotool`/root available).
+
+### Daemon result
+
+- **Canary: zero requests** with the export fully enabled by environment.
+- **Local records preserved:** `telemetry_event` held `ao.daemon.started`,
+  `ao.projects.created`, `ao.onboarding.first_project_added`; `change_log` and
+  `conversation_provider_events` were also populated. (In the desktop app the
+  local `telemetry_event` sink is additionally gated by
+  `telemetry_policy.json` `events_enabled:false`; the core durable records are
+  not.)
+- **External destinations (CONNECT proxy):**
+  - `raw.githubusercontent.com:443` — pricing catalog manifest
+    (`internal/pricing/fetch.go`). Functional, no user data.
+  - `registry.npmjs.org:443` — installed-harness update check
+    (`systeminstall/manager_versions.go`); absent with `AO_HARNESS_UPDATE_CHECKS=off`.
+  - `chatgpt.com:443` — Codex install-plan URL (`systeminstall/agentplans.go`).
+  - `github.com:443` — GitHub auth/PR client.
+- **No PostHog/Sentry destination** appeared in any socket.
+
+### Electron (dev) result
+
+- Window "Orchestrator.inc (dev)" loaded (screenshot), the Kanban board rendered,
+  a synthetic project appeared, and a real `opencode-v2` session ran in a created
+  worktree and replied. Session detail, stop + worktree cleanup, app restart with
+  recovery ("Exited"), and renderer reconnect were all exercised.
+- The supervisor forces `AO_TELEMETRY_REMOTE=off` when spawning the daemon
+  (`telemetryOverrides()` in `main.ts`) — a second, independent guarantee on top
+  of the daemon's own fork policy.
+- Profile scan: no analytics install id. The PostHog/Sentry strings in the
+  Chromium cache are the app's own modules served by the Vite dev server
+  (`localhost:5173/src/...`), not responses from an observability endpoint.
+
+### Packaged artifact result
+
+- `electron-forge make` produced a local **deb**
+  (`out/make/deb/x64/agent-orchestrator_0.13.0_amd64.deb`). Building needed a lab
+  workaround: bundled tmux is normally compiled from source (`yacc`/`bison`,
+  absent here); the system tmux (3.5a, the exact pinned version) was placed in
+  `build-tmux.mjs`'s cache. `rpm`/AppImage makers were skipped (no
+  `rpmbuild`/`appimagetool`).
+- `resources/app-update.yml` → `owner: EIVRAJAM`, `repo: agent-orchestrator`; no
+  `Untrivial-ai` anywhere in the packaged resources.
+- `desktop-version-floor.json` →
+  `https://github.com/EIVRAJAM/agent-orchestrator/releases/latest`.
+- Direct execution of `resolveReleaseRepo`/`buildAppUpdateYml` rejected
+  `Untrivial-ai/agent-orchestrator` and `aoagents/agent-orchestrator` (upstream),
+  `someone/else` (unauthorized) and malformed slugs; blank falls back to the fork.
+- The packaged app booted (screenshot), loaded its renderer, and made **no**
+  PostHog/Sentry request.
+
+### Host classification
+
+| Host | Port | Classification |
+| --- | --- | --- |
+| `raw.githubusercontent.com` | 443 | Functional (pricing catalog) |
+| `registry.npmjs.org` | 443 | Functional (harness update check) |
+| `chatgpt.com` | 443 | Functional / agent (Codex install plan, Codex service) |
+| `github.com` / `api.github.com` | 443 | Functional (GitHub auth/PR) |
+| `opencode.ai` | 443 | Agent service (OpenCode) |
+| `*.googleapis.com` / `*.gstatic.com` / `*.gvt1.com` (Chromium network service) | 443 | Chromium/OS (component updates, safe browsing); not AO |
+| daemon loopback, agent local APIs, Vite dev server | various | Loopback / local |
+| **`us.i.posthog.com` / `*.ingest.sentry.io`** | — | **None observed** |
+
+### Limits (re-run)
+
+- Still no full packet capture (no `tcpdump`/`strace`/root): the method is
+  destination canary + socket inspection + CONNECT-proxy naming.
+- One Chromium network-service peer IPv6 (`2800:e0:c79::d`) was not resolved to a
+  name; it is not a known observability endpoint and produced no canary hit.
+- **Signing, notarization, install and the effective updater download were not
+  performed** (no root for `dpkg -i`, no published release, macOS unavailable).
+- **rpm/AppImage and all macOS artifacts were not built** (missing tooling).
+- **`agent-ci run --all` was not run** (Docker absent). **Mobile runtime was not
+  run** (no simulator/device; Expo deps absent) — mobile evidence remains the
+  code constants and the automated tests. **Codex chat mode** is blocked by the
+  installed Codex version (< AO's minimum); Codex TUI was exercised instead.
