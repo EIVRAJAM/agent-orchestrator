@@ -86,6 +86,10 @@ flipped, so a change fails closed and loudly instead of exporting silently.
   13. `87fc8276d` — call arguments linked to parameters through default values
       and object/array destructuring patterns, integrated with the call
       fixpoint.
+  14. `9a962153b` — defaults also activate on statically `undefined` arguments
+      (global `undefined`/`void`, unless shadowed) and on `undefined`
+      object/array values; duplicate object keys resolve to their last effective
+      definition, with fail-closed handling of ambiguous keys.
 
 ## 3. Inventory of mechanisms
 
@@ -352,22 +356,33 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      alias chains), a direct call relates its arguments to parameters by
      declaration identity, covering:
      - **identifier parameters** bound to a positional argument;
-     - **default values**: when the argument is absent the parameter is bound to
-       its initializer, so `function f(helper = path) { helper.resolve = … }
-       f()` invalidates `path`. A default that names an earlier parameter follows
-       left-to-right evaluation order (`(first = path, second = first)`); a
-       reference to a later or ambiguous parameter is not trusted;
+     - **default values**: when the argument is absent **or statically
+       `undefined`** (the global `undefined`, or any `void …`, unless a local
+       binding of that name shadows it) the parameter is bound to its
+       initializer, so both `function f(helper = path) { helper.resolve = … }
+       f()` and `f(undefined)` invalidate `path`. A default that names an earlier
+       parameter follows left-to-right evaluation order
+       (`(first = path, second = first)`); a reference to a later or ambiguous
+       parameter is not trusted;
      - **object and array patterns** matched structurally against a static object
        or array literal (inline or one level of a `const` literal initializer),
        including renamed properties (`{ source: helper }`), nested patterns,
-       omitted elements and defaults inside the pattern. Only static keys
-       (identifier, string, numeric) are matched; a spread, a computed key, a
-       rest element (a shallow copy, not an alias) or an unresolvable structure
-       yields no relation rather than a guessed one. A mutation of one binding
-       invalidates only its corresponding value.
+       omitted elements and defaults inside the pattern. A duplicate object key
+       resolves to its **last** definition, matching equivalent identifier /
+       string / numeric keys and shorthands (`{ helper: local, helper: path }`
+       and `{ helper: local, "helper": path }` bind `path`); a spread, computed
+       key, method or accessor that could define the inspected key makes that
+       resolution ambiguous. Only static keys are matched; a rest element (a
+       shallow copy, not an alias) or an unresolvable structure yields no
+       relation rather than a guessed one. An absent, omitted or statically
+       `undefined` property/element falls back to the pattern default. A mutation
+       of one binding invalidates only its corresponding value.
      A mutation of a parameter binding (or an alias of it) invalidates the value
      it was bound to, with a fixpoint over call chains (`outer(path)` →
-     `inner(h)`, including a forwarded destructured binding). A rest *parameter*
+     `inner(h)`, including a forwarded destructured binding). A mutated binding
+     whose value is **ambiguous** (a spread/computed key or a method/accessor
+     collision) fails closed: every helper seed is distrusted rather than
+     assuming the mutation touched nothing. A rest *parameter*
      invalidates every remaining identifier argument (conservative). A callee
      that is not an identifier binding (dynamic, a member access, a higher-order
      callback) is not attributed, and a call with a spread argument is not mapped
@@ -473,7 +488,15 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    **default values** — mutating a defaulted parameter (identifier default,
    `Object.assign`, or a default naming an earlier parameter) invalidates the
    default (fail) versus a read-only default, an explicit independent argument
-   that avoids the default, and an independent default (pass); **destructured
+   that avoids the default, and an independent default (pass); **static
+   `undefined`** — an explicit `undefined`/`void` argument, an `undefined` object
+   property or array element, and a nested `undefined` all activate the default
+   (fail) versus a shadowed `undefined`, explicit independent argument/property/
+   element, and a read-only default (pass); **duplicate object keys** — a helper
+   as the last definition (data or shorthand), an identifier/string key pair, and
+   a later method or getter that overrides it (fail) versus an independent last
+   value, an independent middle value, distinct keys, and an independent
+   shorthand (pass); **destructured
    parameters** — an object/array pattern, a renamed property, a nested pattern,
    a default inside the pattern, a forwarded call chain and `Object.assign` on an
    extracted binding (fail) versus a read-only pattern, an independent property
@@ -554,8 +577,12 @@ mandatory part.
   callback by higher-order code, or whose reference is stored and called through
   a member, is not linked to its arguments; a call with a spread argument is not
   mapped positionally; a destructuring pattern matched against a non-literal, a
-  mutable or reassigned binding, a spread, a computed key or a rest element (a
-  shallow copy, not an alias) yields no relation; and a helper modelled only
+  mutable or reassigned binding, or a rest element (a shallow copy, not an alias)
+  yields no relation; a spread, computed key or method/accessor collision on the
+  inspected key is treated as **ambiguous** and, when the binding is mutated,
+  fails closed (every helper seed is distrusted); `undefined` is recognised only
+  as the un-shadowed global identifier or a `void …` expression (not, for example,
+  `globalThis.undefined`); and a helper modelled only
   through a value the scanner cannot follow is treated as unresolvable rather
   than trusted.
   **Reachability through a container is not modelled.** Storing a helper in an
@@ -627,8 +654,9 @@ assignment operators), `07eea972` (scope-aware declaration-identity model:
 aliases in blocks/functions/callbacks, destructuring write targets, and
 `++`/`--`/`delete` vs read-only unary operators), `89d925b5d` (call arguments
 linked to parameters; `for`/`for…of`/`for…in` header scopes, named function
-expressions), and `87fc8276d` (arguments linked through default values and
-destructuring patterns). None of those commits change the daemon
+expressions), `87fc8276d` (arguments linked through default values and
+destructuring patterns), and `9a962153b` (`undefined`-activating defaults and
+duplicate object keys). None of those commits change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
@@ -678,7 +706,7 @@ pending (environment limitation). No row is marked **VD** from the historical
 | Environment variables cannot re-enable export | I, VS, VT | gate/tests for `AO_TELEMETRY_*`, `AO_SENTRY_DSN`, `VITE_AO_*`, `EXPO_PUBLIC_*` |
 | Internal events and local logs preserved | I, VS, VT | daemon local SQLite sink test; controlled run recorded local events |
 | Updater + authorized release target | I, VS, VT | `release-target.ts` tests + guard; **VD pending** (packaged artifact) |
-| Privacy guard + CI | I, VS, VT | `privacy-guard.test.sh` (217 fixtures), `privacy-guard.sh`; **CI remote pending** |
+| Privacy guard + CI | I, VS, VT | `privacy-guard.test.sh` (236 fixtures), `privacy-guard.sh`; **CI remote pending** |
 | Codex/OpenCode, sessions, worktrees, GitHub/PR/CI | — | **P** (not exercised in this environment) |
 | Full system/desktop traffic capture | — | **P** (no Xvfb/`tcpdump`/`strace`) |
 | Real Electron desktop app | — | **P** |

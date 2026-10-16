@@ -24,7 +24,8 @@ what was and was not observed, and about the limits of the method.
 > operators), and `89d925b5d` (call arguments linked to parameters;
 > `for`/`for…of`/`for…in` header scopes, named function expressions), and
 > `87fc8276d` (arguments linked through default values and destructuring
-> patterns). It is kept as
+> patterns), and `9a962153b` (`undefined`-activating defaults and duplicate
+> object keys). It is kept as
 > **historical / comparative** evidence, not as execution evidence of the current
 > HEAD. It stays
 > relevant because the daemon outbound paths it exercised — `newTelemetrySink`
