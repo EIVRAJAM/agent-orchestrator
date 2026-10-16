@@ -1245,6 +1245,203 @@ export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } }
 EOF
 check "arithmetic/bitwise operations do not invalidate a helper (pass)" pass "$d"
 
+# --- Alias mutation inside nested scopes -------------------------------------
+
+d="$base/alias-block-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+{
+  const p = path;
+  p.resolve = () => "@sentry/electron";
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an alias inside a block invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-function-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+function replaceResolver() {
+  const p = path;
+  p.resolve = () => "@sentry/electron";
+}
+replaceResolver();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an alias inside an invoked function invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-chain-in-function"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f() {
+  const a = path;
+  const b = a;
+  b.resolve = fake;
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an alias chain inside a function invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-callback-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const setup = () => {
+  const p = path;
+  p.resolve = fake;
+};
+setup();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an alias inside a callback invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-object-assign-local"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+function f() {
+  const p = path;
+  Object.assign(p, { resolve: fake });
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign through a local alias invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-shadowing-mutation"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = { unrelated: true };
+function f() {
+  const p = path;
+  p.resolve = fake;
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "shadowing does not hide the real mutation (fail)" fail "$d"
+
+d="$base/alias-local-unmutated"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+{
+  const p = path;
+  void p;
+}
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an unmutated local alias is fine (pass)" pass "$d"
+
+d="$base/alias-same-name-different-scopes"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = { unrelated: true };
+function f() {
+  const p = { also: true };
+  return p;
+}
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "same name in different scopes without mutations (pass)" pass "$d"
+
+d="$base/alias-independent-reassignment"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+let counter = 1;
+counter += 1;
+counter = 5;
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "reassigning an independent local does not invalidate the helper (pass)" pass "$d"
+
+# --- Destructuring write targets ---------------------------------------------
+
+d="$base/destructure-array-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+[path.resolve] = [() => "@sentry/electron"];
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an array destructuring write to path.resolve (fail)" fail "$d"
+
+d="$base/destructure-object-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+({ replacement: path.resolve } = { replacement: () => "@sentry/electron" });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an object destructuring write to path.resolve (fail)" fail "$d"
+
+d="$base/destructure-alias-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+[p.resolve] = [fake];
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a destructuring write through an alias (fail)" fail "$d"
+
+d="$base/destructure-benign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const { a, b } = { a: 1, b: 2 };
+const [x = 1, , y] = [10];
+void a; void b; void x; void y;
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "normal destructuring that does not write a helper (pass)" pass "$d"
+
+# --- Prefix/postfix operators ------------------------------------------------
+
+d="$base/prefix-increment-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+++path.resolve;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a prefix ++ on a member invalidates the helper (fail)" fail "$d"
+
+d="$base/postfix-increment-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve++;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a postfix ++ on a member invalidates the helper (fail)" fail "$d"
+
+d="$base/prefix-decrement-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+--path.resolve;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a prefix -- on a member invalidates the helper (fail)" fail "$d"
+
+d="$base/postfix-decrement-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve--;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a postfix -- on a member invalidates the helper (fail)" fail "$d"
+
+d="$base/delete-member-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+delete path.resolve;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "delete on a member invalidates the helper (fail)" fail "$d"
+
+d="$base/prefix-read-only-operators"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+void path;
+typeof path;
+!path;
++path;
+-path;
+~path;
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "void/typeof/!/+/-/~ do not invalidate a helper (pass)" pass "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

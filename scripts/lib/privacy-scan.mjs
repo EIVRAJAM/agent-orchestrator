@@ -552,7 +552,7 @@ function isObservabilityTarget(text) {
 }
 
 // Root identifier of a property/element access chain (`path.posix.resolve` →
-// `path`), used to invalidate a helper whose members are mutated.
+// `path`).
 function rootIdentifierOf(node) {
   let current = unwrap(node);
   while (current) {
@@ -566,127 +566,263 @@ function rootIdentifierOf(node) {
   return null;
 }
 
-// Top-level `const` identifier bindings, so a simple local alias can be resolved.
-// Names declared in a nested scope (or as parameters) are recorded as `shadowed`;
-// `let`/`var`, reassignments, destructuring and function/class declarations make a
-// name `unsafe`. Neither shadowed nor unsafe names are ever trusted, and any
-// assignment to a binding or to one of its members invalidates it. The context also
-// records the file's trusted path/url helper bindings (`helpers`) and every locally
-// declared name (`declared`), so provenance is checked, not the name.
+// Write targets of an assignment left-hand side, including destructuring
+// patterns (`[a.b] = …`, `({ x: a.b } = …)`), defaults (`[a = 1] = …`), spreads
+// and omitted elements. Anything else is not treated as a write.
+function collectWriteTargets(node, out) {
+  const target = unwrap(node);
+  if (!target) return out;
+  if (ts.isIdentifier(target) || ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target)) {
+    out.push(target);
+    return out;
+  }
+  if (ts.isArrayLiteralExpression(target)) {
+    for (const element of target.elements) {
+      if (ts.isOmittedExpression(element)) continue;
+      collectWriteTargets(element, out);
+    }
+    return out;
+  }
+  if (ts.isSpreadElement(target)) {
+    collectWriteTargets(target.expression, out);
+    return out;
+  }
+  if (ts.isObjectLiteralExpression(target)) {
+    for (const property of target.properties) {
+      if (ts.isPropertyAssignment(property)) collectWriteTargets(property.initializer, out);
+      else if (ts.isShorthandPropertyAssignment(property)) out.push(property.name);
+      else if (ts.isSpreadAssignment(property)) collectWriteTargets(property.expression, out);
+    }
+    return out;
+  }
+  if (ts.isBinaryExpression(target) && ts.isAssignmentOperator(target.operatorToken.kind)) {
+    collectWriteTargets(target.left, out);
+    return out;
+  }
+  return out;
+}
+
+// Only `++`/`--` are mutating unary operators; `void`, `typeof`, `!`, `+`, `-`
+// and `~` are reads.
+const isIncrementToken = (kind) => kind === ts.SyntaxKind.PlusPlusToken || kind === ts.SyntaxKind.MinusMinusToken;
+
+function collectPatternNames(pattern, out = []) {
+  if (ts.isIdentifier(pattern)) {
+    out.push(pattern);
+    return out;
+  }
+  if (ts.isObjectBindingPattern(pattern) || ts.isArrayBindingPattern(pattern)) {
+    for (const element of pattern.elements) {
+      if (ts.isBindingElement(element)) collectPatternNames(element.name, out);
+    }
+  }
+  return out;
+}
+
+// Scope-aware binding model.
+//
+// Bindings are identified by their declaration's name node, never by text, so two
+// variables with the same name in different scopes are distinct. A reference
+// resolves to the nearest declaration in its lexical scope. An identifier alias
+// (`const p = path`) shares its target's object, so any observable object
+// mutation — a member write, a destructuring write, `Object.assign(…)`, … — at any
+// depth propagates across every alias that shares the object and invalidates the
+// original helper. A mutation observed anywhere in a function is propagated even
+// if the function is not proven to run (conservative); an alias that is never
+// written invalidates nothing.
 function createBindingContext(source) {
-  const bindings = new Map();
-  const unsafe = new Set();
-  const shadowed = new Set();
-  const declared = new Set();
-  const helpers = new Map();
-  // Identifier aliases (`const p = path`) that share one object, and the roots
-  // whose object was mutated. A mutation through any alias invalidates the whole
-  // shared-object component.
-  const aliasPairs = [];
-  const objectMutated = new Set();
-  const isTopLevel = (node) => {
-    let parent = node.parent;
-    while (parent) {
-      if (parent === source) return true;
-      if (ts.isFunctionLike(parent) || ts.isBlock(parent) || ts.isModuleBlock(parent)) return false;
-      parent = parent.parent;
-    }
-    return false;
+  const scopeBindings = new Map(); // scopeNode -> Map(name -> declNameNode)
+  const declInitializer = new Map(); // declNameNode -> initializer Expression
+  const mutableDecls = new Set(); // let/var/param/function/class/catch/destructured-non-const/duplicate
+  const reassignedDecls = new Set();
+  const objectMutatedDecls = new Set();
+  const helperSeeds = new Map(); // declNameNode -> { module, member }
+  let implicitRequireTainted = false;
+
+  const scopeKindOf = (node) => {
+    if (ts.isSourceFile(node)) return "source";
+    if (ts.isFunctionLike(node)) return "function";
+    if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node) || ts.isCatchClause(node)) return "block";
+    return null;
   };
-  const declareNames = (name) => {
-    if (ts.isIdentifier(name)) {
-      declared.add(name.text);
+  const nearestScope = (node, functionOnly) => {
+    let current = node.parent;
+    while (current) {
+      const kind = scopeKindOf(current);
+      if (kind === "source" || kind === "function") return current;
+      if (kind === "block" && !functionOnly) return current;
+      current = current.parent;
+    }
+    return source;
+  };
+  const registerName = (scope, nameNode, declName) => {
+    if (!scopeBindings.has(scope)) scopeBindings.set(scope, new Map());
+    const map = scopeBindings.get(scope);
+    if (map.has(nameNode.text) && map.get(nameNode.text) !== declName) {
+      // Two declarations of one name in one scope: ambiguous, neither is trusted.
+      mutableDecls.add(map.get(nameNode.text));
+      mutableDecls.add(declName);
       return;
     }
-    ts.forEachChild(name, declareNames);
+    map.set(nameNode.text, declName);
   };
-  const markNames = (name, topLevel) => {
-    if (ts.isIdentifier(name)) {
-      declared.add(name.text);
-      if (topLevel) unsafe.add(name.text);
-      else shadowed.add(name.text);
+  const registerPattern = (scope, pattern) => {
+    if (ts.isIdentifier(pattern)) {
+      registerName(scope, pattern, pattern);
       return;
     }
-    ts.forEachChild(name, (child) => markNames(child, topLevel));
+    if (ts.isObjectBindingPattern(pattern) || ts.isArrayBindingPattern(pattern)) {
+      for (const element of pattern.elements) {
+        if (ts.isBindingElement(element)) registerPattern(scope, element.name);
+      }
+    }
   };
-  // A write invalidates the target binding. A write to a *member* (or to an object
-  // through an object-level mutator) also marks the root object as mutated, so the
-  // mutation propagates to every identifier alias that shares that object.
-  const markWrite = (node, objectMutation) => {
-    const root = rootIdentifierOf(node);
-    if (!root) return;
-    unsafe.add(root.text);
-    if (objectMutation) objectMutated.add(root.text);
-  };
-  const visit = (node) => {
+  const visitScopes = (node) => {
     if (ts.isVariableDeclaration(node)) {
-      const topLevel = isTopLevel(node);
-      const isConst = ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const) !== 0;
-      if (topLevel && node.initializer && ts.isIdentifier(node.name)) {
-        declared.add(node.name.text);
-        const initializer = unwrap(node.initializer);
-        if (initializer && ts.isIdentifier(initializer)) aliasPairs.push([node.name.text, initializer.text]);
-        if (!isConst || bindings.has(node.name.text)) unsafe.add(node.name.text);
-        else bindings.set(node.name.text, node.initializer);
-      } else if (topLevel) {
-        // Top-level destructuring (`const { resolve } = require("node:path")`) is
-        // neutral: pass 2 decides trust from the require source. A top-level
-        // non-const destructuring/binding is unsafe.
-        if (isConst) declareNames(node.name);
-        else markNames(node.name, true);
+      const list = node.parent;
+      const isVar = ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.BlockScoped) === 0;
+      const isConst = ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const) !== 0;
+      const scope = nearestScope(node, isVar);
+      if (ts.isIdentifier(node.name)) {
+        registerName(scope, node.name, node.name);
+        if (node.initializer) declInitializer.set(node.name, node.initializer);
+        if (!isConst) mutableDecls.add(node.name);
       } else {
-        markNames(node.name, false);
+        registerPattern(scope, node.name);
+        if (!isConst) for (const name of collectPatternNames(node.name)) mutableDecls.add(name);
       }
-    }
-    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name) {
-      declared.add(node.name.text);
-      if (isTopLevel(node)) unsafe.add(node.name.text);
-      else shadowed.add(node.name.text);
-    }
-    if (ts.isParameter(node)) markNames(node.name, false);
-    if (ts.isCatchClause(node) && node.variableDeclaration) markNames(node.variableDeclaration.name, false);
-    if (ts.isImportDeclaration(node) && node.importClause) {
+    } else if (ts.isParameter(node)) {
+      const scope = nearestScope(node, true);
+      registerPattern(scope, node.name);
+      for (const name of collectPatternNames(node.name)) mutableDecls.add(name);
+    } else if (ts.isCatchClause(node) && node.variableDeclaration) {
+      registerPattern(node, node.variableDeclaration.name);
+      for (const name of collectPatternNames(node.variableDeclaration.name)) mutableDecls.add(name);
+    } else if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name) {
+      registerName(nearestScope(node, false), node.name, node.name);
+      mutableDecls.add(node.name);
+    } else if (ts.isImportDeclaration(node) && node.importClause) {
       const clause = node.importClause;
-      if (clause.name) declared.add(clause.name.text);
+      if (clause.name) registerName(source, clause.name, clause.name);
       const named = clause.namedBindings;
-      if (named && ts.isNamespaceImport(named)) declared.add(named.name.text);
+      if (named && ts.isNamespaceImport(named)) registerName(source, named.name, named.name);
       if (named && ts.isNamedImports(named)) {
-        for (const element of named.elements) declared.add(element.name.text);
+        for (const element of named.elements) registerName(source, element.name, element.name);
       }
     }
+    ts.forEachChild(node, visitScopes);
+  };
+  visitScopes(source);
+
+  // Resolve an identifier reference to the nearest declaration in its lexical
+  // scope (declarations are identified by their name node, so same-text bindings
+  // in different scopes stay distinct).
+  const resolve = (identifier) => {
+    let current = identifier.parent;
+    while (current) {
+      const map = scopeBindings.get(current);
+      if (map && map.has(identifier.text)) return map.get(identifier.text);
+      current = current.parent;
+    }
+    return null;
+  };
+
+  const markTarget = (targetNode) => {
+    const target = unwrap(targetNode);
+    if (!target) return;
+    if (ts.isIdentifier(target)) {
+      const decl = resolve(target);
+      if (decl) reassignedDecls.add(decl);
+      else if (target.text === "require") implicitRequireTainted = true;
+      return;
+    }
+    if (ts.isPropertyAccessExpression(target) || ts.isElementAccessExpression(target)) {
+      const root = rootIdentifierOf(target);
+      if (!root) return;
+      const decl = resolve(root);
+      if (decl) objectMutatedDecls.add(decl);
+      else if (root.text === "require") implicitRequireTainted = true;
+    }
+  };
+  const visitWrites = (node) => {
     if (ts.isBinaryExpression(node) && ts.isAssignmentOperator(node.operatorToken.kind)) {
-      const target = unwrap(node.left);
-      markWrite(node.left, !ts.isIdentifier(target));
-    }
-    if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
-      const target = unwrap(node.operand);
-      markWrite(node.operand, !ts.isIdentifier(target));
-    }
-    if (ts.isDeleteExpression(node)) {
-      const target = unwrap(node.expression);
-      markWrite(node.expression, !ts.isIdentifier(target));
-    }
-    if (ts.isCallExpression(node)) {
+      const targets = [];
+      collectWriteTargets(node.left, targets);
+      for (const target of targets) markTarget(target);
+    } else if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      isIncrementToken(node.operator)
+    ) {
+      markTarget(node.operand);
+    } else if (ts.isDeleteExpression(node)) {
+      markTarget(node.expression);
+    } else if (ts.isCallExpression(node)) {
       const callee = callTargetName(node.expression);
       if (
         (callee === "Object.assign" || callee === "Object.defineProperty" || callee === "Reflect.set") &&
         node.arguments.length >= 1
       ) {
-        markWrite(node.arguments[0], true);
+        const first = unwrap(node.arguments[0]);
+        if (first && (ts.isIdentifier(first) || ts.isPropertyAccessExpression(first) || ts.isElementAccessExpression(first))) {
+          const root = rootIdentifierOf(first);
+          if (root) {
+            const decl = resolve(root);
+            if (decl) objectMutatedDecls.add(decl);
+          }
+        }
       }
     }
-    ts.forEachChild(node, visit);
+    ts.forEachChild(node, visitWrites);
   };
-  visit(source);
-  // Propagate an object mutation across every identifier alias that shares the
-  // object, so `const p = path; p.resolve = fake;` invalidates `path` too. Cycles
-  // are handled by the union-find. A name that is not part of any alias keeps the
-  // invalidation added directly by markWrite.
+  visitWrites(source);
+  // Helper seeds: bindings imported from node:path/url, or required from them.
+  const registerSeed = (idNode, module, member) => {
+    if (!module || (!MODULE_PATH.has(module) && !MODULE_URL.has(module))) return;
+    helperSeeds.set(idNode, { module, member });
+  };
+  for (const statement of source.statements) {
+    if (ts.isImportDeclaration(statement) && statement.importClause) {
+      const module = nodeSpecifier(statement.moduleSpecifier);
+      const clause = statement.importClause;
+      if (clause.name) registerSeed(clause.name, module, null);
+      const named = clause.namedBindings;
+      if (named && ts.isNamespaceImport(named)) registerSeed(named.name, module, null);
+      if (named && ts.isNamedImports(named)) {
+        for (const element of named.elements) {
+          const imported = element.propertyName ? element.propertyName.text : element.name.text;
+          registerSeed(element.name, module, imported);
+        }
+      }
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        const initializer = unwrap(declaration.initializer);
+        if (!initializer || !ts.isCallExpression(initializer)) continue;
+        const callee = initializer.expression;
+        if (!ts.isIdentifier(callee) || callee.text !== "require") continue;
+        if (resolve(callee) !== null || implicitRequireTainted) continue;
+        if (initializer.arguments.length < 1) continue;
+        const module = nodeSpecifier(initializer.arguments[0]);
+        if (ts.isIdentifier(declaration.name)) {
+          registerSeed(declaration.name, module, null);
+        } else if (ts.isObjectBindingPattern(declaration.name)) {
+          for (const element of declaration.name.elements) {
+            if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+            const imported = element.propertyName && ts.isIdentifier(element.propertyName) ? element.propertyName.text : element.name.text;
+            registerSeed(element.name, module, imported);
+          }
+        }
+      }
+    }
+  }
+
+  // Identifier aliases share one object; a mutation propagates across the whole
+  // component (cycles included) and invalidates every member.
   const aliasParent = new Map();
-  const findRoot = (name) => {
-    let root = name;
+  const findRoot = (node) => {
+    let root = node;
     while (aliasParent.has(root) && aliasParent.get(root) !== root) root = aliasParent.get(root);
-    let current = name;
+    let current = node;
     while (aliasParent.has(current) && aliasParent.get(current) !== current) {
       const next = aliasParent.get(current);
       aliasParent.set(current, root);
@@ -694,91 +830,59 @@ function createBindingContext(source) {
     }
     return root;
   };
-  for (const [left, right] of aliasPairs) {
-    if (!aliasParent.has(left)) aliasParent.set(left, left);
-    if (!aliasParent.has(right)) aliasParent.set(right, right);
-    const leftRoot = findRoot(left);
-    const rightRoot = findRoot(right);
-    if (leftRoot !== rightRoot) aliasParent.set(leftRoot, rightRoot);
+  for (const [decl, initializer] of declInitializer) {
+    const target = unwrap(initializer);
+    if (!target || !ts.isIdentifier(target)) continue;
+    const other = resolve(target);
+    if (!other) continue;
+    if (!aliasParent.has(decl)) aliasParent.set(decl, decl);
+    if (!aliasParent.has(other)) aliasParent.set(other, other);
+    const declRoot = findRoot(decl);
+    const otherRoot = findRoot(other);
+    if (declRoot !== otherRoot) aliasParent.set(declRoot, otherRoot);
   }
-  if (objectMutated.size > 0 && aliasParent.size > 0) {
+  const invalidated = new Set(mutableDecls);
+  for (const decl of reassignedDecls) invalidated.add(decl);
+  for (const decl of objectMutatedDecls) invalidated.add(decl);
+  if (objectMutatedDecls.size > 0 && aliasParent.size > 0) {
     const groups = new Map();
-    for (const name of aliasParent.keys()) {
-      const root = findRoot(name);
+    for (const decl of aliasParent.keys()) {
+      const root = findRoot(decl);
       if (!groups.has(root)) groups.set(root, []);
-      groups.get(root).push(name);
+      groups.get(root).push(decl);
     }
-    for (const mutated of objectMutated) {
+    for (const mutated of objectMutatedDecls) {
       if (!aliasParent.has(mutated)) continue;
-      for (const member of groups.get(findRoot(mutated)) ?? []) unsafe.add(member);
+      for (const member of groups.get(findRoot(mutated)) ?? []) invalidated.add(member);
     }
   }
-  // `require` is trusted only as the implicit CommonJS global. A local
-  // declaration, shadowing, reassignment, parameter or import of `require` makes
-  // every `require(...)` in the file ambiguous, so no require binding is trusted.
-  const requireIsImplicit = !declared.has("require") && !shadowed.has("require") && !unsafe.has("require");
 
-  const addHelper = (name, module, member) => {
-    if (!name) return;
-    declared.add(name);
-    if (!MODULE_PATH.has(module) && !MODULE_URL.has(module)) return;
-    if (unsafe.has(name) || shadowed.has(name)) return;
-    helpers.set(name, { module, member });
+  const initializerOf = (decl) => (decl ? declInitializer.get(decl) ?? null : null);
+  const isInvalidated = (decl) => Boolean(decl) && invalidated.has(decl);
+  const seedOf = (decl) => {
+    if (!decl || invalidated.has(decl)) return null;
+    return helperSeeds.get(decl) ?? null;
   };
-  const addRequirePattern = (pattern, module) => {
-    if (ts.isIdentifier(pattern)) {
-      addHelper(pattern.text, module, null);
-      return;
-    }
-    if (!ts.isObjectBindingPattern(pattern)) return;
-    for (const element of pattern.elements) {
-      const local = element.name && ts.isIdentifier(element.name) ? element.name.text : null;
-      const imported = element.propertyName && ts.isIdentifier(element.propertyName) ? element.propertyName.text : local;
-      addHelper(local, module, imported);
-    }
-  };
-  for (const statement of source.statements) {
-    if (ts.isImportDeclaration(statement) && statement.importClause) {
-      const module = nodeSpecifier(statement.moduleSpecifier);
-      const clause = statement.importClause;
-      if (clause.name) addHelper(clause.name.text, module, null);
-      const named = clause.namedBindings;
-      if (named && ts.isNamespaceImport(named)) addHelper(named.name.text, module, null);
-      if (named && ts.isNamedImports(named)) {
-        for (const element of named.elements) {
-          const imported = element.propertyName ? element.propertyName.text : element.name.text;
-          addHelper(element.name.text, module, imported);
-        }
-      }
-    }
-    if (requireIsImplicit && ts.isVariableStatement(statement)) {
-      for (const declaration of statement.declarationList.declarations) {
-        const initializer = unwrap(declaration.initializer);
-        if (!initializer || !ts.isCallExpression(initializer)) continue;
-        if (!(ts.isIdentifier(initializer.expression) && initializer.expression.text === "require")) continue;
-        if (initializer.arguments.length < 1) continue;
-        addRequirePattern(declaration.name, nodeSpecifier(initializer.arguments[0]));
-      }
-    }
-  }
-  return { bindings, unsafe, shadowed, declared, helpers };
+  return { resolve, initializerOf, isInvalidated, seedOf };
 }
 
 // Identity of a trusted helper binding/expression as { module, member } (member is
-// null for a namespace import). Aliases (`const resolve = path.resolve`) are
-// resolved through the binding table.
+// null for a namespace import). Declarations are resolved through the scope-aware
+// binding table, so aliases and shadowing are handled by identity, not by text.
 function helperIdentity(node, ctx, seen) {
   const target = unwrap(node);
   if (!target) return null;
   if (ts.isIdentifier(target)) {
-    const direct = ctx.helpers.get(target.text);
-    if (direct) return direct;
-    if (ctx.unsafe.has(target.text) || ctx.shadowed.has(target.text) || seen.has(target.text)) return null;
-    const binding = ctx.bindings.get(target.text);
-    if (!binding) return null;
+    const decl = ctx.resolve(target);
+    if (!decl || seen.has(decl)) return null;
+    const seed = ctx.seedOf(decl);
+    if (seed) return seed;
+    if (ctx.isInvalidated(decl)) return null;
+    const initializer = ctx.initializerOf(decl);
+    if (!initializer) return null;
     const next = new Set(seen);
-    next.add(target.text);
-    return helperIdentity(binding, ctx, next);
+    next.add(decl);
+    return helperIdentity(initializer, ctx, next);
   }
   if (ts.isPropertyAccessExpression(target)) {
     const segments = [];
@@ -799,10 +903,10 @@ function helperIdentity(node, ctx, seen) {
 // from node:url/url. A local `URL` from another source is not trusted.
 function isTrustedUrlClass(node, ctx) {
   if (ts.isIdentifier(node) && node.text === "URL") {
-    if (ctx.shadowed.has("URL")) return false;
-    const helper = ctx.helpers.get("URL");
-    if (helper) return MODULE_URL.has(helper.module) && helper.member === "URL";
-    return !ctx.declared.has("URL");
+    const decl = ctx.resolve(node);
+    if (!decl) return true; // the un-shadowed global URL
+    const seed = ctx.seedOf(decl);
+    return Boolean(seed && MODULE_URL.has(seed.module) && seed.member === "URL");
   }
   if (ts.isPropertyAccessExpression(node) && node.name.text === "URL") {
     const base = helperIdentity(node.expression, ctx, new Set());
@@ -816,12 +920,13 @@ function resolveStaticString(node, ctx, seen) {
   if (!target) return null;
   if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) return target.text;
   if (ts.isIdentifier(target)) {
-    if (ctx.unsafe.has(target.text) || ctx.shadowed.has(target.text) || seen.has(target.text)) return null;
-    const binding = ctx.bindings.get(target.text);
-    if (!binding) return null;
+    const decl = ctx.resolve(target);
+    if (!decl || ctx.isInvalidated(decl) || seen.has(decl)) return null;
+    const initializer = ctx.initializerOf(decl);
+    if (!initializer) return null;
     const next = new Set(seen);
-    next.add(target.text);
-    return resolveStaticString(binding, ctx, next);
+    next.add(decl);
+    return resolveStaticString(initializer, ctx, next);
   }
   return null;
 }
@@ -840,11 +945,13 @@ function resolvePathCallArgument(node, ctx, seen) {
   }
   if (ts.isIdentifier(target)) {
     if (target.text === "__dirname" || target.text === "__filename") {
-      // Implicit only when not declared/shadowed/reassigned. A static local const
-      // is resolved and analysed; a dynamic or mutable one fails closed.
-      if (ctx.shadowed.has(target.text) || ctx.unsafe.has(target.text)) return null;
-      if (ctx.bindings.has(target.text)) return resolveStaticString(target, ctx, seen);
-      return "";
+      // Implicit only when not declared. A static local const is resolved and
+      // analysed; a mutable or non-static one fails closed.
+      const decl = ctx.resolve(target);
+      if (!decl) return "";
+      if (ctx.isInvalidated(decl)) return null;
+      if (!ctx.initializerOf(decl)) return null;
+      return resolveStaticString(target, ctx, seen);
     }
     return resolveStaticString(target, ctx, seen);
   }
@@ -867,14 +974,13 @@ function resolveStatic(node, ctx, seen) {
   if (ts.isObjectLiteralExpression(target)) return { type: "object", node: target };
   if (ts.isArrayLiteralExpression(target)) return { type: "array", node: target };
   if (ts.isIdentifier(target)) {
-    if (ctx.unsafe.has(target.text) || ctx.shadowed.has(target.text) || seen.has(target.text)) {
-      return { type: "dynamic" };
-    }
-    const binding = ctx.bindings.get(target.text);
-    if (!binding) return { type: "dynamic" };
+    const decl = ctx.resolve(target);
+    if (!decl || ctx.isInvalidated(decl) || seen.has(decl)) return { type: "dynamic" };
+    const initializer = ctx.initializerOf(decl);
+    if (!initializer) return { type: "dynamic" };
     const next = new Set(seen);
-    next.add(target.text);
-    return resolveStatic(binding, ctx, next);
+    next.add(decl);
+    return resolveStatic(initializer, ctx, next);
   }
   if (ts.isNewExpression(target)) {
     return resolveNewUrl(target, ctx, seen) ?? { type: "dynamic" };
@@ -1014,12 +1120,13 @@ function resolveConfigExport(expression, ctx, seen) {
   }
   if (ts.isObjectLiteralExpression(node)) return { type: "object", node };
   if (ts.isIdentifier(node)) {
-    if (ctx.unsafe.has(node.text) || ctx.shadowed.has(node.text) || seen.has(node.text)) return { type: "dynamic" };
-    const binding = ctx.bindings.get(node.text);
-    if (!binding) return { type: "dynamic" };
+    const decl = ctx.resolve(node);
+    if (!decl || ctx.isInvalidated(decl) || seen.has(decl)) return { type: "dynamic" };
+    const initializer = ctx.initializerOf(decl);
+    if (!initializer) return { type: "dynamic" };
     const next = new Set(seen);
-    next.add(node.text);
-    return resolveConfigExport(binding, ctx, next);
+    next.add(decl);
+    return resolveConfigExport(initializer, ctx, next);
   }
   if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
     const body = unwrap(node.body);
@@ -1189,8 +1296,11 @@ function inspectBabelPluginName(rel, lineOf, nameNode, optionsNode, ctx) {
   // inspected (a computed plugin name cannot be classified without false-
   // positiving every dynamic plugin — documented limit).
   const identifier = unwrap(nameNode);
-  if (identifier && ts.isIdentifier(identifier) && (ctx.unsafe.has(identifier.text) || ctx.shadowed.has(identifier.text))) {
-    report(rel, lineOf(identifier), null, "unanalyzable Babel plugin name (reassigned/shadowed binding; not allowlisted)");
+  if (identifier && ts.isIdentifier(identifier)) {
+    const decl = ctx.resolve(identifier);
+    if (decl && ctx.isInvalidated(decl)) {
+      report(rel, lineOf(identifier), null, "unanalyzable Babel plugin name (reassigned/shadowed binding; not allowlisted)");
+    }
   }
 }
 
