@@ -622,14 +622,19 @@ function collectPatternNames(pattern, out = []) {
 // Scope-aware binding model.
 //
 // Bindings are identified by their declaration's name node, never by text, so two
-// variables with the same name in different scopes are distinct. A reference
-// resolves to the nearest declaration in its lexical scope. An identifier alias
-// (`const p = path`) shares its target's object, so any observable object
-// mutation — a member write, a destructuring write, `Object.assign(…)`, … — at any
-// depth propagates across every alias that shares the object and invalidates the
-// original helper. A mutation observed anywhere in a function is propagated even
-// if the function is not proven to run (conservative); an alias that is never
-// written invalidates nothing.
+// variables with the same name — including a loop header's binding — in different
+// scopes are distinct. A reference resolves to the nearest declaration in its
+// lexical scope. Scopes are the module, blocks, function bodies, `switch` case
+// blocks, `catch` clauses and loop headers (`for`/`for…of`/`for…in`); `var` belongs
+// to the nearest function, `let`/`const` to the nearest block. An identifier alias
+// (`const p = path`) shares its target's object, so any observable object mutation
+// — a member write, a destructuring write, `Object.assign(…)`, … — at any depth
+// propagates across every alias that shares the object and invalidates the
+// original helper. For a statically-resolvable local function (declaration, arrow
+// or function expression, plus simple alias chains), a call relates positional
+// arguments to parameters, so a mutation through a parameter invalidates the
+// argument. Mutations are propagated even when a function is not proven to run
+// (conservative); an alias that is never written invalidates nothing.
 function createBindingContext(source) {
   const scopeBindings = new Map(); // scopeNode -> Map(name -> declNameNode)
   const declInitializer = new Map(); // declNameNode -> initializer Expression
@@ -642,7 +647,17 @@ function createBindingContext(source) {
   const scopeKindOf = (node) => {
     if (ts.isSourceFile(node)) return "source";
     if (ts.isFunctionLike(node)) return "function";
-    if (ts.isBlock(node) || ts.isModuleBlock(node) || ts.isCaseBlock(node) || ts.isCatchClause(node)) return "block";
+    if (
+      ts.isBlock(node) ||
+      ts.isModuleBlock(node) ||
+      ts.isCaseBlock(node) ||
+      ts.isCatchClause(node) ||
+      ts.isForStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isForInStatement(node)
+    ) {
+      return "block";
+    }
     return null;
   };
   const nearestScope = (node, functionOnly) => {
@@ -700,6 +715,10 @@ function createBindingContext(source) {
       for (const name of collectPatternNames(node.variableDeclaration.name)) mutableDecls.add(name);
     } else if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name) {
       registerName(nearestScope(node, false), node.name, node.name);
+      mutableDecls.add(node.name);
+    } else if (ts.isFunctionExpression(node) && node.name) {
+      // A named function expression binds its name inside its own body.
+      registerName(node, node.name, node.name);
       mutableDecls.add(node.name);
     } else if (ts.isImportDeclaration(node) && node.importClause) {
       const clause = node.importClause;
@@ -817,7 +836,8 @@ function createBindingContext(source) {
   }
 
   // Identifier aliases share one object; a mutation propagates across the whole
-  // component (cycles included) and invalidates every member.
+  // component (cycles included). `for…of [a, b]` relates the loop binding to each
+  // statically resolvable element of a literal iterable.
   const aliasParent = new Map();
   const findRoot = (node) => {
     let root = node;
@@ -830,32 +850,123 @@ function createBindingContext(source) {
     }
     return root;
   };
+  const linkAliases = (left, right) => {
+    if (!left || !right || left === right) return;
+    if (!aliasParent.has(left)) aliasParent.set(left, left);
+    if (!aliasParent.has(right)) aliasParent.set(right, right);
+    const leftRoot = findRoot(left);
+    const rightRoot = findRoot(right);
+    if (leftRoot !== rightRoot) aliasParent.set(leftRoot, rightRoot);
+  };
   for (const [decl, initializer] of declInitializer) {
     const target = unwrap(initializer);
-    if (!target || !ts.isIdentifier(target)) continue;
-    const other = resolve(target);
-    if (!other) continue;
-    if (!aliasParent.has(decl)) aliasParent.set(decl, decl);
-    if (!aliasParent.has(other)) aliasParent.set(other, other);
-    const declRoot = findRoot(decl);
-    const otherRoot = findRoot(other);
-    if (declRoot !== otherRoot) aliasParent.set(declRoot, otherRoot);
+    if (target && ts.isIdentifier(target)) linkAliases(decl, resolve(target));
   }
+  const collectForOfLiteralElements = (node) => {
+    if (ts.isForOfStatement(node) && ts.isVariableDeclarationList(node.initializer)) {
+      const iterable = unwrap(node.expression);
+      if (ts.isArrayLiteralExpression(iterable)) {
+        for (const declaration of node.initializer.declarations) {
+          if (!ts.isIdentifier(declaration.name)) continue;
+          for (const element of iterable.elements) {
+            if (ts.isOmittedExpression(element) || ts.isSpreadElement(element)) continue;
+            const elementNode = unwrap(element);
+            if (elementNode && ts.isIdentifier(elementNode)) linkAliases(resolve(declaration.name), resolve(elementNode));
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, collectForOfLiteralElements);
+  };
+  collectForOfLiteralElements(source);
+
+  // A declaration (or anything sharing its object) that is object-mutated is
+  // invalidated; adding one immediately pulls in its whole alias component.
+  const mutated = new Set();
+  const addMutated = (decl) => {
+    if (!decl || mutated.has(decl)) return false;
+    if (aliasParent.has(decl)) {
+      const root = findRoot(decl);
+      for (const candidate of aliasParent.keys()) if (findRoot(candidate) === root) mutated.add(candidate);
+    }
+    mutated.add(decl);
+    return true;
+  };
+  for (const decl of objectMutatedDecls) addMutated(decl);
+  const isMutated = (decl) => Boolean(decl) && mutated.has(decl);
+
+  // Local functions statically resolved through a binding: function declarations,
+  // arrow/function expressions assigned directly, and simple alias chains.
+  const functionOf = new Map();
+  const functions = [];
+  const collectFunctions = (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      functions.push({ decl: node.name, fn: node, from: null });
+    } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const initializer = unwrap(node.initializer);
+      if (initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))) {
+        functions.push({ decl: node.name, fn: initializer, from: null });
+      } else if (initializer && ts.isIdentifier(initializer)) {
+        functions.push({ decl: node.name, fn: null, from: initializer });
+      }
+    }
+    ts.forEachChild(node, collectFunctions);
+  };
+  collectFunctions(source);
+  for (const entry of functions) if (entry.fn) functionOf.set(entry.decl, entry.fn);
+  for (let pass = 0; pass <= functions.length; pass += 1) {
+    let changed = false;
+    for (const entry of functions) {
+      if (entry.fn || functionOf.has(entry.decl)) continue;
+      const sourceDecl = resolve(entry.from);
+      if (sourceDecl && functionOf.has(sourceDecl)) {
+        functionOf.set(entry.decl, functionOf.get(sourceDecl));
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  // Relate each call's positional arguments to its parameters: if a parameter (or
+  // an alias of it) is object-mutated, the corresponding argument is tainted. The
+  // fixpoint also covers calls that pass a parameter on to another local function.
+  const taintArgument = (argument) => {
+    const node = unwrap(argument);
+    if (!node || !ts.isIdentifier(node)) return false;
+    return addMutated(resolve(node));
+  };
+  const applyCall = (call) => {
+    const fn = functionOf.get(resolve(call.expression));
+    if (!fn) return false;
+    let changed = false;
+    for (let index = 0; index < fn.parameters.length; index += 1) {
+      const parameter = fn.parameters[index];
+      const names = collectPatternNames(parameter.name);
+      const mutatedParam = names.some(isMutated);
+      if (parameter.dotDotDotToken) {
+        if (mutatedParam) for (let rest = index; rest < call.arguments.length; rest += 1) changed = taintArgument(call.arguments[rest]) || changed;
+        break;
+      }
+      const argument = call.arguments[index];
+      if (mutatedParam && argument) changed = taintArgument(argument) || changed;
+    }
+    return changed;
+  };
+  const calls = [];
+  const collectCalls = (node) => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) calls.push(node);
+    ts.forEachChild(node, collectCalls);
+  };
+  collectCalls(source);
+  for (let pass = 0; pass <= calls.length + 1; pass += 1) {
+    let changed = false;
+    for (const call of calls) changed = applyCall(call) || changed;
+    if (!changed) break;
+  }
+
   const invalidated = new Set(mutableDecls);
   for (const decl of reassignedDecls) invalidated.add(decl);
-  for (const decl of objectMutatedDecls) invalidated.add(decl);
-  if (objectMutatedDecls.size > 0 && aliasParent.size > 0) {
-    const groups = new Map();
-    for (const decl of aliasParent.keys()) {
-      const root = findRoot(decl);
-      if (!groups.has(root)) groups.set(root, []);
-      groups.get(root).push(decl);
-    }
-    for (const mutated of objectMutatedDecls) {
-      if (!aliasParent.has(mutated)) continue;
-      for (const member of groups.get(findRoot(mutated)) ?? []) invalidated.add(member);
-    }
-  }
+  for (const decl of mutated) invalidated.add(decl);
 
   const initializerOf = (decl) => (decl ? declInitializer.get(decl) ?? null : null);
   const isInvalidated = (decl) => Boolean(decl) && invalidated.has(decl);

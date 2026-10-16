@@ -1442,6 +1442,246 @@ export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } }
 EOF
 check "void/typeof/!/+/-/~ do not invalidate a helper (pass)" pass "$d"
 
+# --- Argument/parameter propagation ------------------------------------------
+
+d="$base/fn-decl-param-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function replaceResolver(helper) {
+  helper.resolve = () => "@sentry/electron";
+}
+replaceResolver(path);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating a function-declaration parameter invalidates the argument (fail)" fail "$d"
+
+d="$base/arrow-param-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const replaceResolver = (helper) => {
+  helper.resolve = fake;
+};
+replaceResolver(path);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating an arrow-function parameter invalidates the argument (fail)" fail "$d"
+
+d="$base/fn-expr-param-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const replaceResolver = function (helper) {
+  helper.resolve = fake;
+};
+replaceResolver(path);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating a function-expression parameter invalidates the argument (fail)" fail "$d"
+
+d="$base/param-alias-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f(helper) {
+  const alias = helper;
+  alias.resolve = fake;
+}
+f(path);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a parameter copied to an alias then mutated invalidates the argument (fail)" fail "$d"
+
+d="$base/param-object-assign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f(helper) {
+  Object.assign(helper, { resolve: fake });
+}
+f(path);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign on a parameter invalidates the argument (fail)" fail "$d"
+
+d="$base/call-chain-param-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function inner(p) { p.resolve = fake; }
+function outer(h) { inner(h); }
+outer(path);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a local call chain that mutates a parameter invalidates the argument (fail)" fail "$d"
+
+d="$base/fn-binding-shadowed"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function replaceResolver(x) { void x; }
+function outer() {
+  function replaceResolver(helper) { helper.resolve = fake; }
+  replaceResolver(path);
+}
+outer();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a shadowed function binding is resolved to the correct function (fail)" fail "$d"
+
+d="$base/fn-param-read-only"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function readResolver(helper) { return helper.resolve; }
+readResolver(path);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a function that only reads the parameter does not invalidate it (pass)" pass "$d"
+
+d="$base/fn-mutates-independent-object"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function f(o) { o.resolve = fake; }
+f(local);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a function that mutates an independent object leaves the helper trusted (pass)" pass "$d"
+
+d="$base/same-name-functions"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = {};
+function f(x) { x.a = 1; }
+function outer() { function f(y) { y.b = 1; } f(local); }
+f(local);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "two functions with the same name in different scopes stay independent (pass)" pass "$d"
+
+d="$base/dynamic-callee-not-attributed"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const fns = { replace() {} };
+fns.replace(path);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a dynamic callee is not attributed to a local function (pass)" pass "$d"
+
+# --- Loop-header scopes ------------------------------------------------------
+
+d="$base/loop-for-header-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = { unrelated: true };
+for (const p = path; ; ) {
+  p.resolve = () => "@sentry/electron";
+  break;
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a for-header binding aliasing path invalidates it when mutated (fail)" fail "$d"
+
+d="$base/loop-for-of-array-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+for (const p of [path]) {
+  p.resolve = fake;
+  break;
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a for-of over [path] invalidates path when the binding is mutated (fail)" fail "$d"
+
+d="$base/loop-nested-alias-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+for (const a of [path]) {
+  for (const b = a; ; ) {
+    b.resolve = fake;
+    break;
+  }
+  break;
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a nested loop alias that mutates the helper invalidates it (fail)" fail "$d"
+
+d="$base/loop-alias-object-assign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+for (const p = path; ; ) {
+  Object.assign(p, { resolve: fake });
+  break;
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign on a loop alias invalidates the helper (fail)" fail "$d"
+
+d="$base/loop-outer-same-name-independent"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = { unrelated: true };
+for (const p = { other: true }; ; ) {
+  void p;
+  break;
+}
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an outer same-name binding is not affected by an independent loop alias (pass)" pass "$d"
+
+d="$base/loop-var-function-scoped"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+for (var i = 0; i < 1; i += 1) {
+  void i;
+}
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a var in a loop header stays function-scoped (pass)" pass "$d"
+
+d="$base/two-loops-homonymous"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+for (const p of [{ a: 1 }]) { void p; break; }
+for (const p of [{ b: 2 }]) { void p; break; }
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "two loops with homonymous independent bindings (pass)" pass "$d"
+
+d="$base/loop-read-only"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+for (const p of [path]) { void p; break; }
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a loop that only reads the helper leaves it trusted (pass)" pass "$d"
+
+# --- Named function expressions and class static blocks ----------------------
+
+d="$base/named-fe-shadow-import"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const f = function path() { path.resolve = fake; };
+f();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a named function expression shadows the import without invalidating it (pass)" pass "$d"
+
+d="$base/class-static-local-shadow"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+class C {
+  static { const path = { resolve: 1 }; path.resolve = fake; }
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a class static-block local shadows the import without invalidating it (pass)" pass "$d"
+
+d="$base/class-static-mutates-helper"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+class C {
+  static { path.resolve = fake; }
+}
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a class static block that mutates the import invalidates it (fail)" fail "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0
