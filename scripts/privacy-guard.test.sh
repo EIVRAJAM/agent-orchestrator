@@ -841,6 +841,251 @@ module.exports = { plugins: [[benignPlugin, { options: {} }]] };
 EOF
 check "a benign Babel plugin name via a binding (pass)" pass "$d"
 
+# --- require provenance -------------------------------------------------------
+
+d="$base/require-local-const"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const require = () => ({ resolve() { return "@sentry/electron"; } });
+const path = require("node:path");
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a local const named require makes require untrusted (fail)" fail "$d"
+
+d="$base/require-local-function"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+function require() { return { resolve() { return "@sentry/electron"; } }; }
+const path = require("node:path");
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a local function named require makes require untrusted (fail)" fail "$d"
+
+d="$base/require-parameter"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+function build(require) { const path = require("node:path"); return path.resolve(__dirname, "src"); }
+export default { resolve: { alias: { reporter: build(0) } } };
+EOF
+check "require received as a parameter (fail)" fail "$d"
+
+d="$base/require-reassigned"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+require = fake;
+const path = require("node:path");
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a reassigned require binding (fail)" fail "$d"
+
+# --- helper member mutations -------------------------------------------------
+
+d="$base/helper-mutate-resolve"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+path.resolve = () => "@sentry/electron";
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an assignment to path.resolve invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-join"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.join = fake;
+export default { resolve: { alias: { reporter: path.join(__dirname, "src") } } };
+EOF
+check "an assignment to path.join invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-posix-resolve"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.posix.resolve = fake;
+export default { resolve: { alias: { reporter: path.posix.resolve(__dirname, "src") } } };
+EOF
+check "an assignment to path.posix.resolve invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-posix-join"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.posix.join = fake;
+export default { resolve: { alias: { reporter: path.posix.join(__dirname, "src") } } };
+EOF
+check "an assignment to path.posix.join invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-fileurltopath"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as url from "node:url";
+url.fileURLToPath = fake;
+export default { resolve: { alias: { reporter: url.fileURLToPath(__dirname) } } };
+EOF
+check "an assignment to url.fileURLToPath invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-url-class"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as url from "node:url";
+url.URL = FakeURL;
+export default { resolve: { alias: { reporter: url.URL.name } } };
+EOF
+check "an assignment to url.URL invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-bracket"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path["resolve"] = fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an element-access assignment to path[\"resolve\"] invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-compound"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve += fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a compound assignment to path.resolve invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-increment"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve++;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an increment of path.resolve invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-mutate-object-assign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+Object.assign(path, { resolve: fake });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign(path, …) invalidates the helper (fail)" fail "$d"
+
+d="$base/helper-unmodified-resolve-join"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src/ui"), "@u2": path.join(__dirname, "src") } } };
+EOF
+check "unmodified path.resolve and path.join (pass)" pass "$d"
+
+d="$base/helper-unmodified-posix"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+export default { resolve: { alias: { "@ui": path.posix.resolve(__dirname, "src"), "@u2": path.posix.join(__dirname, "src") } } };
+EOF
+check "unmodified path.posix.resolve and path.posix.join (pass)" pass "$d"
+
+d="$base/helper-unmodified-fileurltopath"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as url from "node:url";
+export default { resolve: { alias: { "@ui": url.fileURLToPath("./src/ui") } } };
+EOF
+check "unmodified url.fileURLToPath (pass)" pass "$d"
+
+d="$base/helper-unmodified-url-class"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { fileURLToPath, URL } from "node:url";
+export default { resolve: { alias: { "@ui": fileURLToPath(new URL("./src/ui", import.meta.url)) } } };
+EOF
+check "unmodified URL class (pass)" pass "$d"
+
+# --- __dirname / __filename / import.meta.url --------------------------------
+
+d="$base/dirname-implicit"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src/ui") } } };
+EOF
+check "the implicit __dirname is a valid base (pass)" pass "$d"
+
+d="$base/filename-implicit"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+export default { resolve: { alias: { "@ui": path.resolve(__filename, "src/ui") } } };
+EOF
+check "the implicit __filename is a valid base (pass)" pass "$d"
+
+d="$base/dirname-local-sdk"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+const __dirname = "node_modules/@sentry";
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "electron") } } };
+EOF
+check "a local const __dirname pointing at an SDK (fail)" fail "$d"
+
+d="$base/dirname-local-benign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+const __dirname = "src";
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "ui") } } };
+EOF
+check "a local const __dirname benign and static (pass after resolving)" pass "$d"
+
+d="$base/dirname-let"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+let __dirname = "src";
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "ui") } } };
+EOF
+check "a mutable let __dirname (fail)" fail "$d"
+
+d="$base/dirname-parameter"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+function build(__dirname) { return path.resolve(__dirname, "ui"); }
+export default { resolve: { alias: { "@ui": build(0) } } };
+EOF
+check "a parameter named __dirname (fail)" fail "$d"
+
+d="$base/import-meta-url"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { fileURLToPath } from "node:url";
+export default { resolve: { alias: { "@ui": fileURLToPath(new URL("./src/ui", import.meta.url)) } } };
+EOF
+check "import.meta.url is a valid intrinsic base (pass)" pass "$d"
+
+# --- Relative re-exports and Vitest discovery --------------------------------
+
+d="$base/vitest-reexport-observability"; make_fixture "$d"
+put "$d/frontend/vitest.config.ts" <<'EOF'
+export { default } from "./base";
+EOF
+put "$d/frontend/base.ts" <<'EOF'
+export default { resolve: { alias: { reporter: "@sentry/electron" } } };
+EOF
+check "a Vitest config re-exporting a config with an observability alias (fail)" fail "$d"
+
+d="$base/vite-reexport-benign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export { default } from "./base";
+EOF
+put "$d/frontend/base.ts" <<'EOF'
+export default { resolve: { alias: { "@ui": "./src/ui" } } };
+EOF
+check "a relative re-export of a benign config (pass)" pass "$d"
+
+d="$base/reexport-missing"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export { default } from "./does-not-exist";
+EOF
+check "a relative re-export of a missing file (fail)" fail "$d"
+
+d="$base/reexport-cycle"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export { default } from "./other";
+EOF
+put "$d/frontend/other.ts" <<'EOF'
+export { default } from "./vite.config";
+EOF
+check "a cycle of relative re-exports (fail)" fail "$d"
+
+d="$base/reexport-bare-package"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export { default } from "some-package";
+EOF
+check "a default re-export from a non-relative package (fail)" fail "$d"
+
+d="$base/vitest-config-direct-alias"; make_fixture "$d"
+put "$d/packages/product-ui/vitest.config.ts" <<'EOF'
+export default { resolve: { alias: { reporter: "@sentry/electron" } } };
+EOF
+check "an observability alias in a discovered vitest.config.ts (fail)" fail "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

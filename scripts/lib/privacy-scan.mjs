@@ -424,7 +424,10 @@ function scanGoFile(rel, text) {
 // observability literals inside it are flagged, and a fully computed module name
 // is a documented gap (see docs/privacy-fork.md).
 
-const VITE_CONFIG_NAME = /^vite(\.[^/\\]+)?\.config\.[cm]?[jt]s$/;
+// Vite and Vitest both resolve modules through Vite's resolver, so both config
+// families are part of the resolution surface. A test file
+// (`vite.renderer.config.test.ts`) or `vitest.workspace.*` is not matched.
+const VITE_CONFIG_NAME = /^(?:vite|vitest)(\.[^/\\]+)?\.config\.[cm]?[jt]s$/;
 const BABEL_CONFIG_NAME = /^babel\.config\.[cm]?[jt]s$/;
 const METRO_CONFIG_NAME = /^metro\.config\.[cm]?[jt]s$/;
 
@@ -533,15 +536,6 @@ const MODULE_URL = new Set(["node:url", "url"]);
 const PATH_MEMBERS = new Set(["resolve", "join", "posix.resolve", "posix.join"]);
 const URL_MEMBERS = new Set(["fileURLToPath"]);
 
-// A filesystem base that contributes no package name (the module's own location).
-function isLocalBase(node) {
-  if (ts.isIdentifier(node) && (node.text === "__dirname" || node.text === "__filename")) return true;
-  if (ts.isPropertyAccessExpression(node) && node.expression.kind === ts.SyntaxKind.MetaProperty && node.name.text === "url") {
-    return true;
-  }
-  return false;
-}
-
 // True when a path string names an observability package as a path segment (e.g.
 // "node_modules/@sentry/electron" or "node_modules/posthog-js").
 function pathReferencesObservability(text) {
@@ -557,12 +551,28 @@ function isObservabilityTarget(text) {
   return OBSERVABILITY_SPECIFIER.test(text) || pathReferencesObservability(text);
 }
 
+// Root identifier of a property/element access chain (`path.posix.resolve` →
+// `path`), used to invalidate a helper whose members are mutated.
+function rootIdentifierOf(node) {
+  let current = unwrap(node);
+  while (current) {
+    if (ts.isIdentifier(current)) return current;
+    if (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+      current = unwrap(current.expression);
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
 // Top-level `const` identifier bindings, so a simple local alias can be resolved.
 // Names declared in a nested scope (or as parameters) are recorded as `shadowed`;
 // `let`/`var`, reassignments, destructuring and function/class declarations make a
-// name `unsafe`. Neither shadowed nor unsafe names are ever trusted. The context
-// also records the file's trusted path/url helper bindings (`helpers`) and every
-// locally declared name (`declared`), so provenance is checked, not the name.
+// name `unsafe`. Neither shadowed nor unsafe names are ever trusted, and any
+// assignment to a binding or to one of its members invalidates it. The context also
+// records the file's trusted path/url helper bindings (`helpers`) and every locally
+// declared name (`declared`), so provenance is checked, not the name.
 function createBindingContext(source) {
   const bindings = new Map();
   const unsafe = new Set();
@@ -594,6 +604,13 @@ function createBindingContext(source) {
     }
     ts.forEachChild(name, (child) => markNames(child, topLevel));
   };
+  // Any assignment (`=`, `+=`, `++`, `delete`, `Object.assign`, …) to a binding or
+  // to a member of it invalidates the whole binding: a mutated helper is never
+  // trusted.
+  const markMutated = (node) => {
+    const root = rootIdentifierOf(node);
+    if (root) unsafe.add(root.text);
+  };
   const visit = (node) => {
     if (ts.isVariableDeclaration(node)) {
       const topLevel = isTopLevel(node);
@@ -619,13 +636,34 @@ function createBindingContext(source) {
     }
     if (ts.isParameter(node)) markNames(node.name, false);
     if (ts.isCatchClause(node) && node.variableDeclaration) markNames(node.variableDeclaration.name, false);
-    if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left)) unsafe.add(node.left.text);
-    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && ts.isIdentifier(node.operand)) {
-      unsafe.add(node.operand.text);
+    if (ts.isImportDeclaration(node) && node.importClause) {
+      const clause = node.importClause;
+      if (clause.name) declared.add(clause.name.text);
+      const named = clause.namedBindings;
+      if (named && ts.isNamespaceImport(named)) declared.add(named.name.text);
+      if (named && ts.isNamedImports(named)) {
+        for (const element of named.elements) declared.add(element.name.text);
+      }
+    }
+    if (ts.isBinaryExpression(node)) markMutated(node.left);
+    if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) markMutated(node.operand);
+    if (ts.isDeleteExpression(node)) markMutated(node.expression);
+    if (ts.isCallExpression(node)) {
+      const callee = callTargetName(node.expression);
+      if (
+        (callee === "Object.assign" || callee === "Object.defineProperty" || callee === "Reflect.set") &&
+        node.arguments.length >= 1
+      ) {
+        markMutated(node.arguments[0]);
+      }
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
+  // `require` is trusted only as the implicit CommonJS global. A local
+  // declaration, shadowing, reassignment, parameter or import of `require` makes
+  // every `require(...)` in the file ambiguous, so no require binding is trusted.
+  const requireIsImplicit = !declared.has("require") && !shadowed.has("require") && !unsafe.has("require");
 
   const addHelper = (name, module, member) => {
     if (!name) return;
@@ -660,7 +698,7 @@ function createBindingContext(source) {
         }
       }
     }
-    if (ts.isVariableStatement(statement)) {
+    if (requireIsImplicit && ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
         const initializer = unwrap(declaration.initializer);
         if (!initializer || !ts.isCallExpression(initializer)) continue;
@@ -739,8 +777,24 @@ function resolvePathCallArgument(node, ctx, seen) {
   const target = unwrap(node);
   if (!target) return null;
   if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) return target.text;
-  if (isLocalBase(target)) return "";
-  if (ts.isIdentifier(target)) return resolveStaticString(target, ctx, seen);
+  // import.meta.url is an intrinsic, non-reassignable base.
+  if (
+    ts.isPropertyAccessExpression(target) &&
+    target.expression.kind === ts.SyntaxKind.MetaProperty &&
+    target.name.text === "url"
+  ) {
+    return "";
+  }
+  if (ts.isIdentifier(target)) {
+    if (target.text === "__dirname" || target.text === "__filename") {
+      // Implicit only when not declared/shadowed/reassigned. A static local const
+      // is resolved and analysed; a dynamic or mutable one fails closed.
+      if (ctx.shadowed.has(target.text) || ctx.unsafe.has(target.text)) return null;
+      if (ctx.bindings.has(target.text)) return resolveStaticString(target, ctx, seen);
+      return "";
+    }
+    return resolveStaticString(target, ctx, seen);
+  }
   return null;
 }
 
@@ -788,8 +842,8 @@ function resolveStatic(node, ctx, seen) {
       if (argument && ts.isNewExpression(argument)) {
         return resolveNewUrl(argument, ctx, seen) ?? { type: "dynamic" };
       }
-      const text = resolveStaticString(argument, ctx, seen);
-      return text === null ? { type: "dynamic" } : { type: "path", value: text };
+      const part = resolvePathCallArgument(argument, ctx, seen);
+      return part === null ? { type: "dynamic" } : { type: "path", value: part };
     }
     return { type: "dynamic" };
   }
