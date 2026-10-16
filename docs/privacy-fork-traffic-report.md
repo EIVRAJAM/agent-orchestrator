@@ -10,10 +10,12 @@ what was and was not observed, and about the limits of the method.
 > authority, Go policy coherence), `cecf213db` (import-specifier scanner, widened
 > coverage, per-condition self-tests), `ff51dbbe5` (multiline import/require
 > detection, package-name boundaries, backtick, `overrides`/`resolutions`),
-> `e66d5af01` (AST-based import analysis and indirection-alias detection), and
-> `66e069c77` (full Vite/Babel/Metro resolution-config coverage and a
-> manifest-scoped dependency allowlist). It is kept as **historical /
-> comparative** evidence, not as execution evidence of the current HEAD. It stays
+> `e66d5af01` (AST-based import analysis and indirection-alias detection),
+> `66e069c77` (broadened Vite/Babel/Metro resolution-config discovery and a
+> manifest-scoped dependency allowlist), and `cdfdfea64` (strict fail-closed
+> classification of alias targets, shorthand/spread/indirection). It is kept as
+> **historical / comparative** evidence, not as execution evidence of the current
+> HEAD. It stays
 > relevant because the daemon outbound paths it exercised — `newTelemetrySink`
 > (local-only), the renderer/mobile init, and the daemon env-stamping — are
 > unchanged by those commits, and the Go change made the Sentry DSN path strictly

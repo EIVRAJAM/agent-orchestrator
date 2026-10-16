@@ -59,9 +59,12 @@ flipped, so a change fails closed and loudly instead of exporting silently.
      strings/templates/comments/regex) and indirection-alias detection (npm
      `npm:` aliases, `package.json` `imports`, tsconfig `paths`, Vite
      `resolve.alias`).
-  6. `66e069c77` — full resolution-config coverage (Vite anywhere under
+  6. `66e069c77` — broadened resolution-config discovery (Vite anywhere under
      `frontend/**`/`packages/**`, Babel `module-resolver`, Metro
      `extraNodeModules`) and a manifest-scoped dependency allowlist.
+  7. `cdfdfea64` — strict static classification of alias targets
+     (fail-closed on any partially literal / dynamic target), shorthand/spread/
+     indirection coverage, and the full `babel-plugin-module-resolver` name.
 
 ## 3. Inventory of mechanisms
 
@@ -274,11 +277,26 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      `vite.<name>.config.*`), Babel (`babel.config.*`) and Metro
      (`metro.config.*`) — and inspected through the AST (not every string):
      Vite `resolve.alias` in object and `{find, replacement}` array form, inside
-     `defineConfig(...)` or a direct export; Babel `module-resolver` aliases;
-     Metro `resolver.extraNodeModules`. A dynamic (non-literal) alias map or
-     target is rejected fail-closed. Metro `resolver.resolveRequest` is a
-     function, so only observability literals inside it are flagged; a fully
-     computed module name is a documented gap. tsconfig values are checked too.
+     `defineConfig(...)` or a direct export; Babel `module-resolver`
+     (`module-resolver`, `babel-plugin-module-resolver`, scoped variants);
+     Metro `resolver.extraNodeModules`. Shorthand properties, spreads, and
+     `resolve`/`alias`/`extraNodeModules` stored in a variable are handled:
+     resolved when a top-level `const` binding is fully static, rejected
+     fail-closed otherwise. tsconfig values are checked too.
+   - **strict alias-target classification** (fail-closed): a target is accepted
+     only when its value is **fully determined** — a string / no-substitution
+     template literal, or a recognized local construction (`path.resolve`/
+     `path.join` whose arguments are all static or known local bases such as
+     `__dirname`, and `fileURLToPath(new URL(<static>, …))`). The mere presence of
+     a benign literal inside an otherwise dynamic expression is **not** enough: a
+     call, an identifier bound to a dynamic value, a concatenation, an
+     interpolated template, a property access, `process.env`, a spread, or a
+     destructured/reassigned binding are all rejected. A resolved path that names
+     an observability package as a path segment (`node_modules/@sentry/electron`,
+     `node_modules/posthog-js`) also fails.
+   - **deliberate exception**: Metro `resolver.resolveRequest` is a function, so
+     only observability literals inside it are flagged; a **fully computed**
+     module name there is not detected (documented gap).
 2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): one fixture per
    condition, each built from the real policy files with a single injection, so
    a working pattern cannot hide a broken one. Covered: direct `Sentry.init`;
@@ -305,9 +323,18 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    `vite.config.ts`, a config outside `frontend/`, and the
    `{ find, replacement }` array form (fail); a Vite config whose SDK string is
    not an alias and a benign Vite alias (pass); a dynamic Vite alias (fail,
-   fail-closed); Babel `module-resolver` and Metro `extraNodeModules` aliases and
-   a Metro `resolveRequest` naming an SDK literally (fail); a Metro resolver with
-   a computed name (pass — documented gap); the **manifest-scoped dependency**
+   fail-closed); Babel `module-resolver` (short and `babel-plugin-` full name) and
+   Metro `extraNodeModules` aliases and a Metro `resolveRequest` naming an SDK
+   literally (fail); a Metro resolver with a computed name (pass — documented
+   gap); the **strict static classification** cases — a call with a benign literal
+   plus a dynamic identifier, a template literal with interpolation, and a
+   partially dynamic concatenation (fail); a local `path.resolve()` and the
+   repository's `fileURLToPath(new URL(…))` (pass) versus the same into
+   `node_modules/@sentry/electron` (fail); a literal benign target (pass) versus a
+   literal observability target (fail); **shorthand/spread/indirection** — a
+   resolvable Vite shorthand and an indirect resolvable `resolve` (pass) versus a
+   dynamic shorthand (Vite/Babel/Metro), a spread inside `resolve`/`alias`, and an
+   indirect unresolvable `resolve` (fail); the **manifest-scoped dependency**
    cases — each dormant dependency in its own manifest (pass), a dormant
    dependency in another manifest via `dependencies`/`devDependencies`/
    `optionalDependencies`/`peerDependencies`, a self-alias outside its manifest,
@@ -342,9 +369,13 @@ mandatory part.
   (`require(name)`), a Go raw-string/URL import, a **Metro `resolver.resolveRequest`
   that computes the module name without naming an SDK literally**, or a resolver
   alias the scanner does not know are not detectable here; the scan showing "OK"
-  proves nothing about absence. A dynamic (non-literal) Vite/Babel alias map or
-  target is *not* silently accepted — it is rejected fail-closed because it
-  cannot be proven safe.
+  proves nothing about absence. An alias **target or map** that is not fully
+  static — including a partially literal one, an interpolated template, a
+  concatenation, a dynamic binding, a shorthand, or a spread — is *not* silently
+  accepted: it is rejected fail-closed because it cannot be proven safe. The one
+  deliberate exception is Metro `resolver.resolveRequest`, a function the repo
+  already uses, where a fully computed module name cannot be rejected without
+  breaking it.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -383,8 +414,10 @@ release-target authority, Go policy coherence), `cecf213db` (import-specifier
 scanner, widened coverage, per-condition self-tests), `ff51dbbe5` (multiline
 import/require detection, package-name boundaries, backtick, `overrides`/
 `resolutions`), `e66d5af01` (AST-based import analysis and indirection-alias
-detection), and `66e069c77` (full Vite/Babel/Metro resolution-config coverage and
-a manifest-scoped dependency allowlist). None of those commits change the daemon
+detection), `66e069c77` (broadened Vite/Babel/Metro resolution-config discovery
+and a manifest-scoped dependency allowlist), and `cdfdfea64` (strict
+fail-closed classification of alias targets, shorthand/spread/indirection).
+None of those commits change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
