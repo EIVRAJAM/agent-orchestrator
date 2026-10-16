@@ -9,18 +9,19 @@ what was and was not observed, and about the limits of the method.
 > commits — `d77f30f26` (guard gates, mobile Sentry early return, release-target
 > authority, Go policy coherence), `cecf213db` (import-specifier scanner, widened
 > coverage, per-condition self-tests), `ff51dbbe5` (multiline import/require
-> detection, package-name boundaries, backtick, `overrides`/`resolutions`), and
-> the following commit (AST-based import analysis and indirection-alias
-> detection). It is kept as **historical / comparative** evidence, not as
-> execution evidence of the current HEAD. It stays relevant because the daemon
-> outbound paths it exercised — `newTelemetrySink` (local-only), the
-> renderer/mobile init, and the daemon env-stamping — are unchanged by those
-> commits, and the Go change made the Sentry DSN path strictly tighter (always
-> blank instead of a branch), so it cannot widen the surface. The **binary built
-> from the final commit has not been observed**, and there is no full traffic
-> capture of the final HEAD. Repeat the run on the final commit before claiming
-> execution evidence for the definitive artifact; the method below is the
-> reproducible procedure.
+> detection, package-name boundaries, backtick, `overrides`/`resolutions`),
+> `e66d5af01` (AST-based import analysis and indirection-alias detection), and
+> `66e069c77` (full Vite/Babel/Metro resolution-config coverage and a
+> manifest-scoped dependency allowlist). It is kept as **historical /
+> comparative** evidence, not as execution evidence of the current HEAD. It stays
+> relevant because the daemon outbound paths it exercised — `newTelemetrySink`
+> (local-only), the renderer/mobile init, and the daemon env-stamping — are
+> unchanged by those commits, and the Go change made the Sentry DSN path strictly
+> tighter (always blank instead of a branch), so it cannot widen the surface. The
+> **binary built from the final commit has not been observed**, and there is no
+> full traffic capture of the final HEAD. Repeat the run on the final commit
+> before claiming execution evidence for the definitive artifact; the method
+> below is the reproducible procedure.
 
 ## Verdict
 

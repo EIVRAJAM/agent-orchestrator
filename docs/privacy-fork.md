@@ -55,10 +55,13 @@ flipped, so a change fails closed and loudly instead of exporting silently.
      per-condition guard self-tests, doc/evidence precision.
   4. `ff51dbbe5` — multiline import/require detection, package-name boundaries,
      backtick specifiers, `overrides`/`resolutions` dependency scanning.
-  5. *(this commit)* — AST-based import analysis (no false positives from
+  5. `e66d5af01` — AST-based import analysis (no false positives from
      strings/templates/comments/regex) and indirection-alias detection (npm
      `npm:` aliases, `package.json` `imports`, tsconfig `paths`, Vite
      `resolve.alias`).
+  6. `66e069c77` — full resolution-config coverage (Vite anywhere under
+     `frontend/**`/`packages/**`, Babel `module-resolver`, Metro
+     `extraNodeModules`) and a manifest-scoped dependency allowlist.
 
 ## 3. Inventory of mechanisms
 
@@ -258,11 +261,24 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      packages by both name and **alias target**: npm aliases
      (`"reporter": "npm:@sentry/electron@^7.0.0"`), `resolutions`/`overrides`/
      `pnpm.overrides`, and the `package.json` `imports` map
-     (`"#reporter": "@sentry/electron"`). An alias that renames an observability
-     package is flagged even when the target is an allowlisted dormant
-     dependency, because it hides the import site; a self-alias is not. The
-     repository's own module aliases are also covered: observability targets in
-     tsconfig `paths` or Vite `resolve.alias` fail.
+     (`"#reporter": "@sentry/electron"`). The allowlist is **manifest-scoped**:
+     `frontend/package.json` may declare `@sentry/electron` and `posthog-js`,
+     `packages/mobile/package.json` may declare `posthog-react-native`, and a
+     dormant dependency, self-alias, override or resolution in any other manifest
+     fails (so a dormant dep cannot be added to a new package unreviewed, and a
+     self-alias is only acceptable inside its authorized manifest). An alias that
+     renames an observability package fails everywhere because it hides the
+     import site.
+   - **resolution configs**: discovered under `frontend/**` and `packages/**` —
+     Vite (`vite.config.{ts,js,mts,mjs,cts,cjs}` and
+     `vite.<name>.config.*`), Babel (`babel.config.*`) and Metro
+     (`metro.config.*`) — and inspected through the AST (not every string):
+     Vite `resolve.alias` in object and `{find, replacement}` array form, inside
+     `defineConfig(...)` or a direct export; Babel `module-resolver` aliases;
+     Metro `resolver.extraNodeModules`. A dynamic (non-literal) alias map or
+     target is rejected fail-closed. Metro `resolver.resolveRequest` is a
+     function, so only observability literals inside it are flagged; a fully
+     computed module name is a documented gap. tsconfig values are checked too.
 2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): one fixture per
    condition, each built from the real policy files with a single injection, so
    a working pattern cannot hide a broken one. Covered: direct `Sentry.init`;
@@ -284,11 +300,23 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    including a conditional value, and an alias import followed by an
    arbitrary-identifier call (fail); a tsconfig `paths` and a Vite
    `resolve.alias` pointing at an SDK (fail); a non-SDK npm alias and a
-   self-alias of an allowlisted dependency (pass); and the benign-literal set —
-   SDK names inside ordinary strings, template-literal examples, comments, regex
-   literals, the plain word `from`, and mixed inner delimiters — which must
-   **not** false-positive. A clean tree must pass, including the dormant
-   implementations and their reviewed tests.
+   self-alias of an allowlisted dependency (pass); **resolution configs** —
+   Vite `resolve.alias` in `packages/product-ui` (object), a conventional
+   `vite.config.ts`, a config outside `frontend/`, and the
+   `{ find, replacement }` array form (fail); a Vite config whose SDK string is
+   not an alias and a benign Vite alias (pass); a dynamic Vite alias (fail,
+   fail-closed); Babel `module-resolver` and Metro `extraNodeModules` aliases and
+   a Metro `resolveRequest` naming an SDK literally (fail); a Metro resolver with
+   a computed name (pass — documented gap); the **manifest-scoped dependency**
+   cases — each dormant dependency in its own manifest (pass), a dormant
+   dependency in another manifest via `dependencies`/`devDependencies`/
+   `optionalDependencies`/`peerDependencies`, a self-alias outside its manifest,
+   an override alias in a foreign manifest, and a new observability package in an
+   authorized manifest (fail); and the benign-literal set — SDK names inside
+   ordinary strings, template-literal examples, comments, regex literals, the
+   plain word `from`, and mixed inner delimiters — which must **not**
+   false-positive. A clean tree must pass, including the dormant implementations
+   and their reviewed tests.
 3. **Behavioral tests** for the known composition points: daemon composition (no
    remote sink even when configured against a live `httptest` server; Sentry
    never enabled with a DSN present), renderer/main policy, release-target
@@ -305,14 +333,18 @@ mandatory part.
 - The behavioral tests protect the **known** composition points. They cannot
   vouch for a new module that those tests never import.
 - The **import allowlist** detects new uses of the reviewed SDKs (under any
-  alias) anywhere in the covered tree, and the **dependency/alias analysis**
-  detects new known observability SDKs, npm aliases, `imports` maps and
-  tsconfig/Vite aliases in any discovered manifest or config.
+  alias) anywhere in the covered tree; the **dependency/alias analysis** detects
+  new known observability SDKs, npm aliases, `imports` maps and
+  tsconfig/Vite/Babel/Metro alias targets in any discovered manifest or config,
+  with a manifest-scoped dependency allowlist.
 - **No static search is a guarantee.** A hand-written HTTP exporter with no SDK
   and no known marker, a module specifier computed at runtime
-  (`require(name)`), a Go raw-string/URL import, or a resolver alias the scanner
-  does not know are not detectable here; the scan showing "OK" proves nothing
-  about absence.
+  (`require(name)`), a Go raw-string/URL import, a **Metro `resolver.resolveRequest`
+  that computes the module name without naming an SDK literally**, or a resolver
+  alias the scanner does not know are not detectable here; the scan showing "OK"
+  proves nothing about absence. A dynamic (non-literal) Vite/Babel alias map or
+  target is *not* silently accepted — it is rejected fail-closed because it
+  cannot be proven safe.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -350,10 +382,11 @@ hardening commits — `d77f30f26` (guard gates, mobile Sentry early return,
 release-target authority, Go policy coherence), `cecf213db` (import-specifier
 scanner, widened coverage, per-condition self-tests), `ff51dbbe5` (multiline
 import/require detection, package-name boundaries, backtick, `overrides`/
-`resolutions`), and *this commit* (AST-based import analysis and
-indirection-alias detection). None of those commits change the daemon outbound
-paths the run exercised (`newTelemetrySink` local-only, renderer/mobile init,
-daemon env-stamping), and the Go Sentry change made the DSN path strictly
+`resolutions`), `e66d5af01` (AST-based import analysis and indirection-alias
+detection), and `66e069c77` (full Vite/Babel/Metro resolution-config coverage and
+a manifest-scoped dependency allowlist). None of those commits change the daemon
+outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
+init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
 comparative** evidence for those paths.
 
