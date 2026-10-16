@@ -1,21 +1,33 @@
 name: Privacy guard
 
 # Blocks a PR that reintroduces AO's outbound telemetry/diagnostics export, points
-# the updater at upstream, or adds an unreviewed observability dependency. Combines
-# behavioral tests with static alarms; see docs/privacy-fork.md. This fork's policy
-# is that AO's own analytics and error reporting never leave the machine.
+# the updater at an upstream or unauthorized repository, or adds an unreviewed
+# observability dependency. Combines behavioral tests with failing static gates;
+# see docs/privacy-fork.md. This fork's policy is that AO's own analytics and
+# error reporting never leave the machine.
+#
+# The guard script refuses to run in CI when a PRIVACY_GUARD_SKIP_* (or
+# *_STATIC_ONLY) variable is set, so this job always runs every mandatory part.
 
 on:
   push:
     branches: [main]
   pull_request:
     paths:
+      # Products and their telemetry surfaces.
       - "backend/**"
       - "frontend/**"
       - "packages/mobile/**"
+      - "packages/cloud-client/**"
+      - "contracts/**"
+      # Files that can change the policy, the release target, or packaging.
       - "desktop-version-floor.json"
-      - "scripts/privacy-guard.sh"
-      - ".github/workflows/privacy-guard.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "go.work"
+      - "go.work.sum"
+      - "scripts/**"
+      - ".github/workflows/**"
 
 permissions:
   contents: read
@@ -39,11 +51,20 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            packages/mobile/package-lock.json
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci --no-audit --no-fund
+
+      - name: Install mobile dependencies
+        working-directory: packages/mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Privacy guard self-tests
+        run: bash scripts/privacy-guard.test.sh
 
       - name: Privacy guard
         run: bash scripts/privacy-guard.sh

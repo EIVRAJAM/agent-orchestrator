@@ -8,84 +8,146 @@
 #
 #   1. Behavioral tests — the composition points must not build an exporter and
 #      must not initialize a client/transport, no matter the config or env.
-#   2. Static alarms — a reintroduced exporter, an upstream update feed, or a
-#      new observability dependency is flagged for review. Static matching is an
-#      alarm, never the guarantee; it is here to catch what tests miss.
+#   2. Static gates — a reintroduced exporter, an upstream/unauthorized update
+#      feed, or a new observability dependency FAILS the guard (not just warns).
+#      An explicit allowlist pins the deliberately-dormant files, and those files
+#      must still carry their fork-policy guard.
 #   3. The documented policy — see docs/privacy-fork.md — which states what is
 #      and is not allowed to leave the machine.
 #
+# Static matching is an alarm, never the guarantee; the behavioral tests are the
+# backstop for a reintroduction that avoids the grepped shapes.
+#
 # Run locally from the repo root:
 #   bash scripts/privacy-guard.sh
-# Skip a half when a toolchain is unavailable (document which, and verify it in
-# CI instead):
-#   PRIVACY_GUARD_SKIP_GO=1 bash scripts/privacy-guard.sh
+#
+# Local-only diagnostics (NOT allowed in CI; the guard rejects them when CI is
+# set, so a workflow can never skip a mandatory part):
+#   PRIVACY_GUARD_SKIP_GO=1        skip the Go tests
+#   PRIVACY_GUARD_SKIP_FRONTEND=1  skip the frontend tests
+#   PRIVACY_GUARD_SKIP_MOBILE=1    skip the mobile tests
+#   PRIVACY_GUARD_STATIC_ONLY=1    run only the static gates (guard self-tests)
+#   PRIVACY_GUARD_ROOT=<dir>       run against a fixture tree (guard self-tests)
 #
 # It never publishes, deploys, or contacts an external service.
 set -uo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="${PRIVACY_GUARD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$root" || exit 2
+
+static_only="${PRIVACY_GUARD_STATIC_ONLY:-0}"
 
 fail=0
 note() { printf '%s\n' "$*"; }
 bad() { printf 'FAIL: %s\n' "$*" >&2; fail=1; }
 
-# --- 1. Behavioral: backend composition builds no remote exporter ------------
+# --- CI must run every mandatory part ----------------------------------------
 
-if [[ "${PRIVACY_GUARD_SKIP_GO:-}" != "1" ]]; then
-  note "==> go test: telemetry/sentry composition and policy"
-  if ! ( cd backend && go test ./internal/daemon/ ./internal/adapters/telemetry/ ./internal/observe/sentryobs/ \
-      -run 'TestNewTelemetrySink|TestDaemonSentryDSN|TestNewDaemonSentryConfig' -count=1 ); then
-    bad "backend privacy tests failed"
+if [[ -n "${CI:-}" ]]; then
+  for var in PRIVACY_GUARD_SKIP_GO PRIVACY_GUARD_SKIP_FRONTEND PRIVACY_GUARD_SKIP_MOBILE PRIVACY_GUARD_STATIC_ONLY; do
+    if [[ -n "${!var:-}" ]]; then
+      printf 'privacy-guard: refusing to run in CI with %s set (CI=%s)\n' "$var" "$CI" >&2
+      exit 2
+    fi
+  done
+fi
+
+# --- Static helpers ----------------------------------------------------------
+
+# require_false <file> <regex that must appear with "false">
+require_false() {
+  local file="$1" pattern="$2"
+  if [[ ! -f "$file" ]]; then
+    bad "$file is missing (expected fork policy file)"
+    return
   fi
-else
-  note "==> go test: SKIPPED (PRIVACY_GUARD_SKIP_GO=1)"
-fi
+  grep -Eq "$pattern" "$file" || bad "$file: expected a closed policy value matching /$pattern/"
+}
 
-# --- 2. Policy constants stay closed -----------------------------------------
+require_contains() {
+  local file="$1" text="$2"
+  if [[ ! -f "$file" ]]; then
+    bad "$file is missing"
+    return
+  fi
+  grep -Fq "$text" "$file" || bad "$file: missing required policy guard \"$text\""
+}
 
-note "==> policy constants are closed"
-grep -Eq 'forkExternalTelemetryExportAllowed[[:space:]]*=[[:space:]]*false' backend/internal/daemon/fork_privacy.go \
-  || bad "backend/internal/daemon/fork_privacy.go: forkExternalTelemetryExportAllowed is no longer false"
-grep -Eq 'forkExternalDiagnosticsExportAllowed[[:space:]]*=[[:space:]]*false' backend/internal/daemon/fork_privacy.go \
-  || bad "backend/internal/daemon/fork_privacy.go: forkExternalDiagnosticsExportAllowed is no longer false"
-grep -Eq 'EXTERNAL_TELEMETRY_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false' frontend/src/shared/fork-privacy.ts \
-  || bad "frontend/src/shared/fork-privacy.ts: EXTERNAL_TELEMETRY_EXPORT_ALLOWED is no longer false"
-grep -Eq 'EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false' frontend/src/shared/fork-privacy.ts \
-  || bad "frontend/src/shared/fork-privacy.ts: EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED is no longer false"
+require_absent_file() {
+  local file="$1"
+  [[ -e "$file" ]] && bad "$file must not exist"
+}
 
-# --- 3. Static: no remote exporter construction in production Go ------------
+# --- Static gate 1: policy constants are closed ------------------------------
 
-note "==> no PostHog exporter is constructed outside the dormant adapter"
-remote_go_hits="$(grep -rn --include='*.go' 'NewPostHogSink(' backend \
-  | grep -v '_test\.go' \
-  | grep -v '/internal/adapters/telemetry/' || true)"
-if [[ -n "$remote_go_hits" ]]; then
-  bad "a production Go file constructs the PostHog exporter (fork policy forbids it):
-$remote_go_hits"
-fi
+note "==> static: fork policy constants are closed"
+require_false backend/internal/daemon/fork_privacy.go 'forkExternalTelemetryExportAllowed[[:space:]]*=[[:space:]]*false'
+require_false backend/internal/daemon/fork_privacy.go 'forkExternalDiagnosticsExportAllowed[[:space:]]*=[[:space:]]*false'
+require_false frontend/src/shared/fork-privacy.ts 'EXTERNAL_TELEMETRY_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false'
+require_false frontend/src/shared/fork-privacy.ts 'EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false'
+require_false packages/mobile/lib/fork-privacy.ts 'MOBILE_EXTERNAL_TELEMETRY_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false'
+require_false packages/mobile/lib/fork-privacy.ts 'MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false'
 
-# --- 4. Static: updater and version floor never target upstream --------------
+# --- Static gate 2: authorized observability init/construction sites ---------
+#
+# Every exporter construction or client init in Go, Electron main/renderer and
+# mobile must be in the reviewed allowlist below. Anything else fails.
 
-note "==> update feed and version floor target the fork, not upstream"
-for f in \
-  frontend/forge.config.ts \
-  frontend/src/main/feature-builds.ts \
-  frontend/src/main/desktop-version-floor.ts \
-  desktop-version-floor.json; do
-  # Ignore comment lines: the fork's own comments explain the upstream owner by
-  # name. What must never reappear is the upstream owner as a code value.
-  upstream_hits="$(grep -n 'Untrivial-ai' "$f" 2>/dev/null \
-    | grep -vE '^[0-9]+:[[:space:]]*(//|\*|#)' || true)"
-  if [[ -n "$upstream_hits" ]]; then
-    bad "$f uses the upstream owner as a value; a fork build could be replaced by an upstream artifact:
-$upstream_hits"
+note "==> static: observability init/construction sites are allowlisted"
+allowed=" backend/internal/adapters/telemetry/posthog.go backend/internal/observe/sentryobs/sentryobs.go frontend/src/renderer/lib/telemetry.ts packages/mobile/lib/telemetry/runtime.ts packages/mobile/lib/sentry.ts "
+init_pattern='posthog\.init\(|new PostHog\(|Sentry\.init\(|sentry\.Init\(|sentry\.init\(|mod\.init\(|NewPostHogSink\(|sentry\.NewHTTPSyncTransport\('
+scan_dirs=(backend frontend/src packages/mobile/lib)
+mapfile -t init_hits < <(
+  grep -rnE --include='*.go' --include='*.ts' --include='*.tsx' "$init_pattern" "${scan_dirs[@]}" 2>/dev/null || true
+)
+for hit in "${init_hits[@]:-}"; do
+  [[ -z "$hit" ]] && continue
+  file="${hit%%:*}"
+  file="${file#./}"
+  base="$(basename "$file")"
+  case "$base" in
+    *_test.go|*.test.ts|*.test.tsx) continue ;;
+  esac
+  content="${hit#*:}"; content="${content#*:}"
+  trimmed="${content#"${content%%[![:space:]]*}"}"
+  case "$trimmed" in
+    //*|'*'*|'/*'*|'#'*) continue ;; # comment line
+  esac
+  if [[ " $allowed " != *" $file "* ]]; then
+    bad "unauthorized observability init/construction in $file: $trimmed"
   fi
 done
 
-# --- 5. Static: no unreviewed observability dependency -----------------------
+# --- Static gate 3: allowed files stay protected by the policy ---------------
 
-note "==> observability dependencies match the reviewed allowlist"
+note "==> static: dormant files still carry their fork-policy guard"
+require_contains frontend/src/renderer/lib/telemetry.ts EXTERNAL_TELEMETRY_EXPORT_ALLOWED
+require_contains frontend/src/main/sentry-main.ts EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED
+require_contains frontend/src/renderer/lib/sentry.ts EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED
+require_contains packages/mobile/lib/sentry.ts MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED
+require_contains packages/mobile/lib/telemetry/runtime.ts MOBILE_TELEMETRY_DISABLED
+require_contains packages/mobile/lib/telemetry/config.ts MOBILE_EXTERNAL_TELEMETRY_EXPORT_ALLOWED
+# The daemon Sentry DSN must never be read from configuration.
+if grep -Eq 'daemonSentryDSN|cfg\.Telemetry\.SentryDSN' backend/internal/daemon/daemon.go; then
+  bad "backend/internal/daemon/daemon.go reads a Sentry DSN from configuration; the fork keeps it blank"
+fi
+
+# --- Static gate 4: release target authority ---------------------------------
+
+note "==> static: release target is the authorized fork repo"
+require_contains frontend/src/shared/release-target.ts 'AUTHORIZED_RELEASE_REPOS'
+require_contains frontend/src/shared/release-target.ts 'UPSTREAM_RELEASE_REPOS'
+require_contains frontend/src/shared/release-target.ts 'EIVRAJAM/agent-orchestrator'
+for consumer in frontend/forge.config.ts frontend/src/main/feature-builds.ts frontend/src/main/desktop-version-floor.ts; do
+  require_contains "$consumer" 'release-target'
+done
+if grep -n '"downloadUrl"' desktop-version-floor.json 2>/dev/null | grep -q 'Untrivial-ai'; then
+  bad "desktop-version-floor.json points its downloadUrl at upstream"
+fi
+
+# --- Static gate 5: no unreviewed observability dependency -------------------
+
+note "==> static: observability dependencies match the reviewed allowlist"
 node - <<'NODE' || bad "unreviewed observability dependency found"
 const fs = require("fs");
 const files = ["package.json", "frontend/package.json", "packages/mobile/package.json"];
@@ -115,26 +177,55 @@ if (flagged.length) {
 console.log("ok: no unreviewed observability dependency");
 NODE
 
-# --- 6. Alarm: report exporter init sites for human review -------------------
-#
-# Not a failure on its own — the shipping paths are disabled by the policy
-# constants above — but any new/renamed init site here should be eyeballed.
+if [[ "$static_only" == "1" ]]; then
+  if [[ "$fail" -eq 0 ]]; then
+    note "privacy guard (static only): OK"
+  else
+    note "privacy guard (static only): FAILED"
+  fi
+  exit "$fail"
+fi
 
-note "==> review alarm: analytics/error init call sites (informational)"
-grep -rn --include='*.ts' --include='*.tsx' -E '(posthog|PostHog)\.init\(|new PostHog\(|Sentry\.init\(|sentry\.Init\(' \
-  frontend/src packages/mobile/lib 2>/dev/null \
-  | grep -v '\.test\.' | sed 's/^/    /' || true
+# --- Behavioral gate 1: Go daemon composition --------------------------------
 
-# --- 7. Behavioral: frontend policy tests ------------------------------------
+if [[ "${PRIVACY_GUARD_SKIP_GO:-}" != "1" ]]; then
+  note "==> go test: telemetry/sentry composition and policy"
+  if ! ( cd backend && go test ./internal/daemon/ ./internal/adapters/telemetry/ ./internal/observe/sentryobs/ \
+      -run 'TestNewTelemetrySink|TestForkPrivacyPolicyIsClosed|TestNewDaemonSentryConfig' -count=1 ); then
+    bad "backend privacy tests failed"
+  fi
+else
+  note "==> go test: SKIPPED (PRIVACY_GUARD_SKIP_GO=1)"
+fi
+
+# --- Behavioral gate 2: frontend composition ---------------------------------
 
 if [[ "${PRIVACY_GUARD_SKIP_FRONTEND:-}" != "1" ]]; then
-  note "==> vitest: renderer/main privacy policy"
+  note "==> vitest: renderer/main/release-target privacy policy"
   if ! ( cd frontend && npx vitest run --config vite.renderer.config.ts \
-      src/shared/privacy-policy.test.ts src/shared/telemetry.test.ts src/renderer/lib/telemetry.init.test.ts ); then
+      src/shared/privacy-policy.test.ts \
+      src/shared/telemetry.test.ts \
+      src/shared/release-target.test.ts \
+      src/renderer/lib/telemetry.init.test.ts \
+      src/main/sentry-main.test.ts \
+      src/main/desktop-version-floor.test.ts ); then
     bad "frontend privacy tests failed"
   fi
 else
   note "==> vitest: SKIPPED (PRIVACY_GUARD_SKIP_FRONTEND=1)"
+fi
+
+# --- Behavioral gate 3: mobile composition -----------------------------------
+
+if [[ "${PRIVACY_GUARD_SKIP_MOBILE:-}" != "1" ]]; then
+  note "==> vitest: mobile privacy policy"
+  if [[ ! -d packages/mobile/node_modules ]]; then
+    bad "packages/mobile/node_modules is missing; run \`npm ci\` in packages/mobile (or use PRIVACY_GUARD_SKIP_MOBILE=1 outside CI)"
+  elif ! ( cd packages/mobile && npx vitest run lib/sentry.test.ts lib/telemetry/fork-privacy.test.ts ); then
+    bad "mobile privacy tests failed"
+  fi
+else
+  note "==> vitest: SKIPPED (PRIVACY_GUARD_SKIP_MOBILE=1)"
 fi
 
 if [[ "$fail" -eq 0 ]]; then

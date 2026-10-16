@@ -1,22 +1,24 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { app } from "electron";
+import { resolveReleaseRepo } from "../shared/release-target";
 import type { UpdateSettings } from "./update-settings";
 
 const GITHUB_API = "https://api.github.com";
 
 // Default when the baked app-update.yml cannot be read (dev, or a malformed
-// bundle). Matches forge.config.ts DEFAULT_RELEASE_REPO. This fork must default
-// to its own repo, never upstream, so a fork build can never list or install an
-// upstream artifact with a different privacy policy (see docs/privacy-fork.md).
-const DEFAULT_REPO = { owner: "EIVRAJAM", repo: "agent-orchestrator" } as const;
+// bundle). It comes from the same authorized release-target authority the
+// updater is built from (frontend/src/shared/release-target.ts), so feature
+// builds list the fork's releases, never an upstream repository's. A misconfigured
+// authority throws here at load instead of silently pointing at the wrong feed.
+const defaultReleaseRepo = resolveReleaseRepo(undefined);
+const DEFAULT_REPO = { owner: defaultReleaseRepo.owner, repo: defaultReleaseRepo.name } as const;
 
 // Resolve the GitHub repo the app updates from by reading the same bundled
 // app-update.yml that electron-updater uses. Both are baked from AO_RELEASE_REPO
 // at build time, so this keeps the feature list and the updater on the SAME repo
-// (a fork build lists that fork's feature releases, not Untrivial-ai's). The
-// list and the updater must never diverge, or the picker would offer builds
-// the updater cannot install.
+// (a fork build lists that fork's feature releases). The list and the updater
+// must never diverge, or the picker would offer builds the updater cannot install.
 let cachedRepo: { owner: string; repo: string } | undefined;
 function resolveRepo(): { owner: string; repo: string } {
 	if (cachedRepo) return cachedRepo;

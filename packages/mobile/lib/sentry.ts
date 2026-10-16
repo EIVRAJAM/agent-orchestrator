@@ -1,26 +1,26 @@
 // Mobile Sentry sink (@sentry/react-native), mirroring the desktop renderer sink
-// so both classify errors identically. No-op until BOTH hold:
-//   1. a DSN is configured via EXPO_PUBLIC_SENTRY_DSN, and
-//   2. the @sentry/react-native SDK is installed.
+// so both classify errors identically.
 //
-// The SDK is intentionally NOT added to package.json yet: @sentry/react-native
-// is a native module, so installing it correctly means `npx expo install
-// @sentry/react-native` (to pick the SDK-54-compatible version) plus a prebuild
-// cycle to regenerate the committed native projects, and the config plugin for
-// source maps. Adding it without that would leave the committed ios/ prebuild
-// inconsistent. Ship steps, in order:
-//   1. `npx expo install @sentry/react-native`  (do not hand-pin the version),
-//      then point loadSdk() below at the real import
+// Fork privacy policy: this is a permanent no-op. initMobileSentry returns
+// before reading any DSN, loading the SDK, calling init, or creating any queue,
+// transport, or auto-capture, so no EXPO_PUBLIC_* variable, consent record, or
+// remote config can enable it. See packages/mobile/lib/fork-privacy.ts and
+// docs/privacy-fork.md.
+//
+// Upstream behavior, retained only as documentation: it was a no-op until BOTH
+// held below. The SDK is intentionally NOT in package.json yet (a native module
+// needs `npx expo install @sentry/react-native` plus a prebuild cycle, the Expo
+// config plugin for source maps, and store Data-Safety declarations). Ship
+// steps, for a future approved build only:
+//   1. `npx expo install @sentry/react-native`, then point loadSdk() at the real import
 //   2. add the @sentry/react-native Expo config plugin, then `npx expo prebuild`
 //   3. wire source-map upload at EAS build time AND on every `eas update`
-//      (the Sentry Expo plugin does both), and set `dist` to the running
-//      expo-updates id so an OTA bundle's maps resolve
 //   4. set EXPO_PUBLIC_SENTRY_DSN and update the store Data-Safety / App-Privacy
 //      declarations (a second processor gates the mobile release)
-// Until then this file compiles and runs as a no-op with no native dependency.
 
 import { classifyError, type ClassifyInput, type Triage } from "./observability";
 import { DEFAULT_SENTRY_DSN } from "./sentry-config";
+import { MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED } from "./fork-privacy";
 
 type SentryLike = {
 	init: (opts: Record<string, unknown>) => void;
@@ -82,15 +82,28 @@ async function loadSdk(): Promise<SentryLike | null> {
 	return null;
 }
 
-/** Initialize once. No DSN or no SDK → stays a no-op forever. */
-export async function initMobileSentry(context: MobileObservabilityContext = {}): Promise<void> {
+/**
+ * Initialize once. Fork policy keeps this a permanent no-op: it returns before
+ * reading a DSN, loading the SDK, or calling init.
+ *
+ * `options.loadSdk` exists so tests can inject an "SDK available" case and prove
+ * Sentry.init is still never called; production callers pass nothing and use the
+ * stub loader.
+ */
+export async function initMobileSentry(
+	context: MobileObservabilityContext = {},
+	options: { loadSdk?: () => Promise<SentryLike | null> } = {},
+): Promise<void> {
+	// Fork privacy policy. Return before any DSN read, SDK load, mod.init, queue,
+	// transport, or auto-capture. This is the whole mobile diagnostics switch.
+	if (!MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED) return;
 	ctx = context;
 	if (initStarted || sentry) return;
 	const d = dsn();
 	if (!d) return;
 	initStarted = true;
 	try {
-		const mod = await loadSdk();
+		const mod = await (options.loadSdk ?? loadSdk)();
 		if (!mod) return;
 		mod.init({
 			dsn: d,

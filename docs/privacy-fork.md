@@ -23,21 +23,28 @@ For builds distributed by this fork:
   setting, remote config, or domain availability can re-enable these sends.
 - No legacy telemetry queue is replayed or flushed to a third party.
 
-This is a **code property**, not a runtime setting. Each side has one
-declared source of truth and the composition points consult it:
+This is a **code property**, not a runtime setting. The daemon and renderer
+composition points are local-only *by construction*; the policy constants are an
+explicit assertion, not a switch. Where each side's source of truth lives:
 
-| Side | Source of truth | Composition points that consult it |
+| Side | Source of truth | Composition points |
 | --- | --- | --- |
-| Go daemon | `backend/internal/daemon/fork_privacy.go` | `newTelemetrySink` (`telemetry_wiring.go`), `daemonSentryDSN` / `newDaemonSentryConfig` (`daemon.go`) |
-| Electron/renderer | `frontend/src/shared/fork-privacy.ts` | `rendererTelemetryEnabled` / `buildTelemetryBootstrap` (`shared/telemetry.ts`), `initTelemetry` (`renderer/lib/telemetry.ts`), `initMainSentry` (`main/sentry-main.ts`), renderer Sentry intake (`renderer/lib/sentry.ts`), daemon env stamping (`main.ts`) |
-| Mobile | `packages/mobile/lib/telemetry/config.ts` | `initMobileTelemetry` (`packages/mobile/lib/telemetry/runtime.ts`) |
+| Go daemon | `backend/internal/daemon/fork_privacy.go` (`forkExternal{Telemetry,Diagnostics}ExportAllowed` assertions; `forkPrivacyPolicyViolated` checked at boot; `newDaemonSentryConfig` always blank DSN) | `newTelemetrySink` (local-only), `Run` (fail-closed assertion, blank Sentry DSN) |
+| Electron/renderer | `frontend/src/shared/fork-privacy.ts` | `rendererTelemetryEnabled` / `buildTelemetryBootstrap`, `initTelemetry`, `initMainSentry`, renderer Sentry intake, daemon env stamping (`main.ts`) |
+| Desktop release target | `frontend/src/shared/release-target.ts` | `forge.config.ts` (feed + publisher), `feature-builds.ts`, `desktop-version-floor.ts` |
+| Mobile | `packages/mobile/lib/fork-privacy.ts` | `telemetry/config.ts` (`MOBILE_TELEMETRY_DISABLED`), `sentry.ts` (`initMobileSentry`) |
+
+The Go constants are deliberately **not** branched on to reach an exporter:
+`newTelemetrySink` builds only a local SQLite or no-op sink, and the daemon's
+Sentry DSN is never read from configuration. `daemon.Run` calls
+`forkPrivacyPolicyViolated()` and refuses to start if a policy constant is ever
+flipped, so a change fails closed and loudly instead of exporting silently.
 
 ## 2. Base state
 
 - Fork remote: `EIVRAJAM/agent-orchestrator`
-- Base branch/SHA at the start of this work: `main` @ `7dceb0ec7d2eddd4360692123a64e5bd3daf78eb`
+- Base branch/SHA: `main` @ `7dceb0ec7d2eddd4360692123a64e5bd3daf78eb`
 - Working branch: `privacy/disable-external-telemetry`
-- Working tree at start: clean
 
 ## 3. Inventory of mechanisms
 
@@ -47,14 +54,14 @@ Classification: **ET** external telemetry · **ED** external diagnostics ·
 
 | # | Mechanism | Class | Location | Destination | Activation (upstream) | Fork treatment |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | Daemon PostHog sink | ET | `backend/internal/adapters/telemetry/posthog.go`, wired in `daemon/telemetry_wiring.go` | `AO_TELEMETRY_POSTHOG_HOST` (default `https://us.i.posthog.com`)/`capture/` | `AO_TELEMETRY_REMOTE=posthog` + key + events consent | Composition no longer builds it; adapter kept dormant |
+| 1 | Daemon PostHog sink | ET | `backend/internal/adapters/telemetry/posthog.go` | `AO_TELEMETRY_POSTHOG_HOST` (default `https://us.i.posthog.com`)/`capture/` | `AO_TELEMETRY_REMOTE=posthog` + key + events consent | Composition never builds it; adapter kept dormant |
 | 2 | Daemon aggregate/rate-limit/denylist wrappers | IE | `adapters/telemetry/{aggregate,ratelimit,denylist}.go` | — (only shape PostHog traffic) | same as #1 | Unwired with #1 |
-| 3 | Daemon Sentry | ED | `backend/internal/observe/sentryobs/sentryobs.go`, `daemon.go` | DSN host via sentry-go | `AO_SENTRY_DSN` + policy gate | DSN forced blank; `Init` stays a no-op |
-| 4 | Agent-switch Sentry envelope sender | ED | `observe/sentryobs/agent_switch_sender.go`, `agent_switch_event.go`, `dsn.go` | `<dsn-host>/api/<project>/envelope/` | `domain.AgentSwitchFailureProductionEnabled` (already `false`) + durable consent + destination | DSN blank ⇒ destination unparsable ⇒ sender never built |
+| 3 | Daemon Sentry | ED | `backend/internal/observe/sentryobs/sentryobs.go`, `daemon.go` | DSN host via sentry-go | `AO_SENTRY_DSN` + policy gate | DSN never read from config; `Init` stays a permanent no-op |
+| 4 | Agent-switch Sentry envelope sender | ED | `observe/sentryobs/agent_switch_sender.go`, `agent_switch_event.go`, `dsn.go` | `<dsn-host>/api/<project>/envelope/` | `domain.AgentSwitchFailureProductionEnabled` (already `false`) + durable consent + destination | `ParseAgentSwitchDSN("")` ⇒ unbuildable |
 | 5 | Agent-switch outbox/dispatcher/policy | IE | `observe/agentswitch/` | local SQLite outbox | observer present | Observer never present; dispatcher stays unbuilt |
-| 6 | Local SQLite telemetry events | LL | `adapters/telemetry/localsqlite.go` → `telemetry_events` table (30-day retention) | local disk only | events enabled | **Kept** (local diagnostics) |
+| 6 | Local SQLite telemetry events | LL | `adapters/telemetry/localsqlite.go` → `telemetry_event` table (30-day retention) | local disk only | events enabled | **Kept** (local diagnostics) |
 | 7 | Renderer PostHog client | ET | `frontend/src/renderer/lib/telemetry.ts` | `https://us.i.posthog.com` via `posthog-js` | packaged build + bootstrap | `initTelemetry` returns false; bootstrap always null |
-| 8 | Renderer→main Sentry intake | ED | `renderer/lib/sentry.ts`, `main/sentry-main.ts` | none (no transport) | `AGENT_SWITCH_FAILURE_PRODUCTION_ENABLED` (already `false`) | Guards forced closed; `initMainSentry` always null |
+| 8 | Renderer→main Sentry intake | ED | `renderer/lib/sentry.ts`, `main/sentry-main.ts` | none (no transport) | production gate (already `false`) | Guards forced closed; `initMainSentry` always null |
 | 9 | Agent-switch visibility envelope | ED | `main/agent-switch-observability.ts` | Sentry envelope (never wired) | production gate | Shipping composition passes `send: async () => undefined` |
 | 10 | Desktop consent controller / policy file | IE | `main/desktop-telemetry-controller.ts`, `main/telemetry-policy-file.ts` | local `telemetry_policy.json` | user toggle | Kept; capture path inert |
 | 11 | Install/distinct id | LL | `shared/telemetry.ts` `loadOrCreateTelemetryInstallId` | local file | bootstrap | Never generated for export (bootstrap always null) |
@@ -63,32 +70,32 @@ Classification: **ET** external telemetry · **ED** external diagnostics ·
 | 14 | Telemetry policy control endpoints | FC | `httpd/router.go` (`/internal/agent-switch-observability/*`) | loopback daemon | desktop → daemon | **Kept** (loopback only) |
 | 15 | Loopback daemon API, CDC/SSE, terminal mux | FC | `httpd/`, `storage/sqlite`, `terminal/` | `127.0.0.1` | normal operation | **Kept** |
 | 16 | GitHub/GitLab SCM + tracker intake | FC | `adapters/scm/*`, `adapters/tracker/*` | user's own provider | configured creds | **Kept** |
-| 17 | Cloud control plane | FC | `config.go` (`https://api.aoagents.dev`) | AO cloud (hosted product) | cloud features (out of scope in this fork) | Unchanged |
+| 17 | Cloud control plane | FC | `config.go` (`https://api.aoagents.dev`) | AO cloud (hosted product) | cloud features | Unchanged (out of scope) |
 | 18 | Expo push | FC | `push/expo.go` | `exp.host` | push enabled | Unchanged |
-| 19 | Pricing catalog fetch | FC | `pricing/fetch.go` | `raw.githubusercontent.com/Untrivial-ai/...` | usage pricing | Unchanged (no user data; see residual risk) |
-| 20 | Update feed (electron-updater) | FC | `frontend/forge.config.ts`, `main/auto-updater.ts` | GitHub releases | packaged build | Repointed to the fork repo |
-| 21 | Desktop version floor | FC | `frontend/src/main/desktop-version-floor.ts`, `desktop-version-floor.json` | `raw.githubusercontent.com` | packaged build | Repointed to the fork repo |
+| 19 | Pricing catalog fetch | FC | `pricing/fetch.go` | `raw.githubusercontent.com` | usage pricing | Unchanged (no user data; residual risk) |
+| 20 | Update feed (electron-updater) | FC | `frontend/forge.config.ts`, `main/auto-updater.ts` | GitHub releases | packaged build | Feed built from the authorized release target only |
+| 21 | Desktop version floor | FC | `frontend/src/main/desktop-version-floor.ts`, `desktop-version-floor.json` | `raw.githubusercontent.com` (fork repo) | packaged build | Fetched from the fork; download URL restricted to the authorized repo |
 | 22 | Mobile PostHog client | ET | `packages/mobile/lib/telemetry/runtime.ts` | `https://us.i.posthog.com` via `posthog-react-native` | packaged + `EXPO_PUBLIC_AO_TELEMETRY_DISABLED != "1"` | Disabled constant; no client |
-| 23 | Mobile Sentry | ED | `packages/mobile/lib/sentry.ts` | separate Sentry project | `EXPO_PUBLIC_SENTRY_DSN` | Already stubbed; client gated off |
+| 23 | Mobile Sentry | ED | `packages/mobile/lib/sentry.ts` | separate Sentry project | `EXPO_PUBLIC_SENTRY_DSN` | `initMobileSentry` returns before DSN/SDK/init |
 | 24 | Cloud (`cloud/`) | — | `cloud/` | AWS CloudWatch (server-side) | hosted product | Out of scope: separate module, no client SDK |
-| 25 | `@sentry/electron` dependency | NV | `frontend/package.json` | none (unused) | never imported | Kept and allowlisted; see residual risk |
+| 25 | `@sentry/electron` / `posthog-js` / `posthog-react-native` deps | NV | `package.json` files | none unless wired | never imported for export | Kept and allowlisted; see residual risk |
 | 26 | Electron native crash reporter / minidumps | — | — | — | never started | None found; crash dumps only reparented under `~/.ao` |
+| 27 | CI privacy guard | — | `scripts/privacy-guard.sh`, `.github/workflows/privacy-guard.yml` | — | on push/PR | **New**: fails on reintroduction |
 
-Evidence: this inventory comes from reading the code (file/line references in
-the table) plus the existing test suite. It supersedes any earlier draft
-summary; where the code and a prior note disagreed, the code wins.
+Evidence: this inventory comes from reading the code (file references in the
+table) plus the test suite and a controlled daemon run (§7). Where the code and a
+prior note disagreed, the code wins.
 
 ## 4. What "external" means here, and what is preserved
 
 Preserved on purpose (they are **not** telemetry):
 
-- **Local logs and local diagnostics**, including the SQLite `telemetry_events`
-  table (`LL`). These never leave the machine and are what a maintainer debugs
-  with.
+- **Local logs and local diagnostics**, including the SQLite `telemetry_event`
+  table (`LL`). These never leave the machine.
 - **Internal application events, hooks, protocol messages, and CDC events**
   (`IE`). Internal names and shared interfaces are not, by themselves, evidence
-  of external export. The daemon still emits `ao.*` events to its local sink and
-  the SSE/CDC pipeline still delivers session state.
+  of external export; the daemon still records `ao.*` events locally and the
+  SSE/CDC pipeline still delivers session state.
 - **Functional communication** (`FC`): the loopback daemon API, WebSocket
   terminal mux, SCM/tracker clients, cloud control plane, Expo push, and update
   feeds. The fork blocks AO's tracking and error-reporting export, not the
@@ -97,56 +104,64 @@ Preserved on purpose (they are **not** telemetry):
 ### Out of scope
 
 - **Agent-harness telemetry.** Codex, Claude Code, Kimi, Crush and similar
-  harness binaries have their own telemetry, configured by their own vendors.
-  This fork does not and cannot disable it from AO's code. Some harnesses expose
-  their own opt-out (`cloud/internal/workerexec/command.go` shows the pattern);
-  configuring those is a per-harness operator decision, not an AO fork change.
+  harness binaries have their own telemetry configured by their vendors. This
+  fork does not disable it from AO's code. Some harnesses expose their own
+  opt-out (`cloud/internal/workerexec/command.go` shows the pattern);
+  configuring those is a per-harness operator decision.
 - **The hosted cloud product** (`cloud/`): a separate Go module with server-side
-  CloudWatch monitoring only, no AO client SDK. Its existence in this repo is
-  not an install path for the desktop fork.
-- **Mobile**: treated in-repo (see #22/#23) but not built or run as part of this
-  change; its independent initializations are disabled in code and its runtime
-  validation is a pending item.
+  CloudWatch monitoring only, no AO client SDK.
+- **Mobile**: treated in-repo and disabled in code; its runtime is not validated
+  by this change (§8).
 
 ## 5. Implementation
 
 Backend (Go):
 
-- `backend/internal/daemon/fork_privacy.go` (new): the policy constants and the
-  DSN resolver.
-- `backend/internal/daemon/telemetry_wiring.go`: `newTelemetrySink` no longer
-  constructs the PostHog chain; it returns a local SQLite sink (events enabled)
-  or a `NoopSink` (events disabled). The `aggregatedEventNames` list that only
-  existed to shape PostHog traffic is gone.
-- `backend/internal/daemon/daemon.go`: the Sentry DSN is resolved through the
-  policy (`daemonSentryDSN`) for both `sentryobs.ParseAgentSwitchDSN` and
-  `sentryobs.Init(newDaemonSentryConfig(...))`, so neither the daemon Sentry
-  client nor the agent-switch sender is ever built.
-- `backend/internal/daemon/telemetry_wiring_test.go`,
-  `backend/internal/daemon/fork_privacy_test.go`: regression tests (see §7).
+- `backend/internal/daemon/fork_privacy.go`: policy constants, the
+  `forkPrivacyPolicyViolated()` boot assertion, and `newDaemonSentryConfig`
+  (always-blank DSN, never read from config).
+- `backend/internal/daemon/telemetry_wiring.go`: `newTelemetrySink` returns only
+  a local SQLite sink (events enabled) or `NoopSink`; the PostHog chain and the
+  `aggregatedEventNames` list it needed are gone.
+- `backend/internal/daemon/daemon.go`: fail-closed `forkPrivacyPolicyViolated()`
+  check at startup; `ParseAgentSwitchDSN("")`; `sentryobs.Init(newDaemonSentryConfig(...))`.
+- Tests: `fork_privacy_test.go`, `telemetry_wiring_test.go`.
 
 Frontend:
 
-- `frontend/src/shared/fork-privacy.ts` (new): the policy constants.
-- `frontend/src/shared/telemetry.ts`: `rendererTelemetryEnabled` is permanently
-  false, so `buildTelemetryBootstrap` always returns null (no PostHog client, no
-  install id generated for export).
+- `frontend/src/shared/fork-privacy.ts`: policy constants.
+- `frontend/src/shared/telemetry.ts`: `rendererTelemetryEnabled` permanently
+  false ⇒ `buildTelemetryBootstrap` always null.
 - `frontend/src/renderer/lib/telemetry.ts`: `initTelemetry` returns before
   `posthog.init`.
 - `frontend/src/main/sentry-main.ts`, `frontend/src/renderer/lib/sentry.ts`:
-  intake and transport are forced closed.
+  intake and transport forced closed.
 - `frontend/src/main.ts`: `telemetryOverrides()` pins `AO_TELEMETRY_REMOTE=off`
-  and stamps no PostHog key/host or Sentry DSN onto the daemon.
+  and stamps no PostHog key/host or Sentry DSN.
 - `frontend/vite.renderer.config.ts`: PostHog origins removed from the renderer
-  CSP (defense in depth).
-- Tests: `frontend/src/shared/privacy-policy.test.ts`,
-  `frontend/src/shared/telemetry.test.ts`,
-  `frontend/src/renderer/lib/telemetry.init.test.ts`.
+  CSP.
+- `frontend/src/shared/release-target.ts` (**new**): the single authorized
+  release-target authority (see §6).
+- `frontend/forge.config.ts`, `frontend/src/main/feature-builds.ts`,
+  `frontend/src/main/desktop-version-floor.ts`: route through the authority.
+- Tests: `privacy-policy.test.ts`, `telemetry.test.ts`, `release-target.test.ts`,
+  `telemetry.init.test.ts`, `sentry-main.test.ts`, `desktop-version-floor.test.ts`.
 
 Mobile:
 
-- `packages/mobile/lib/telemetry/config.ts`: `MOBILE_TELEMETRY_DISABLED` is a
-  constant `true`, so `initMobileTelemetry` never constructs a client.
+- `packages/mobile/lib/fork-privacy.ts` (**new**): the mobile policy constants.
+- `packages/mobile/lib/telemetry/config.ts`:
+  `MOBILE_TELEMETRY_DISABLED = !MOBILE_EXTERNAL_TELEMETRY_EXPORT_ALLOWED`.
+- `packages/mobile/lib/sentry.ts`: `initMobileSentry` returns before reading the
+  DSN, loading the SDK, or calling `mod.init`; `options.loadSdk` is a test seam.
+- Tests: `packages/mobile/lib/sentry.test.ts`,
+  `packages/mobile/lib/telemetry/fork-privacy.test.ts`.
+
+Guard and docs:
+
+- `scripts/privacy-guard.sh` (hardened, see §7), `scripts/privacy-guard.test.sh`
+  (self-tests), `.github/workflows/privacy-guard.yml`.
+- `docs/privacy-fork.md` (this file), `docs/privacy-fork-traffic-report.md`.
 
 No API contract, storage schema, or generated artifact changed. No new
 dependency was added.
@@ -156,131 +171,143 @@ dependency was added.
 The PostHog adapter, the Sentry code, and the `posthog-js` /
 `posthog-react-native` / `@sentry/electron` dependencies are retained but
 **unreachable from any composition point**. Removing them wholesale would be a
-large, merge-hostile diff across shared interfaces and their test suites; the
-fork policy prefers neutralizing the composition points and keeping the shared
-interfaces, then detecting a reintroduction in CI (see §7). This is a conscious
-trade-off: the residual risk is a future code change flipping a policy constant
-or rewiring a composition point, which the guard is designed to catch.
+large, merge-hostile diff; the fork policy instead neutralizes the composition
+points, keeps shared interfaces, and catches a reintroduction in CI. The
+residual risk is a future code change flipping a policy constant or rewiring a
+composition point, which the guard is designed to fail on.
 
-## 6. Updates and cross-product scope
+## 6. Updates and the release target
 
-**Updater.** Upstream bakes the release feed from `AO_RELEASE_REPO` in
-`frontend/forge.config.ts`. A stock checkout defaulted to
-`Untrivial-ai/agent-orchestrator`, so a packaged fork build would poll upstream
-and could silently stage an upstream artifact (different privacy policy) on
-quit. The fork changes the default (and the matching fallback in
-`frontend/src/main/feature-builds.ts`) to `EIVRAJAM/agent-orchestrator`. CI
-already sets `AO_RELEASE_REPO` to the repo it runs in. With no fork releases
-yet, update checks fail harmlessly; they never fall back to upstream.
+**Release target.** Upstream baked the feed from `AO_RELEASE_REPO` (default
+`Untrivial-ai/agent-orchestrator`), so a fork build could poll and silently
+stage an upstream artifact. The fork routes everything through
+`frontend/src/shared/release-target.ts`:
 
-**Version floor.** `frontend/src/main/desktop-version-floor.ts` (and
-`desktop-version-floor.json`) fetched a floor file from upstream and could
-force-quit a fork install or point at an upstream download. Both now target the
-fork repo. If the fork publishes no floor file, the fetch 404s and the check is
-a silent no-op.
+- `AUTHORIZED_RELEASE_REPOS` is the explicit, reviewed allowlist (currently
+  `EIVRAJAM/agent-orchestrator`). A legitimate rename is made here, deliberately.
+- `UPSTREAM_RELEASE_REPOS` lists known upstream homes, rejected explicitly.
+- A blank `AO_RELEASE_REPO` falls back to the authorized fork; a malformed,
+  upstream, or any other unauthorized value **throws**, so a build fails instead
+  of honoring it.
+- `forge.config.ts` builds the baked `app-update.yml` from this authority and
+  **re-reads and re-validates the generated file** in `prePackage`, so the check
+  is on the artifact, not only the source. `feature-builds.ts` and
+  `desktop-version-floor.ts` derive from the same authority, so updater, feature
+  list, and floor always agree; the floor's download URL is also restricted to
+  authorized repos.
 
 **Manual update procedure** (until fork release infrastructure exists):
 
-1. Build from the desired fork commit (`frontend/npm ci` then
-   `npm run make`), or download a fork-built artifact from the fork's releases.
+1. Build from the desired fork commit (`frontend/npm ci` then `npm run make`),
+   or download a fork-built artifact from the fork's releases.
 2. Install over the existing app. Do not install an upstream artifact; the
-   updater will not offer one, and the version floor will not point at one.
-3. Record the source commit and verify the privacy guard on that commit
-   (`bash scripts/privacy-guard.sh`).
+   updater will not offer one and the version floor will not point at one.
+3. Record the source commit and run `bash scripts/privacy-guard.sh` on it.
 
-**Mobile / Cloud.** Mobile initializations are disabled in code (see §3) but its
-runtime is not validated here (no Expo build). Cloud is a separate module with
-server-side monitoring only and is out of scope. Do not read either as
-"validated" — see §8.
+**Mobile / Cloud.** Mobile initializations are disabled in code but its runtime
+is not validated here (no Expo build). Cloud is a separate module and out of
+scope.
 
 ## 7. Verification
 
-Automated (checked in):
+`bash scripts/privacy-guard.sh` (also `npm run privacy:guard`), run locally and
+by `.github/workflows/privacy-guard.yml`. It has three layers:
 
-- `bash scripts/privacy-guard.sh` (also `npm run privacy:guard`), run by
-  `.github/workflows/privacy-guard.yml` and locally. It combines:
-  - backend privacy tests (`newTelemetrySink` never builds a remote exporter;
-    the composed Sentry config never enables Sentry even with a DSN present);
-  - frontend privacy tests (the export gate is closed for every env; the
-    bootstrap is always withheld; `initTelemetry` never constructs a client and
-    every capture is dropped; `initMainSentry` returns null);
-  - static alarms: policy constants closed, no production `NewPostHogSink`, no
-    upstream owner in the updater/floor files, no unreviewed observability
-    dependency, and a printed list of analytics/error init sites for review.
+1. **Failing static gates** (not warnings):
+   - policy constants closed (Go, frontend, mobile);
+   - an exact allowlist of authorized observability init/construction sites
+     (`posthog.init`, `new PostHog`, `Sentry.init`, `sentry.Init`,
+     `sentry.NewHTTPSyncTransport`, `NewPostHogSink`, …) across Go, Electron
+     main, renderer and mobile — anything else fails;
+   - the dormant files still carry their fork-policy guard, and the daemon does
+     not read a Sentry DSN from configuration;
+   - the release target is the authorized fork repo and every consumer routes
+     through the shared authority;
+   - no unreviewed observability dependency.
+2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): a clean fixture tree
+   passes, and each reintroduction fails — a new `Sentry.init`, a new
+   `posthog.init`/`new PostHog`, a mobile telemetry reactivation (guard removed or
+   constant flipped), a new observability dependency, and a release target
+   pointed at upstream.
+3. **Behavioral tests** as the backstop that a reintroduction avoiding the grepped
+   shapes must still fail: daemon composition (no remote sink even when configured
+   against a live `httptest` server; Sentry never enabled with a DSN present),
+   renderer/main policy, release-target resolution (absent/correct/upstream/
+   malformed/unauthorized), and mobile (a valid DSN + an injected SDK +
+   production env still never builds PostHog or calls `Sentry.init`).
 
-The tests assert **behavior at the composition points**, not constant matches:
-they build the real config/objects and assert that no exporter/transport is
-produced and that outbound requests stay at zero, using injected HTTP test
-servers and fakes.
+The guard **refuses to run in CI** if any `PRIVACY_GUARD_SKIP_*` or
+`PRIVACY_GUARD_STATIC_ONLY` variable is set, so a workflow cannot skip a
+mandatory part. Static matching is an alarm, never the sole guarantee.
 
-A controlled daemon-run traffic observation (destination canary + socket
-inspection) is recorded in
-[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md), with its scope
-and limits.
+The CI workflow runs when anything that can change policy, packaging, the
+release target, or dependencies changes: `backend/**`, `frontend/**`,
+`packages/mobile/**`, `packages/cloud-client/**`, `contracts/**`,
+`desktop-version-floor.json`, root `package.json`/`package-lock.json`,
+`go.work`/`go.work.sum`, `scripts/**`, and `.github/workflows/**` (which includes
+`build-artifacts.yml`).
 
-The static checks are an alarm, never the guarantee; a reintroduction that
-avoids the grepped shapes must still be caught by the behavioral tests.
+A controlled daemon-run traffic observation is recorded in
+[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md).
 
-## 8. Residual risks and pending validations
+## 8. Status: implemented, verified, pending
 
-Residual risks:
+**Implemented:** the policy and composition changes in §5, the release-target
+authority in §6, and the guard/self-tests/workflow in §7.
 
-1. **A future code change flips a policy constant or rewires a composition
-   point.** This is the main risk. The guard and CI workflow exist to make such
-   a change fail and force review; they do not make it impossible.
-2. **Dormant adapters and SDKs remain in the tree** (§5). A reintroduction only
-   needs a composition change, which the guard flags. Removing them entirely is
-   deferred to keep the fork mergeable.
-3. **`@sentry/electron` is an unused declared dependency.** It is allowlisted in
-   the guard. Removing it is a candidate follow-up that touches the lockfile.
-4. **Pricing catalog fetch** (#19) still contacts `raw.githubusercontent.com`
-   for a static catalog. It sends no user data, but it is an upstream-owned
-   endpoint; repointing it to the fork is a candidate follow-up.
-5. **Agent-harness telemetry** is unchanged and out of scope (§4). Users who
-   need it off must configure each harness.
+**Verified by automated tests** (all green in this environment):
 
-Pending validations (not done here — do not read as passed):
+- Go: `go build ./...`; `gofmt`/`go vet` clean; `golangci-lint v2.13.2` on the
+  touched packages reports 0 issues; `go test ./internal/daemon/...` passes;
+  the privacy tests assert the local-only sink, the blank Sentry DSN, and the
+  closed policy assertion.
+- Frontend: `npm run typecheck` passes; the privacy/release-target tests pass.
+- Mobile: `npm run typecheck` passes; the mobile privacy tests pass (and the
+  pre-existing `conversationChrome` failure is unrelated — see below).
+- Guard: `scripts/privacy-guard.test.sh` passes (clean passes; six
+  reintroductions fail); `scripts/privacy-guard.sh` returns OK end-to-end.
 
-- **Real desktop traffic capture.** Not performed in this environment. The
-  required method (isolated worktree, `npm ci`, `AO_DATA_DIR` lab dir, the
-  `ao-desktop-dev` skill, run packaged-equivalent and dev, observe start/stop,
-  session create/stop, controlled error, reconnect) must be run on a supported
-  desktop OS and recorded as an appendix to this document, distinguishing AO
-  traffic from agent traffic and system traffic. In-process interception alone
-  is not a full system capture.
-- **Mobile runtime.** No Expo build/run here; only the code-level disable is
-  done.
-- **Cloud.** Out of scope; no validation attempted.
-- **Packaged-artifact verification on macOS/Windows.** Not run; the updater
-  change is verified by code review and the guard, not by a signed-artifact
-  install test.
+**Verified by controlled execution:** a single daemon run with a local
+destination canary configured as the PostHog host and Sentry DSN, with remote
+telemetry fully enabled by env, produced zero requests to the canary, recorded
+internal events locally, and made only two functional outbound connections
+(pricing catalog and a harness readiness probe). See the traffic report.
+
+**Pending (not verified here):**
+
+- Full system/desktop traffic capture. Requires a supported desktop OS with a
+  display; this environment has no Xvfb, `tcpdump`, or `strace`. The daemon
+  observation is destination-canary + socket inspection, not a full capture.
+- Real Electron desktop app run (launch, create/stop/restore a session, create
+  and clean up worktrees, reconnect, packaged-equivalent and dev).
+- Real launches of Codex and OpenCode; GitHub / PR / CI flows.
+- Packaged artifact build and install, and effective updater behavior
+  (download/install from the fork release target).
+- Mobile app runtime (code-level disable only; no Expo build).
+- Cloud: out of scope, not exercised.
+
+**Comparative limitation (pre-existing, not a pass):** the full frontend suite
+(`vitest run`) has a reproducible failure in `ContextMeter.test.tsx` and the full
+mobile suite in `lib/chat/conversationChrome.test.ts` (a locale/`Intl` formatting
+difference in this container). Both fail **identically on the base SHA**
+`7dceb0ec7` in an isolated worktree, and neither is in a file this change
+touches. They are recorded as environment/locale limitations, not as verified
+passes.
 
 ## 9. Syncing with upstream
 
 1. Fetch upstream and merge/rebase onto `main`.
-2. Re-run `bash scripts/privacy-guard.sh`; the privacy workflow will also run on
-   the PR.
-3. Review every conflict or automated change in these files specifically:
-   `backend/internal/daemon/fork_privacy.go`,
-   `backend/internal/daemon/telemetry_wiring.go`,
-   `backend/internal/daemon/daemon.go`,
-   `frontend/src/shared/fork-privacy.ts`,
-   `frontend/src/shared/telemetry.ts`,
-   `frontend/src/renderer/lib/telemetry.ts`,
-   `frontend/src/main.ts`,
-   `frontend/src/main/sentry-main.ts`,
-   `frontend/src/renderer/lib/sentry.ts`,
-   `frontend/vite.renderer.config.ts`,
-   `frontend/forge.config.ts`,
-   `frontend/src/main/feature-builds.ts`,
-   `frontend/src/main/desktop-version-floor.ts`,
-   `desktop-version-floor.json`,
-   `packages/mobile/lib/telemetry/config.ts`.
-   Upstream changes in observability, consent, or the updater are the ones that
-   can silently change this policy.
-4. If upstream adds a new observability dependency or init site, the guard
-   flags it; decide deliberately whether it is a kept-dormant adapter or a
-   removed surface, and update this document.
+2. Run `bash scripts/privacy-guard.test.sh` and `bash scripts/privacy-guard.sh`.
+3. Review every conflict or automated change in the policy/composition files
+   listed in §5, plus `frontend/src/shared/release-target.ts`,
+   `frontend/forge.config.ts`, `frontend/src/main/feature-builds.ts`,
+   `frontend/src/main/desktop-version-floor.ts`, `desktop-version-floor.json`,
+   and `packages/mobile/lib/{fork-privacy.ts,sentry.ts,telemetry/config.ts}`.
+   Upstream changes in observability, consent, or the updater can silently
+   change this policy.
+4. If upstream adds a new observability dependency or init site, the guard fails;
+   decide deliberately whether it is a kept-dormant adapter or a removed surface,
+   and update this document and the allowlist.
 5. Regenerate generated artifacts only if the merge changed their sources
    (`npm run sqlc`, `npm run api`); this policy change required none.
 6. Re-run the relevant full suites the repository requires before sharing a PR.

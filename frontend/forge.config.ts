@@ -7,21 +7,25 @@ import MakerNSIS from "./makers/maker-nsis";
 import MakerDMG, { isSigningConfigured, sealDmg, verifyDmg, verifyMacArtifact } from "./makers/maker-dmg";
 import { machoHasX86_64Slice } from "./makers/macho-archs";
 import MakerAppImage from "./makers/maker-appimage";
-import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { BUNDLED_TMUX_VERSION } from "./scripts/tmux-version.mjs";
+import {
+	assertAuthorizedAppUpdateYml,
+	buildAppUpdateYml,
+	resolveReleaseRepo,
+} from "./src/shared/release-target";
 
-// Default GitHub release target for this fork. Upstream (the org the repo was
-// transferred to in July 2026) is Untrivial-ai; this fork lives at
-// EIVRAJAM/agent-orchestrator and MUST NOT default to the upstream repo, or a
-// packaged fork build would poll and silently stage an upstream artifact with a
-// different privacy policy on quit (see docs/privacy-fork.md). Builds cut by CI
-// override this: the workflows set AO_RELEASE_REPO to the repo they run in, and
-// build-artifacts.yml asserts the baked app-update.yml matches it, so a future
-// rename fails the build instead of stranding the fleet on a redirect (#3523).
-const DEFAULT_RELEASE_REPO = "EIVRAJAM/agent-orchestrator";
+// The GitHub release target is NOT defined here. frontend/src/shared/release-target.ts
+// is the single reviewed authority: it defaults to this fork
+// (EIVRAJAM/agent-orchestrator), rejects known upstream homes explicitly, and
+// throws on any unauthorized AO_RELEASE_REPO instead of silently honoring it, so
+// a build cannot point the updater at a repository with a different privacy
+// policy. CI overrides the repo with AO_RELEASE_REPO=<the repo it runs in>, and
+// build-artifacts.yml asserts the baked app-update.yml matches it. See
+// docs/privacy-fork.md.
 
 // The packaged binary name (no extension). Single source of truth: the packager
 // names the exe/ELF from this, and the NSIS + deb makers must point their
@@ -106,15 +110,11 @@ export function macSignOptionsForFile(filePath: string): { entitlements?: string
 }
 
 // parseReleaseRepo turns an "owner/repo" string (from AO_RELEASE_REPO) into the
-// publisher-github { owner, name } shape, falling back to the production default
-// when unset or malformed.
+// publisher-github { owner, name } shape, falling back to the fork default when
+// unset. Any upstream or unauthorized value throws via resolveReleaseRepo, so a
+// build fails loudly instead of publishing to the wrong repository.
 function parseReleaseRepo(value: string | undefined): { owner: string; name: string } {
-	const [owner, name] = (value || DEFAULT_RELEASE_REPO).split("/");
-	if (!owner || !name) {
-		const [defOwner, defName] = DEFAULT_RELEASE_REPO.split("/");
-		return { owner: defOwner, name: defName };
-	}
-	return { owner, name };
+	return resolveReleaseRepo(value);
 }
 
 const config: ForgeConfig = {
@@ -179,15 +179,12 @@ const config: ForgeConfig = {
                 if (wakeBuild.error) throw wakeBuild.error;
                 if (wakeBuild.status !== 0) throw new Error("macOS wake helper build failed");
 			}
-			const { owner, name } = parseReleaseRepo(process.env.AO_RELEASE_REPO);
-			const yml = [
-				"provider: github",
-				`owner: ${owner}`,
-				`repo: ${name}`,
-				"updaterCacheDirName: agent-orchestrator-updater",
-				"",
-			].join("\n");
-			writeFileSync("app-update.yml", yml);
+			// Build the feed from the authorized release target only.
+			// buildAppUpdateYml throws on an upstream or unauthorized
+			// AO_RELEASE_REPO; the read-back then validates the artifact that
+			// actually ships, not just the source that produced it.
+			writeFileSync("app-update.yml", buildAppUpdateYml(process.env.AO_RELEASE_REPO));
+			assertAuthorizedAppUpdateYml(readFileSync("app-update.yml", "utf8"));
 		},
 		packageAfterPrune: async (_forgeConfig, buildPath) => {
 			const nativeModule = path.join(
@@ -360,13 +357,11 @@ const config: ForgeConfig = {
 	publishers: [
 		{
 			name: "@electron-forge/publisher-github",
-			// Release target is build-time overridable so a fork run publishes to the
-			// fork without a source edit. AO_RELEASE_REPO is "owner/repo"; it defaults
-			// to the production target. The dev/test loop sets
-			// AO_RELEASE_REPO=harshitsinghbhandari/agent-orchestrator (spec §1.1, §8).
-			// Note: aoagents/agent-orchestrator and AgentWrapper/agent-orchestrator
-			// are prior homes and intentionally NOT the default; releases land on
-			// Untrivial-ai.
+			// Release target comes from frontend/src/shared/release-target.ts, the
+			// single reviewed authority. AO_RELEASE_REPO may point at the authorized
+			// fork repo (or a future authorized rename), but an upstream or any other
+			// value throws at config load — a fork build cannot publish to an
+			// unauthorized repository. See docs/privacy-fork.md.
 			config: {
 				repository: parseReleaseRepo(process.env.AO_RELEASE_REPO),
 				prerelease: process.env.AO_RELEASE_PRERELEASE === "true",

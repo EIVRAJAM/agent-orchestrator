@@ -1,14 +1,15 @@
 import { app, dialog, shell } from "electron";
 import semver from "semver";
+import { DEFAULT_RELEASE_REPO, resolveReleaseRepo } from "../shared/release-target";
 
 // Fork privacy/update policy: the version floor is fetched from THIS fork's
-// repo, not upstream. Upstream could otherwise bump `min` and force-quit a fork
-// install, or point it at an upstream download with a different privacy policy.
-// If this fork publishes no desktop-version-floor.json, the fetch 404s and the
-// check is a silent no-op — it never falls back to upstream. See
-// docs/privacy-fork.md.
-const FLOOR_URL =
-  "https://raw.githubusercontent.com/EIVRAJAM/agent-orchestrator/main/desktop-version-floor.json";
+// repo and its download link is restricted to the authorized release target
+// (frontend/src/shared/release-target.ts), not upstream. Upstream could
+// otherwise bump `min` and force-quit a fork install, or point it at an upstream
+// download with a different privacy policy. If this fork publishes no
+// desktop-version-floor.json, the fetch 404s and the check is a silent no-op —
+// it never falls back to upstream. See docs/privacy-fork.md.
+const FLOOR_URL = `https://raw.githubusercontent.com/${DEFAULT_RELEASE_REPO}/main/desktop-version-floor.json`;
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -18,8 +19,25 @@ type Floor = {
   downloadUrl?: string;
 };
 
-const DEFAULT_DOWNLOAD_URL =
-  "https://github.com/EIVRAJAM/agent-orchestrator/releases/latest";
+const DEFAULT_DOWNLOAD_URL = `https://github.com/${DEFAULT_RELEASE_REPO}/releases/latest`;
+
+// Only a download link that points at an authorized release repo is honored;
+// anything else (including a floor file that names upstream) falls back to the
+// authorized default, so the floor can never steer a fork install to an
+// unauthorized artifact.
+function authorizedDownloadUrl(rawUrl: string | undefined): string {
+  const raw = (rawUrl ?? "").trim();
+  const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)(?:\/|$)/.exec(raw);
+  if (match) {
+    try {
+      resolveReleaseRepo(match[1]);
+      return raw;
+    } catch {
+      // Unauthorized/upstream owner: fall through to the authorized default.
+    }
+  }
+  return DEFAULT_DOWNLOAD_URL;
+}
 
 function usableVersion(v: string | null | undefined): string | null {
   const trimmed = v?.trim();
@@ -54,8 +72,7 @@ export async function checkDesktopVersionFloor(): Promise<void> {
   }
 
   const running = app.getVersion();
-  const rawUrl = floor.downloadUrl || DEFAULT_DOWNLOAD_URL;
-  const downloadUrl = rawUrl.startsWith("https://github.com/") ? rawUrl : DEFAULT_DOWNLOAD_URL;
+  const downloadUrl = authorizedDownloadUrl(floor.downloadUrl);
   const minVersion = usableVersion(floor.min);
   const latestVersion = usableVersion(floor.latest);
 

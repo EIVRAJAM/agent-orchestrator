@@ -193,6 +193,13 @@ func Run() error {
 	ignoreBrokenPipeSignal()
 
 	log := newLogger()
+	// Fork privacy policy: the daemon's composition points are local-only and
+	// consult no remote configuration. This assertion fails closed if the
+	// compiled-in policy is ever flipped, rather than exporting silently. See
+	// fork_privacy.go.
+	if forkPrivacyPolicyViolated() {
+		return errors.New("fork privacy policy violated: external telemetry/diagnostics export is enabled")
+	}
 	var browserRuntimeToken string
 	if os.Getenv(browserruntime.RuntimeTokenStdinEnv) == "1" {
 		browserRuntimeToken, err = browserruntime.ReadRuntimeToken(os.Stdin)
@@ -241,13 +248,9 @@ func Run() error {
 	// Consent and event metadata are established before any reporting surface or
 	// recovery enrollment exists. SQLite is forced off first on every boot so a
 	// stale enabled mirror can never authorize work after a restart. The DSN is
-	// resolved through the fork privacy policy, which keeps it blank, so the
-	// staged agent-switch Sentry sender can never be built (see fork_privacy.go).
-	sentryDSN := daemonSentryDSN(cfg.Telemetry)
-	destination, destinationErr := sentryobs.ParseAgentSwitchDSN(sentryDSN, true)
-	if destinationErr != nil && sentryDSN != "" {
-		log.Warn("agent switch failure sender disabled", "error", destinationErr)
-	}
+	// always blank (fork privacy policy — see fork_privacy.go), so the staged
+	// agent-switch Sentry sender can never be built.
+	destination, destinationErr := sentryobs.ParseAgentSwitchDSN("", true)
 	policyCoordinator := agentswitchobs.NewPolicyCoordinator(store, agentswitchobs.PolicyOptions{
 		AuthorityReader:         policyauthority.New(filepath.Join(cfg.DataDir, agentswitchobs.PolicyFileName)),
 		TelemetryEvents:         cfg.Telemetry.Events,

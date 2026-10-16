@@ -89,14 +89,26 @@ describe("checkDesktopVersionFloor", () => {
     expect(quit).toHaveBeenCalled();
   });
 
-  it("opens the download URL when user clicks Download on required update", async () => {
+  it("opens the authorized download URL when the floor names the fork repo", async () => {
+    const { mod, dialog, shellMock, quit } = await importModule({
+      version: "0.12.12",
+      floor: { min: "0.12.13", downloadUrl: "https://github.com/EIVRAJAM/agent-orchestrator/releases/tag/v0.12.13" },
+    });
+    dialog.showMessageBox.mockResolvedValue({ response: 0 });
+    await mod.checkDesktopVersionFloor();
+    expect(shellMock.openExternal).toHaveBeenCalledWith("https://github.com/EIVRAJAM/agent-orchestrator/releases/tag/v0.12.13");
+    expect(quit).toHaveBeenCalled();
+  });
+
+  it("refuses an upstream download URL and falls back to the authorized default", async () => {
     const { mod, dialog, shellMock, quit } = await importModule({
       version: "0.12.12",
       floor: { min: "0.12.13", downloadUrl: "https://github.com/Untrivial-ai/agent-orchestrator/releases/tag/v0.12.13" },
     });
     dialog.showMessageBox.mockResolvedValue({ response: 0 });
     await mod.checkDesktopVersionFloor();
-    expect(shellMock.openExternal).toHaveBeenCalledWith("https://github.com/Untrivial-ai/agent-orchestrator/releases/tag/v0.12.13");
+    expect(shellMock.openExternal).toHaveBeenCalledWith("https://github.com/EIVRAJAM/agent-orchestrator/releases/latest");
+    expect(shellMock.openExternal).not.toHaveBeenCalledWith("https://github.com/Untrivial-ai/agent-orchestrator/releases/tag/v0.12.13");
     expect(quit).toHaveBeenCalled();
   });
 
