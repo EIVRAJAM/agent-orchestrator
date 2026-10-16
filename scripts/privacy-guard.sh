@@ -10,13 +10,19 @@
 #      must not initialize a client/transport, no matter the config or env.
 #   2. Static gates — a reintroduced exporter, an upstream/unauthorized update
 #      feed, or a new observability dependency FAILS the guard (not just warns).
-#      An explicit allowlist pins the deliberately-dormant files, and those files
-#      must still carry their fork-policy guard.
+#      scripts/lib/privacy-scan.mjs matches observability SDK *module specifiers*
+#      (so an aliased import is caught regardless of the local identifier) across
+#      backend/**, frontend/**, packages/** and scripts/**, and discovers every
+#      package.json under those roots. An explicit allowlist pins the
+#      deliberately-dormant files, and those files must still carry their
+#      fork-policy guard.
 #   3. The documented policy — see docs/privacy-fork.md — which states what is
 #      and is not allowed to leave the machine.
 #
-# Static matching is an alarm, never the guarantee; the behavioral tests are the
-# backstop for a reintroduction that avoids the grepped shapes.
+# Static matching is an alarm, never the guarantee: it cannot detect a
+# hand-written HTTP exporter with no known SDK or marker, and it does not prove
+# absence. The behavioral tests cover the known composition points; upstream
+# merges still need code review and, where warranted, traffic inspection.
 #
 # Run locally from the repo root:
 #   bash scripts/privacy-guard.sh
@@ -73,11 +79,6 @@ require_contains() {
   grep -Fq "$text" "$file" || bad "$file: missing required policy guard \"$text\""
 }
 
-require_absent_file() {
-  local file="$1"
-  [[ -e "$file" ]] && bad "$file must not exist"
-}
-
 # --- Static gate 1: policy constants are closed ------------------------------
 
 note "==> static: fork policy constants are closed"
@@ -88,35 +89,18 @@ require_false frontend/src/shared/fork-privacy.ts 'EXTERNAL_DIAGNOSTICS_EXPORT_A
 require_false packages/mobile/lib/fork-privacy.ts 'MOBILE_EXTERNAL_TELEMETRY_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false'
 require_false packages/mobile/lib/fork-privacy.ts 'MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED[[:space:]]*=[[:space:]]*false'
 
-# --- Static gate 2: authorized observability init/construction sites ---------
+# --- Static gate 2: imports, call sites, and dependencies --------------------
 #
-# Every exporter construction or client init in Go, Electron main/renderer and
-# mobile must be in the reviewed allowlist below. Anything else fails.
+# scripts/lib/privacy-scan.mjs matches the observability module *specifier*, so an
+# aliased import is caught regardless of the local identifier, and covers Go,
+# Electron main, renderer and all of packages/**. It also discovers every
+# package.json under the covered roots, so an observability dependency added to
+# any package (product-ui, cloud-client, …) fails unless reviewed.
 
-note "==> static: observability init/construction sites are allowlisted"
-allowed=" backend/internal/adapters/telemetry/posthog.go backend/internal/observe/sentryobs/sentryobs.go frontend/src/renderer/lib/telemetry.ts packages/mobile/lib/telemetry/runtime.ts packages/mobile/lib/sentry.ts "
-init_pattern='posthog\.init\(|new PostHog\(|Sentry\.init\(|sentry\.Init\(|sentry\.init\(|mod\.init\(|NewPostHogSink\(|sentry\.NewHTTPSyncTransport\('
-scan_dirs=(backend frontend/src packages/mobile/lib)
-mapfile -t init_hits < <(
-  grep -rnE --include='*.go' --include='*.ts' --include='*.tsx' "$init_pattern" "${scan_dirs[@]}" 2>/dev/null || true
-)
-for hit in "${init_hits[@]:-}"; do
-  [[ -z "$hit" ]] && continue
-  file="${hit%%:*}"
-  file="${file#./}"
-  base="$(basename "$file")"
-  case "$base" in
-    *_test.go|*.test.ts|*.test.tsx) continue ;;
-  esac
-  content="${hit#*:}"; content="${content#*:}"
-  trimmed="${content#"${content%%[![:space:]]*}"}"
-  case "$trimmed" in
-    //*|'*'*|'/*'*|'#'*) continue ;; # comment line
-  esac
-  if [[ " $allowed " != *" $file "* ]]; then
-    bad "unauthorized observability init/construction in $file: $trimmed"
-  fi
-done
+note "==> static: observability imports, call sites, and dependencies"
+if ! node scripts/lib/privacy-scan.mjs "$root"; then
+  bad "privacy-scan found unauthorized observability imports/constructions or an unreviewed dependency"
+fi
 
 # --- Static gate 3: allowed files stay protected by the policy ---------------
 
@@ -145,37 +129,7 @@ if grep -n '"downloadUrl"' desktop-version-floor.json 2>/dev/null | grep -q 'Unt
   bad "desktop-version-floor.json points its downloadUrl at upstream"
 fi
 
-# --- Static gate 5: no unreviewed observability dependency -------------------
-
-note "==> static: observability dependencies match the reviewed allowlist"
-node - <<'NODE' || bad "unreviewed observability dependency found"
-const fs = require("fs");
-const files = ["package.json", "frontend/package.json", "packages/mobile/package.json"];
-// Direct dependencies that ARE allowed to be present: they back dormant code
-// paths (see docs/privacy-fork.md) and are neutralized at the composition
-// points. Adding any other analytics/error SDK must be a deliberate review.
-const reviewed = new Set([
-  "posthog-js",
-  "posthog-react-native",
-  "@sentry/electron",
-]);
-const observability = /^(posthog|@posthog\/|@sentry\/|@amplitude\/|@datadog\/|@honeycombio\/|@opentelemetry\/|@bugsnag\/|bugsnag|amplitude|mixpanel|segment|@segment\/|datadog|dd-trace|newrelic|rollbar|logrocket|fullstory|heap|@logtail\/|@highlight-run\/)/;
-const flagged = [];
-for (const file of files) {
-  if (!fs.existsSync(file)) continue;
-  const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
-  for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
-    for (const name of Object.keys(pkg[field] ?? {})) {
-      if (observability.test(name) && !reviewed.has(name)) flagged.push(`${file}: ${name}`);
-    }
-  }
-}
-if (flagged.length) {
-  console.error("unreviewed observability dependency present:\n" + flagged.join("\n"));
-  process.exit(1);
-}
-console.log("ok: no unreviewed observability dependency");
-NODE
+# --- Behavioral gates below (skipped only outside CI) ------------------------
 
 if [[ "$static_only" == "1" ]]; then
   if [[ "$fail" -eq 0 ]]; then

@@ -159,7 +159,8 @@ Mobile:
 
 Guard and docs:
 
-- `scripts/privacy-guard.sh` (hardened, see §7), `scripts/privacy-guard.test.sh`
+- `scripts/privacy-guard.sh` (hardened, see §7), `scripts/lib/privacy-scan.mjs`
+  (the import/call/dependency scanner), `scripts/privacy-guard.test.sh`
   (self-tests), `.github/workflows/privacy-guard.yml`.
 - `docs/privacy-fork.md` (this file), `docs/privacy-fork-traffic-report.md`.
 
@@ -215,69 +216,107 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
 
 1. **Failing static gates** (not warnings):
    - policy constants closed (Go, frontend, mobile);
-   - an exact allowlist of authorized observability init/construction sites
-     (`posthog.init`, `new PostHog`, `Sentry.init`, `sentry.Init`,
-     `sentry.NewHTTPSyncTransport`, `NewPostHogSink`, …) across Go, Electron
-     main, renderer and mobile — anything else fails;
+   - `scripts/lib/privacy-scan.mjs` matches observability SDK **module
+     specifiers**, so an aliased import is caught regardless of the local
+     identifier. It scans `backend/**`, `frontend/**`, `packages/**` and
+     `scripts/**` for `.go`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, and
+     covers `import`, `export … from`, bare `import "x"`, dynamic `import(...)`
+     and `require(...)` in TS/JS plus Go import paths (any alias). Only exact,
+     reviewed files are allowlisted: the dormant implementations and their
+     tests (`sentryobs.go`, `posthog.go`, `renderer/lib/telemetry.ts`,
+     `packages/mobile/lib/telemetry/runtime.ts`, `packages/mobile/lib/sentry.ts`,
+     and the reviewed tests). Construction/init call sites are kept as an extra
+     check.
    - the dormant files still carry their fork-policy guard, and the daemon does
      not read a Sentry DSN from configuration;
    - the release target is the authorized fork repo and every consumer routes
      through the shared authority;
-   - no unreviewed observability dependency.
-2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): a clean fixture tree
-   passes, and each reintroduction fails — a new `Sentry.init`, a new
-   `posthog.init`/`new PostHog`, a mobile telemetry reactivation (guard removed or
-   constant flipped), a new observability dependency, and a release target
-   pointed at upstream.
-3. **Behavioral tests** as the backstop that a reintroduction avoiding the grepped
-   shapes must still fail: daemon composition (no remote sink even when configured
-   against a live `httptest` server; Sentry never enabled with a DSN present),
-   renderer/main policy, release-target resolution (absent/correct/upstream/
-   malformed/unauthorized), and mobile (a valid DSN + an injected SDK +
-   production env still never builds PostHog or calls `Sentry.init`).
+   - **dependency discovery**: every `package.json` under `backend/`,
+     `frontend/`, `packages/`, `scripts/` and the repo root (excluding
+     `node_modules`, fixtures and generated output) is checked; an observability
+     dependency anywhere — including `packages/product-ui/package.json` or
+     `packages/cloud-client/package.json` — fails unless it is in the reviewed
+     allowlist.
+2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): one fixture per
+   condition, each built from the real policy files with a single injection, so
+   a working pattern cannot hide a broken one. Covered: direct `Sentry.init`;
+   Sentry under an alias; `sentry-go` under an alias; `posthog.init` alone;
+   `new PostHog` alone; dynamic `import()`; `require()`; init inside
+   `packages/mobile/app/**`; import inside `packages/product-ui/**`; import
+   inside `packages/cloud-client/**`; an observability dependency in
+   `packages/product-ui/package.json`; one in another discovered package; mobile
+   telemetry reactivation (guard removed / constant flipped); an upstream and an
+   unauthorized release target. A clean tree must pass, including the dormant
+   implementations and their reviewed tests.
+3. **Behavioral tests** for the known composition points: daemon composition (no
+   remote sink even when configured against a live `httptest` server; Sentry
+   never enabled with a DSN present), renderer/main policy, release-target
+   resolution (absent/correct/upstream/malformed/unauthorized), and mobile (a
+   valid DSN + an injected SDK + production env still never builds PostHog or
+   calls `Sentry.init`).
 
 The guard **refuses to run in CI** if any `PRIVACY_GUARD_SKIP_*` or
 `PRIVACY_GUARD_STATIC_ONLY` variable is set, so a workflow cannot skip a
-mandatory part. Static matching is an alarm, never the sole guarantee.
+mandatory part.
+
+### What this does and does not cover
+
+- The behavioral tests protect the **known** composition points. They cannot
+  vouch for a new module that those tests never import.
+- The **import allowlist** detects new uses of the reviewed SDKs (under any
+  alias) anywhere in the covered tree, and the **dependency analysis** detects
+  new known observability SDKs in any discovered manifest.
+- **No static search is a guarantee.** A hand-written HTTP exporter with no SDK
+  and no known marker, or a mechanism not yet in the provider list, is not
+  detectable here; the scan showing "OK" proves nothing about absence.
+- Upstream merges therefore still require **code review** and, where warranted,
+  **traffic inspection**. A reintroduction that avoids the static patterns is
+  not automatically caught by the current tests.
 
 The CI workflow runs when anything that can change policy, packaging, the
 release target, or dependencies changes: `backend/**`, `frontend/**`,
-`packages/mobile/**`, `packages/cloud-client/**`, `contracts/**`,
-`desktop-version-floor.json`, root `package.json`/`package-lock.json`,
-`go.work`/`go.work.sum`, `scripts/**`, and `.github/workflows/**` (which includes
-`build-artifacts.yml`).
-
-A controlled daemon-run traffic observation is recorded in
-[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md).
+`packages/**`, `contracts/**`, `desktop-version-floor.json`, root
+`package.json`/`package-lock.json`, `go.work`/`go.work.sum`, `scripts/**`, and
+`.github/workflows/**` (which includes `build-artifacts.yml`).
 
 ## 8. Status: implemented, verified, pending
 
 **Implemented:** the policy and composition changes in §5, the release-target
-authority in §6, and the guard/self-tests/workflow in §7.
+authority in §6, and the guard/scanner/self-tests/workflow in §7.
 
-**Verified by automated tests** (all green in this environment):
+**Verified by automated tests on the current commit** (all green in this
+environment):
 
 - Go: `go build ./...`; `gofmt`/`go vet` clean; `golangci-lint v2.13.2` on the
   touched packages reports 0 issues; `go test ./internal/daemon/...` passes;
   the privacy tests assert the local-only sink, the blank Sentry DSN, and the
   closed policy assertion.
 - Frontend: `npm run typecheck` passes; the privacy/release-target tests pass.
-- Mobile: `npm run typecheck` passes; the mobile privacy tests pass (and the
-  pre-existing `conversationChrome` failure is unrelated — see below).
-- Guard: `scripts/privacy-guard.test.sh` passes (clean passes; six
-  reintroductions fail); `scripts/privacy-guard.sh` returns OK end-to-end.
+- Mobile: `npm run typecheck` passes; the mobile privacy tests pass.
+- Guard: `scripts/privacy-guard.test.sh` passes (clean tree passes; seventeen
+  single-condition reintroductions fail with the expected non-zero exit code);
+  `scripts/privacy-guard.sh` returns OK end-to-end.
 
-**Verified by controlled execution:** a single daemon run with a local
-destination canary configured as the PostHog host and Sentry DSN, with remote
-telemetry fully enabled by env, produced zero requests to the canary, recorded
-internal events locally, and made only two functional outbound connections
-(pricing catalog and a harness readiness probe). See the traffic report.
+**Historical / comparative execution evidence (NOT the current commit):** the
+controlled daemon-run traffic observation
+([privacy-fork-traffic-report.md](privacy-fork-traffic-report.md)) was performed
+on the **previous commit `6bfdccd2d`, not on the current `d77f30f26`**. It
+remains relevant for the paths that did not change — the daemon telemetry sink
+(`newTelemetrySink` local-only), the renderer/mobile init, and the daemon
+env-stamping are untouched by the current commit, whose changes are the guard,
+docs, mobile-Sentry early return, release target, and the Go policy
+representation (the latter strictly tighter: an always-blank DSN instead of a
+branch). But the **binary for `d77f30f26` has not itself been observed**, so the
+run is recorded as *historical/comparative*, not as execution evidence of the
+final artifact. Repeat the run on the final commit before claiming execution
+evidence for it (method in the traffic report).
 
-**Pending (not verified here):**
+**Pending / not verifiable in this environment:**
 
 - Full system/desktop traffic capture. Requires a supported desktop OS with a
   display; this environment has no Xvfb, `tcpdump`, or `strace`. The daemon
   observation is destination-canary + socket inspection, not a full capture.
+- Re-run of the controlled daemon traffic test on the **final** commit.
 - Real Electron desktop app run (launch, create/stop/restore a session, create
   and clean up worktrees, reconnect, packaged-equivalent and dev).
 - Real launches of Codex and OpenCode; GitHub / PR / CI flows.

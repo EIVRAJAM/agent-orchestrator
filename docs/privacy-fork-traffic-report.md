@@ -4,6 +4,18 @@ Appendix to [privacy-fork.md](privacy-fork.md). This records a controlled
 observation of this fork's outbound behavior. It is deliberately explicit about
 what was and was not observed, and about the limits of the method.
 
+> **Evidence scope / historical classification.** This run was performed on the
+> **commit `6bfdccd2d`**, *before* the guard/docs/mobile-Sentry/updater-target
+> corrections in `d77f30f26`. It is kept as **historical / comparative**
+> evidence, not as execution evidence of the current commit. It stays relevant
+> because the daemon outbound paths it exercised — `newTelemetrySink`
+> (local-only), the renderer/mobile init, and the daemon env-stamping — are
+> unchanged by `d77f30f26`; the Go change in that commit tightened the Sentry DSN
+> path (always blank instead of a branch) and cannot widen the surface. The
+> **binary for the final commit has not itself been observed**. Repeat the run on
+> the final commit before claiming execution evidence for the definitive
+> artifact; the method below is the reproducible procedure.
+
 ## Verdict
 
 In the scenarios exercised, the Go daemon made **no** request to a PostHog or
@@ -18,8 +30,9 @@ not, by itself, a guarantee — see [Limits](#limits).
 ## Environment
 
 - Host: Debian GNU/Linux 13 (trixie), Linux 6.12.90, x86_64.
-- Artifact under test: `ao` daemon built from this branch
-  (`go build -o /tmp/opencode/ao ./cmd/ao`).
+- Artifact under test: `ao` daemon built from commit `6bfdccd2d`
+  (`go build -o /tmp/opencode/ao ./cmd/ao`) — the previous commit, see the scope
+  note above.
 - Data: isolated lab dir `AO_DATA_DIR=/tmp/opencode/ao-privacy-lab`, no personal
   credentials, no real `~/.ao` state.
 - Tooling available: `ss`, `lsof`, `python3`. **Not** available: `tcpdump`,
@@ -106,3 +119,5 @@ Three layers, because no single one is a full capture:
   of scope.
 - Traffic of the **agent harnesses** and of the **host system** is not
   attributed here; only the daemon process's sockets were inspected.
+- **This run predates the final commit** (`d77f30f26`); it observed the binary
+  of `6bfdccd2d`. See the scope note at the top.
