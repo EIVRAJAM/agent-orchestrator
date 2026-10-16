@@ -524,8 +524,14 @@ function callTargetName(expression) {
   return null;
 }
 
-const PATH_CALLS = new Set(["path.resolve", "path.join", "path.posix.resolve", "path.posix.join"]);
-const FILE_URL_CALLS = new Set(["fileURLToPath", "url.fileURLToPath"]);
+// Standard modules whose helpers may be trusted, and the specific member
+// functions treated as path/URL construction. Trust is established from the
+// file's own imports/requires (see createBindingContext), never from the callee's
+// name alone.
+const MODULE_PATH = new Set(["node:path", "path"]);
+const MODULE_URL = new Set(["node:url", "url"]);
+const PATH_MEMBERS = new Set(["resolve", "join", "posix.resolve", "posix.join"]);
+const URL_MEMBERS = new Set(["fileURLToPath"]);
 
 // A filesystem base that contributes no package name (the module's own location).
 function isLocalBase(node) {
@@ -552,11 +558,17 @@ function isObservabilityTarget(text) {
 }
 
 // Top-level `const` identifier bindings, so a simple local alias can be resolved.
-// Anything declared with let/var, destructured, redeclared, reassigned or
-// declared in a nested scope is marked unsafe and treated as dynamic.
+// Names declared in a nested scope (or as parameters) are recorded as `shadowed`;
+// `let`/`var`, reassignments, destructuring and function/class declarations make a
+// name `unsafe`. Neither shadowed nor unsafe names are ever trusted. The context
+// also records the file's trusted path/url helper bindings (`helpers`) and every
+// locally declared name (`declared`), so provenance is checked, not the name.
 function createBindingContext(source) {
   const bindings = new Map();
   const unsafe = new Set();
+  const shadowed = new Set();
+  const declared = new Set();
+  const helpers = new Map();
   const isTopLevel = (node) => {
     let parent = node.parent;
     while (parent) {
@@ -566,20 +578,47 @@ function createBindingContext(source) {
     }
     return false;
   };
-  const markPattern = (pattern) => {
-    if (ts.isIdentifier(pattern)) unsafe.add(pattern.text);
-    else ts.forEachChild(pattern, markPattern);
+  const declareNames = (name) => {
+    if (ts.isIdentifier(name)) {
+      declared.add(name.text);
+      return;
+    }
+    ts.forEachChild(name, declareNames);
+  };
+  const markNames = (name, topLevel) => {
+    if (ts.isIdentifier(name)) {
+      declared.add(name.text);
+      if (topLevel) unsafe.add(name.text);
+      else shadowed.add(name.text);
+      return;
+    }
+    ts.forEachChild(name, (child) => markNames(child, topLevel));
   };
   const visit = (node) => {
-    if (ts.isVariableDeclaration(node) && node.initializer && isTopLevel(node)) {
-      if (ts.isIdentifier(node.name)) {
-        const isConst = ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const) !== 0;
+    if (ts.isVariableDeclaration(node)) {
+      const topLevel = isTopLevel(node);
+      const isConst = ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const) !== 0;
+      if (topLevel && node.initializer && ts.isIdentifier(node.name)) {
+        declared.add(node.name.text);
         if (!isConst || bindings.has(node.name.text)) unsafe.add(node.name.text);
         else bindings.set(node.name.text, node.initializer);
+      } else if (topLevel) {
+        // Top-level destructuring (`const { resolve } = require("node:path")`) is
+        // neutral: pass 2 decides trust from the require source. A top-level
+        // non-const destructuring/binding is unsafe.
+        if (isConst) declareNames(node.name);
+        else markNames(node.name, true);
       } else {
-        markPattern(node.name);
+        markNames(node.name, false);
       }
     }
+    if ((ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name) {
+      declared.add(node.name.text);
+      if (isTopLevel(node)) unsafe.add(node.name.text);
+      else shadowed.add(node.name.text);
+    }
+    if (ts.isParameter(node)) markNames(node.name, false);
+    if (ts.isCatchClause(node) && node.variableDeclaration) markNames(node.variableDeclaration.name, false);
     if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left)) unsafe.add(node.left.text);
     if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && ts.isIdentifier(node.operand)) {
       unsafe.add(node.operand.text);
@@ -587,7 +626,98 @@ function createBindingContext(source) {
     ts.forEachChild(node, visit);
   };
   visit(source);
-  return { bindings, unsafe };
+
+  const addHelper = (name, module, member) => {
+    if (!name) return;
+    declared.add(name);
+    if (!MODULE_PATH.has(module) && !MODULE_URL.has(module)) return;
+    if (unsafe.has(name) || shadowed.has(name)) return;
+    helpers.set(name, { module, member });
+  };
+  const addRequirePattern = (pattern, module) => {
+    if (ts.isIdentifier(pattern)) {
+      addHelper(pattern.text, module, null);
+      return;
+    }
+    if (!ts.isObjectBindingPattern(pattern)) return;
+    for (const element of pattern.elements) {
+      const local = element.name && ts.isIdentifier(element.name) ? element.name.text : null;
+      const imported = element.propertyName && ts.isIdentifier(element.propertyName) ? element.propertyName.text : local;
+      addHelper(local, module, imported);
+    }
+  };
+  for (const statement of source.statements) {
+    if (ts.isImportDeclaration(statement) && statement.importClause) {
+      const module = nodeSpecifier(statement.moduleSpecifier);
+      const clause = statement.importClause;
+      if (clause.name) addHelper(clause.name.text, module, null);
+      const named = clause.namedBindings;
+      if (named && ts.isNamespaceImport(named)) addHelper(named.name.text, module, null);
+      if (named && ts.isNamedImports(named)) {
+        for (const element of named.elements) {
+          const imported = element.propertyName ? element.propertyName.text : element.name.text;
+          addHelper(element.name.text, module, imported);
+        }
+      }
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        const initializer = unwrap(declaration.initializer);
+        if (!initializer || !ts.isCallExpression(initializer)) continue;
+        if (!(ts.isIdentifier(initializer.expression) && initializer.expression.text === "require")) continue;
+        if (initializer.arguments.length < 1) continue;
+        addRequirePattern(declaration.name, nodeSpecifier(initializer.arguments[0]));
+      }
+    }
+  }
+  return { bindings, unsafe, shadowed, declared, helpers };
+}
+
+// Identity of a trusted helper binding/expression as { module, member } (member is
+// null for a namespace import). Aliases (`const resolve = path.resolve`) are
+// resolved through the binding table.
+function helperIdentity(node, ctx, seen) {
+  const target = unwrap(node);
+  if (!target) return null;
+  if (ts.isIdentifier(target)) {
+    const direct = ctx.helpers.get(target.text);
+    if (direct) return direct;
+    if (ctx.unsafe.has(target.text) || ctx.shadowed.has(target.text) || seen.has(target.text)) return null;
+    const binding = ctx.bindings.get(target.text);
+    if (!binding) return null;
+    const next = new Set(seen);
+    next.add(target.text);
+    return helperIdentity(binding, ctx, next);
+  }
+  if (ts.isPropertyAccessExpression(target)) {
+    const segments = [];
+    let current = target;
+    while (ts.isPropertyAccessExpression(current)) {
+      segments.unshift(current.name.text);
+      current = current.expression;
+    }
+    if (!ts.isIdentifier(current)) return null;
+    const namespace = ctx.helpers.get(current.text);
+    if (!namespace || namespace.member !== null) return null;
+    return { module: namespace.module, member: segments.join(".") };
+  }
+  return null;
+}
+
+// Whether `node` is the URL class: the un-shadowed global, or a binding imported
+// from node:url/url. A local `URL` from another source is not trusted.
+function isTrustedUrlClass(node, ctx) {
+  if (ts.isIdentifier(node) && node.text === "URL") {
+    if (ctx.shadowed.has("URL")) return false;
+    const helper = ctx.helpers.get("URL");
+    if (helper) return MODULE_URL.has(helper.module) && helper.member === "URL";
+    return !ctx.declared.has("URL");
+  }
+  if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.name.text === "URL") {
+    const namespace = ctx.helpers.get(node.expression.text);
+    return Boolean(namespace && namespace.member === null && MODULE_URL.has(namespace.module));
+  }
+  return false;
 }
 
 function resolveStaticString(node, ctx, seen) {
@@ -595,7 +725,7 @@ function resolveStaticString(node, ctx, seen) {
   if (!target) return null;
   if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) return target.text;
   if (ts.isIdentifier(target)) {
-    if (ctx.unsafe.has(target.text) || seen.has(target.text)) return null;
+    if (ctx.unsafe.has(target.text) || ctx.shadowed.has(target.text) || seen.has(target.text)) return null;
     const binding = ctx.bindings.get(target.text);
     if (!binding) return null;
     const next = new Set(seen);
@@ -615,8 +745,7 @@ function resolvePathCallArgument(node, ctx, seen) {
 }
 
 function resolveNewUrl(node, ctx, seen) {
-  const name = callTargetName(node.expression);
-  if (name !== "URL" && name !== "url.URL") return null;
+  if (!isTrustedUrlClass(node.expression, ctx)) return null;
   const first = resolveStaticString(node.arguments && node.arguments[0], ctx, seen);
   if (first === null) return null;
   return { type: "path", value: first };
@@ -631,7 +760,9 @@ function resolveStatic(node, ctx, seen) {
   if (ts.isObjectLiteralExpression(target)) return { type: "object", node: target };
   if (ts.isArrayLiteralExpression(target)) return { type: "array", node: target };
   if (ts.isIdentifier(target)) {
-    if (ctx.unsafe.has(target.text) || seen.has(target.text)) return { type: "dynamic" };
+    if (ctx.unsafe.has(target.text) || ctx.shadowed.has(target.text) || seen.has(target.text)) {
+      return { type: "dynamic" };
+    }
     const binding = ctx.bindings.get(target.text);
     if (!binding) return { type: "dynamic" };
     const next = new Set(seen);
@@ -642,8 +773,8 @@ function resolveStatic(node, ctx, seen) {
     return resolveNewUrl(target, ctx, seen) ?? { type: "dynamic" };
   }
   if (ts.isCallExpression(target)) {
-    const name = callTargetName(target.expression);
-    if (name && PATH_CALLS.has(name)) {
+    const identity = helperIdentity(target.expression, ctx, new Set());
+    if (identity && MODULE_PATH.has(identity.module) && PATH_MEMBERS.has(identity.member)) {
       const parts = [];
       for (const argument of target.arguments) {
         const part = resolvePathCallArgument(argument, ctx, seen);
@@ -652,7 +783,7 @@ function resolveStatic(node, ctx, seen) {
       }
       return { type: "path", value: parts.filter(Boolean).join("/") };
     }
-    if (name && FILE_URL_CALLS.has(name)) {
+    if (identity && MODULE_URL.has(identity.module) && URL_MEMBERS.has(identity.member)) {
       const argument = unwrap(target.arguments && target.arguments[0]);
       if (argument && ts.isNewExpression(argument)) {
         return resolveNewUrl(argument, ctx, seen) ?? { type: "dynamic" };
@@ -763,23 +894,55 @@ function inspectResolveProperty(rel, lineOf, property, ctx) {
   inspectResolveObject(rel, lineOf, resolved.node, ctx);
 }
 
-// The exported config object: `export default <obj>`, `export default
-// defineConfig(<obj>)`, or `module.exports = <obj>`. Only these are inspected, so
-// a plugin's own `resolve` method is never mistaken for `resolve.alias`.
-function exportedConfigObjects(source) {
-  const objects = [];
-  const consider = (expression) => {
-    const node = unwrap(expression);
-    if (!node) return;
-    if (ts.isCallExpression(node) && callTargetName(node.expression) === "defineConfig") {
-      consider(node.arguments && node.arguments[0]);
-      return;
+// Resolve an exported config expression to an object literal:
+//   export default <obj>
+//   export default defineConfig(<obj>) | defineConfig(<binding>) | defineConfig(() => <obj>)
+//   module.exports = <obj> | () => <obj>
+// Returns { type: "object", node } or { type: "dynamic" }.
+function resolveConfigExport(expression, ctx, seen) {
+  const node = unwrap(expression);
+  if (!node) return { type: "dynamic" };
+  if (ts.isCallExpression(node) && callTargetName(node.expression) === "defineConfig") {
+    return resolveConfigExport(node.arguments && node.arguments[0], ctx, seen);
+  }
+  if (ts.isObjectLiteralExpression(node)) return { type: "object", node };
+  if (ts.isIdentifier(node)) {
+    if (ctx.unsafe.has(node.text) || ctx.shadowed.has(node.text) || seen.has(node.text)) return { type: "dynamic" };
+    const binding = ctx.bindings.get(node.text);
+    if (!binding) return { type: "dynamic" };
+    const next = new Set(seen);
+    next.add(node.text);
+    return resolveConfigExport(binding, ctx, next);
+  }
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    const body = unwrap(node.body);
+    if (body && ts.isObjectLiteralExpression(body)) return { type: "object", node: body };
+    if (body && ts.isBlock(body)) {
+      const returns = body.statements.filter((statement) => ts.isReturnStatement(statement) && statement.expression);
+      if (body.statements.length === 1 && returns.length === 1) {
+        return resolveConfigExport(returns[0].expression, ctx, seen);
+      }
     }
-    if (ts.isObjectLiteralExpression(node)) objects.push(node);
-  };
+    return { type: "dynamic" };
+  }
+  return { type: "dynamic" };
+}
+
+// Export targets (default export / module.exports) and `default` re-exports.
+function configExportTargets(source) {
+  const targets = [];
+  const reexports = [];
   for (const statement of source.statements) {
-    if (ts.isExportAssignment(statement)) consider(statement.expression);
-    if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression)) {
+    if (ts.isExportAssignment(statement)) {
+      targets.push({ node: statement, expression: statement.expression });
+    } else if (ts.isExportDeclaration(statement) && statement.moduleSpecifier) {
+      const clause = statement.exportClause;
+      const reexportsDefault =
+        clause &&
+        ts.isNamedExports(clause) &&
+        clause.elements.some((element) => (element.propertyName ?? element.name).text === "default");
+      if (reexportsDefault) reexports.push({ node: statement, spec: nodeSpecifier(statement.moduleSpecifier) });
+    } else if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression)) {
       const left = statement.expression.left;
       if (
         ts.isPropertyAccessExpression(left) &&
@@ -787,24 +950,103 @@ function exportedConfigObjects(source) {
         left.expression.text === "module" &&
         left.name.text === "exports"
       ) {
-        consider(statement.expression.right);
+        targets.push({ node: statement, expression: statement.expression.right });
       }
     }
   }
-  return objects;
+  return { targets, reexports };
 }
 
-function scanViteConfig(rel, source, ctx) {
-  const lineOf = lineOfNode(source);
-  for (const object of exportedConfigObjects(source)) {
-    for (const property of object.properties) {
-      if (ts.isSpreadAssignment(property)) {
-        report(rel, lineOf(property), null, "unanalyzable spread in the exported config object (not allowlisted)");
-        continue;
-      }
-      if (propertyNameOf(property) === "resolve") inspectResolveProperty(rel, lineOf, property, ctx);
+function resolveRelativeModule(fromAbs, spec) {
+  if (!spec || !spec.startsWith(".")) return null;
+  const base = path.resolve(path.dirname(fromAbs), spec);
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.mts`,
+    `${base}.cts`,
+    `${base}.js`,
+    `${base}.jsx`,
+    `${base}.mjs`,
+    `${base}.cjs`,
+    `${base}.json`,
+    path.join(base, "index.ts"),
+    path.join(base, "index.tsx"),
+    path.join(base, "index.js"),
+    path.join(base, "index.mjs"),
+    path.join(base, "index.cjs"),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      /* try the next candidate */
     }
   }
+  return null;
+}
+
+// Collect the exported config objects of a resolution config, following relative
+// `export { default } from "./…"` re-exports. A target that cannot be resolved to
+// an object is returned as dynamic so the caller can fail closed.
+function collectConfigObjects(abs, source, visited) {
+  const rel = relPath(abs);
+  const lineOf = lineOfNode(source);
+  const ctx = createBindingContext(source);
+  const objects = [];
+  const dynamic = [];
+  const { targets, reexports } = configExportTargets(source);
+  for (const target of targets) {
+    const resolved = resolveConfigExport(target.expression, ctx, new Set());
+    if (resolved.type === "object") objects.push({ rel, lineOf, node: resolved.node, ctx });
+    else dynamic.push({ rel, lineOf, node: target.node });
+  }
+  for (const reexport of reexports) {
+    const target = resolveRelativeModule(abs, reexport.spec);
+    if (!target || visited.has(target)) {
+      dynamic.push({ rel, lineOf, node: reexport.node });
+      continue;
+    }
+    visited.add(target);
+    const targetRel = relPath(target);
+    if (IGNORED_FILES.has(targetRel)) continue;
+    let text;
+    try {
+      text = readFileSync(target, "utf8");
+    } catch {
+      dynamic.push({ rel, lineOf, node: reexport.node });
+      continue;
+    }
+    const kind = SCRIPT_KIND[path.extname(target)] ?? ts.ScriptKind.TS;
+    const targetSource = ts.createSourceFile(target, text, ts.ScriptTarget.Latest, true, kind);
+    const nested = collectConfigObjects(target, targetSource, visited);
+    objects.push(...nested.objects);
+    dynamic.push(...nested.dynamic);
+  }
+  return { objects, dynamic };
+}
+
+function inspectConfigObject(rel, lineOf, object, ctx) {
+  for (const property of object.properties) {
+    if (ts.isSpreadAssignment(property)) {
+      report(rel, lineOf(property), null, "unanalyzable spread in the exported config object (not allowlisted)");
+      continue;
+    }
+    if (propertyNameOf(property) === "resolve") inspectResolveProperty(rel, lineOf, property, ctx);
+  }
+}
+
+function scanViteConfig(abs, source) {
+  const visited = new Set([abs]);
+  const { objects, dynamic } = collectConfigObjects(abs, source, visited);
+  for (const entry of dynamic) {
+    report(entry.rel, entry.lineOf(entry.node), null, "unanalyzable exported config (not allowlisted)");
+  }
+  if (objects.length === 0 && dynamic.length === 0) {
+    report(relPath(abs), 0, null, "no analyzable exported config (not allowlisted)");
+  }
+  for (const entry of objects) inspectConfigObject(entry.rel, entry.lineOf, entry.node, entry.ctx);
 }
 
 function isModuleResolverPluginName(name) {
@@ -829,25 +1071,37 @@ function inspectBabelPluginOptions(rel, lineOf, options, ctx) {
   }
 }
 
+function inspectBabelPluginName(rel, lineOf, nameNode, optionsNode, ctx) {
+  const name = resolveStaticString(nameNode, ctx, new Set());
+  if (name !== null) {
+    if (isModuleResolverPluginName(name) && optionsNode) inspectBabelPluginOptions(rel, lineOf, optionsNode, ctx);
+    return;
+  }
+  // A plugin name that is not fully static. A reassigned/shadowed binding cannot
+  // be trusted, so fail closed; an otherwise unknown dynamic plugin name is not
+  // inspected (a computed plugin name cannot be classified without false-
+  // positiving every dynamic plugin — documented limit).
+  const identifier = unwrap(nameNode);
+  if (identifier && ts.isIdentifier(identifier) && (ctx.unsafe.has(identifier.text) || ctx.shadowed.has(identifier.text))) {
+    report(rel, lineOf(identifier), null, "unanalyzable Babel plugin name (reassigned/shadowed binding; not allowlisted)");
+  }
+}
+
 function scanBabelConfig(rel, source, ctx) {
   const lineOf = lineOfNode(source);
   const visit = (node) => {
     if (ts.isArrayLiteralExpression(node) && node.elements.length >= 1) {
-      const first = unwrap(node.elements[0]);
-      if (first && ts.isStringLiteral(first) && isModuleResolverPluginName(first.text) && node.elements.length >= 2) {
-        inspectBabelPluginOptions(rel, lineOf, node.elements[1], ctx);
-      }
+      inspectBabelPluginName(rel, lineOf, node.elements[0], node.elements.length >= 2 ? node.elements[1] : null, ctx);
     }
     if (ts.isObjectLiteralExpression(node)) {
-      let name = null;
-      let options = null;
+      let nameNode = null;
+      let optionsNode = null;
       for (const property of node.properties) {
         if (!ts.isPropertyAssignment(property)) continue;
-        const initializer = unwrap(property.initializer);
-        if (propertyNameOf(property) === "name" && ts.isStringLiteral(initializer)) name = initializer.text;
-        if (propertyNameOf(property) === "options") options = property.initializer;
+        if (propertyNameOf(property) === "name") nameNode = property.initializer;
+        if (propertyNameOf(property) === "options") optionsNode = property.initializer;
       }
-      if (isModuleResolverPluginName(name) && options) inspectBabelPluginOptions(rel, lineOf, options, ctx);
+      if (nameNode && optionsNode) inspectBabelPluginName(rel, lineOf, nameNode, optionsNode, ctx);
     }
     ts.forEachChild(node, visit);
   };
@@ -923,9 +1177,12 @@ function scanResolutionConfigs() {
     const scriptKind = SCRIPT_KIND[path.extname(abs)] ?? ts.ScriptKind.JS;
     // setParentNodes=true: the resolve.alias walk and binding scoping need parents.
     const source = ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true, scriptKind);
+    if (kind === "vite") {
+      scanViteConfig(abs, source);
+      continue;
+    }
     const ctx = createBindingContext(source);
-    if (kind === "vite") scanViteConfig(rel, source, ctx);
-    else if (kind === "babel") scanBabelConfig(rel, source, ctx);
+    if (kind === "babel") scanBabelConfig(rel, source, ctx);
     else if (kind === "metro") scanMetroConfig(rel, source, ctx);
   }
 }

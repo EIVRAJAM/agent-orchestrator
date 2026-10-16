@@ -672,6 +672,175 @@ module.exports = { plugins: [["babel-plugin-module-resolver", { alias: { reporte
 EOF
 check "the full babel-plugin-module-resolver name (fail)" fail "$d"
 
+# --- Indirect Vite exports ---------------------------------------------------
+
+d="$base/vite-export-default-binding"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const config = { resolve: { alias: { reporter: "@sentry/electron" } } };
+export default config;
+EOF
+check "export default <const binding> with an observability alias (fail)" fail "$d"
+
+d="$base/vite-export-defineconfig-binding"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { defineConfig } from "vite";
+const config = { resolve: { alias: { reporter: "@sentry/electron" } } };
+export default defineConfig(config);
+EOF
+check "export default defineConfig(<const binding>) (fail)" fail "$d"
+
+d="$base/vite-module-exports-binding"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const config = { resolve: { alias: { reporter: "@sentry/electron" } } };
+module.exports = config;
+EOF
+check "module.exports = <const binding> (fail)" fail "$d"
+
+d="$base/vite-defineconfig-arrow"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { defineConfig } from "vite";
+export default defineConfig(() => ({ resolve: { alias: { reporter: "@sentry/electron" } } }));
+EOF
+check "defineConfig(() => ({ observability alias })) (fail)" fail "$d"
+
+d="$base/vite-module-exports-arrow"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+module.exports = () => ({ resolve: { alias: { reporter: "@sentry/electron" } } });
+EOF
+check "module.exports = () => ({ observability alias }) (fail)" fail "$d"
+
+d="$base/vite-export-arrow-benign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export default () => ({ resolve: { alias: { "@ui": "./src/ui" } } });
+EOF
+check "an arrow function with a fully static benign return (pass)" pass "$d"
+
+d="$base/vite-export-dynamic-unresolvable"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export default buildConfig();
+EOF
+check "a dynamic/unresolvable exported config (fail)" fail "$d"
+
+d="$base/vite-export-indirect-benign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const config = { resolve: { alias: { "@ui": "./src/ui" } } };
+export default config;
+EOF
+check "an indirect static benign exported config (pass)" pass "$d"
+
+# --- Helper provenance (path/url) --------------------------------------------
+
+d="$base/vite-helper-fake-path-object"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = { resolve() { return "@sentry/electron"; } };
+export default { resolve: { alias: { reporter: path.resolve("x") } } };
+EOF
+check "a local object named path is not a trusted helper (fail)" fail "$d"
+
+d="$base/vite-helper-fake-fileurltopath-function"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+function fileURLToPath() { return "@sentry/electron"; }
+export default { resolve: { alias: { reporter: fileURLToPath("x") } } };
+EOF
+check "a local function named fileURLToPath is not trusted (fail)" fail "$d"
+
+d="$base/vite-helper-alias-dynamic-arg"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+const resolve = path.resolve;
+export default { resolve: { alias: { reporter: resolve(dynamicValue) } } };
+EOF
+check "an alias of path.resolve with a dynamic argument (fail)" fail "$d"
+
+d="$base/vite-helper-reassigned"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+path = fake;
+export default { resolve: { alias: { reporter: path.resolve("x") } } };
+EOF
+check "a reassigned trusted helper binding (fail)" fail "$d"
+
+d="$base/vite-helper-shadowed"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+function build(path) { return path.resolve("x"); }
+export default { resolve: { alias: { reporter: build(0) } } };
+EOF
+check "a locally shadowed helper name (fail)" fail "$d"
+
+d="$base/vite-helper-parameter"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+function build(pathResolve) { return pathResolve(__dirname, "x"); }
+export default { resolve: { alias: { reporter: build(0) } } };
+EOF
+check "a helper received as a parameter (fail)" fail "$d"
+
+d="$base/vite-helper-other-package"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "lodash";
+export default { resolve: { alias: { reporter: path.resolve("x") } } };
+EOF
+check "a same-named import from another package (fail)" fail "$d"
+
+d="$base/vite-helper-namespace-import"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+export default { resolve: { alias: { "@ui": path.join(__dirname, "src/ui") } } };
+EOF
+check "a trusted import * as path from node:path (pass)" pass "$d"
+
+d="$base/vite-helper-require-namespace"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src/ui") } } };
+EOF
+check "a trusted const path = require(\"node:path\") (pass)" pass "$d"
+
+d="$base/vite-helper-require-destructured"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const { resolve: pathResolve } = require("node:path");
+export default { resolve: { alias: { "@ui": pathResolve(__dirname, "src/ui") } } };
+EOF
+check "a trusted destructured require of node:path (pass)" pass "$d"
+
+# --- Babel plugin name via bindings ------------------------------------------
+
+d="$base/babel-plugin-short-via-binding"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+const resolverPlugin = "module-resolver";
+module.exports = { plugins: [[resolverPlugin, { alias: { reporter: "@sentry/electron" } }]] };
+EOF
+check "module-resolver short name via a binding (fail)" fail "$d"
+
+d="$base/babel-plugin-full-via-binding"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+const resolverPlugin = "babel-plugin-module-resolver";
+module.exports = { plugins: [[resolverPlugin, { alias: { reporter: "@sentry/electron" } }]] };
+EOF
+check "babel-plugin-module-resolver full name via a binding (fail)" fail "$d"
+
+d="$base/babel-plugin-scoped-via-binding"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+const resolverPlugin = "@scope/babel-plugin-module-resolver";
+module.exports = { plugins: [[resolverPlugin, { alias: { reporter: "@sentry/electron" } }]] };
+EOF
+check "scoped module-resolver name via a binding (fail)" fail "$d"
+
+d="$base/babel-plugin-binding-reassigned"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+let resolverPlugin = "babel-plugin-module-resolver";
+resolverPlugin = "something-else";
+module.exports = { plugins: [[resolverPlugin, { alias: { reporter: "@sentry/electron" } }]] };
+EOF
+check "a reassigned Babel plugin-name binding (fail)" fail "$d"
+
+d="$base/babel-plugin-binding-benign"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+const benignPlugin = "eslint-plugin-foo";
+module.exports = { plugins: [[benignPlugin, { options: {} }]] };
+EOF
+check "a benign Babel plugin name via a binding (pass)" pass "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0
