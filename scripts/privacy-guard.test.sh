@@ -182,6 +182,111 @@ sed -i 's#AUTHORIZED_RELEASE_REPOS = \["EIVRAJAM/agent-orchestrator"\]#AUTHORIZE
   "$d/frontend/src/shared/release-target.ts"
 check "release target pointed at an unauthorized repo" fail "$d"
 
+# --- Multiline imports (specifier on a different line from the keyword) ------
+
+d="$base/multiline-static-import"; make_fixture "$d"
+put "$d/frontend/src/main/leak.ts" <<'EOF'
+import {
+  init
+} from
+  "@sentry/electron";
+EOF
+check "multiline static import" fail "$d"
+
+d="$base/multiline-export-from"; make_fixture "$d"
+put "$d/frontend/src/main/leak.ts" <<'EOF'
+export {
+  init as sentryInit,
+} from
+  "@sentry/electron";
+EOF
+check "multiline export ... from" fail "$d"
+
+d="$base/multiline-dynamic-import"; make_fixture "$d"
+put "$d/frontend/src/main/leak.ts" <<'EOF'
+const sentry = await import(
+  "@sentry/electron"
+);
+EOF
+check "multiline dynamic import()" fail "$d"
+
+d="$base/multiline-require"; make_fixture "$d"
+put "$d/frontend/scripts/leak.cjs" <<'EOF'
+const posthog = require(
+  "posthog-js"
+);
+module.exports = posthog;
+EOF
+check "multiline require()" fail "$d"
+
+d="$base/multiline-alias-indirect"; make_fixture "$d"
+put "$d/frontend/src/main/leak.ts" <<'EOF'
+import * as ErrorReporter from
+  "@sentry/electron";
+
+export const report = (error: unknown) => ErrorReporter.captureMessage(String(error));
+EOF
+check "multiline aliased import + indirect call" fail "$d"
+
+# --- Allowlist location: allowed exactly there, rejected anywhere else -------
+
+d="$base/allowlisted-location"; make_fixture "$d"
+put "$d/packages/mobile/lib/telemetry/runtime.ts" <<'EOF'
+import PostHog from "posthog-react-native";
+export const MOBILE_TELEMETRY_DISABLED = true;
+EOF
+check "allowed import at an exact allowlist location" pass "$d"
+
+d="$base/disallowed-location"; make_fixture "$d"
+put "$d/frontend/src/main/telemetry-copy.ts" <<'EOF'
+import PostHog from "posthog-react-native";
+EOF
+check "the same import outside the allowlist location" fail "$d"
+
+# --- Package-name boundaries (no false positives from shared prefixes) --------
+
+d="$base/real-sdk-dependency"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "posthog-node": "4.0.0" } }
+EOF
+check "real observability SDK dependency is detected" fail "$d"
+
+d="$base/prefix-only-dependency"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "posthog-analytics": "1.0.0", "segment-analytics": "1.0.0" } }
+EOF
+check "prefix-only name is not a false positive" pass "$d"
+
+d="$base/scoped-prefix-dependency"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "@sentryfoo/thing": "1.0.0" } }
+EOF
+check "scoped name that only shares a prefix is not a false positive" pass "$d"
+
+d="$base/sdk-subpath-import"; make_fixture "$d"
+put "$d/frontend/src/renderer/leak.ts" <<'EOF'
+import { PostHog } from "posthog-js/dist/module.full.no-external";
+EOF
+check "legitimate SDK subpath import outside the allowlist" fail "$d"
+
+d="$base/backtick-dynamic-import"; make_fixture "$d"
+put "$d/frontend/src/main/leak.ts" <<'EOF'
+const sentry = await import(`@sentry/electron`);
+EOF
+check "backtick dynamic import()" fail "$d"
+
+d="$base/overrides-dependency"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "overrides": { "posthog-node": "4.0.0" } }
+EOF
+check "observability package pinned via overrides" fail "$d"
+
+d="$base/resolutions-dependency"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "resolutions": { "**/posthog-node": "4.0.0" } }
+EOF
+check "observability package pinned via a resolutions selector" fail "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

@@ -4,16 +4,20 @@ Appendix to [privacy-fork.md](privacy-fork.md). This records a controlled
 observation of this fork's outbound behavior. It is deliberately explicit about
 what was and was not observed, and about the limits of the method.
 
-> **Evidence scope / historical classification.** This run was performed on the
-> **commit `6bfdccd2d`**, *before* the guard/docs/mobile-Sentry/updater-target
-> corrections in `d77f30f26`. It is kept as **historical / comparative**
-> evidence, not as execution evidence of the current commit. It stays relevant
-> because the daemon outbound paths it exercised — `newTelemetrySink`
-> (local-only), the renderer/mobile init, and the daemon env-stamping — are
-> unchanged by `d77f30f26`; the Go change in that commit tightened the Sentry DSN
-> path (always blank instead of a branch) and cannot widen the surface. The
-> **binary for the final commit has not itself been observed**. Repeat the run on
-> the final commit before claiming execution evidence for the definitive
+> **Evidence scope / historical classification.** This run was performed on
+> commit **`6bfdccd2d`**. The branch has since moved through two review cycles —
+> `d77f30f26` (guard gates, mobile Sentry early return, release-target authority,
+> Go policy coherence) and `cecf213db` (import-specifier scanner, widened
+> coverage, per-condition self-tests) — and then a further hardening commit that
+> adds multiline import/require detection and package-name boundaries. It is kept
+> as **historical / comparative** evidence, not as execution evidence of the
+> current HEAD. It stays relevant because the daemon outbound paths it exercised
+> — `newTelemetrySink` (local-only), the renderer/mobile init, and the daemon
+> env-stamping — are unchanged by those commits, and the Go change made the
+> Sentry DSN path strictly tighter (always blank instead of a branch), so it
+> cannot widen the surface. The **binary for the final commit has not itself been
+> observed**, and there is no full traffic capture on the final HEAD. Repeat the
+> run on the final commit before claiming execution evidence for the definitive
 > artifact; the method below is the reproducible procedure.
 
 ## Verdict

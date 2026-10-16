@@ -45,6 +45,16 @@ flipped, so a change fails closed and loudly instead of exporting silently.
 - Fork remote: `EIVRAJAM/agent-orchestrator`
 - Base branch/SHA: `main` @ `7dceb0ec7d2eddd4360692123a64e5bd3daf78eb`
 - Working branch: `privacy/disable-external-telemetry`
+- Commit chain on the branch (oldest first):
+  1. `6bfdccd2d` — initial policy: daemon/renderer/mobile export disabled by
+     construction, updater repointed, guard + docs. **The controlled traffic run
+     was taken here** (§8).
+  2. `d77f30f26` — review corrections: failing guard gates, mobile Sentry early
+     return, release-target authority, Go policy coherence.
+  3. `cecf213db` — import-specifier scanner, widened coverage (`packages/**`),
+     per-condition guard self-tests, doc/evidence precision.
+  4. The commit that adds multiline import/require detection and package-name
+     boundary fixes (the child of `cecf213db`; this document is part of it).
 
 ## 3. Inventory of mechanisms
 
@@ -217,11 +227,18 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
 1. **Failing static gates** (not warnings):
    - policy constants closed (Go, frontend, mobile);
    - `scripts/lib/privacy-scan.mjs` matches observability SDK **module
-     specifiers**, so an aliased import is caught regardless of the local
-     identifier. It scans `backend/**`, `frontend/**`, `packages/**` and
+     specifiers** over the whole file content (comments blanked first), so an
+     aliased import is caught regardless of the local identifier, and a specifier
+     on a different line from `import`/`from`/`require`/`import(` is still
+     caught. It scans `backend/**`, `frontend/**`, `packages/**` and
      `scripts/**` for `.go`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, and
      covers `import`, `export … from`, bare `import "x"`, dynamic `import(...)`
-     and `require(...)` in TS/JS plus Go import paths (any alias). Only exact,
+     (including a backtick-delimited specifier) and `require(...)` in TS/JS plus
+     Go import paths (any alias). Provider
+     matching uses package-name boundaries — the exact unscoped name or a
+     `/subpath`, or a `@scope/` — so an unrelated name that only shares a prefix
+     (`posthog-analytics`) is not a false positive, while real subpaths
+     (`posthog-js/dist/...`) and scopes (`@sentry/*`) still match. Only exact,
      reviewed files are allowlisted: the dormant implementations and their
      tests (`sentryobs.go`, `posthog.go`, `renderer/lib/telemetry.ts`,
      `packages/mobile/lib/telemetry/runtime.ts`, `packages/mobile/lib/sentry.ts`,
@@ -235,17 +252,26 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      `frontend/`, `packages/`, `scripts/` and the repo root (excluding
      `node_modules`, fixtures and generated output) is checked; an observability
      dependency anywhere — including `packages/product-ui/package.json` or
-     `packages/cloud-client/package.json` — fails unless it is in the reviewed
-     allowlist.
+     `packages/cloud-client/package.json`, and via `resolutions`/`overrides`
+     (selectors like `**/pkg` are reduced to the package name) — fails unless it
+     is in the reviewed allowlist.
 2. **Guard self-tests** (`scripts/privacy-guard.test.sh`): one fixture per
    condition, each built from the real policy files with a single injection, so
    a working pattern cannot hide a broken one. Covered: direct `Sentry.init`;
    Sentry under an alias; `sentry-go` under an alias; `posthog.init` alone;
-   `new PostHog` alone; dynamic `import()`; `require()`; init inside
+   `new PostHog` alone; dynamic `import()`; `require()`; **multiline** static
+   import, `export … from`, `import(...)`, and `require(...)`; a multiline
+   aliased import with an indirect call; an allowed import at an exact allowlist
+   location (passes) versus the same import elsewhere (fails); init inside
    `packages/mobile/app/**`; import inside `packages/product-ui/**`; import
    inside `packages/cloud-client/**`; an observability dependency in
-   `packages/product-ui/package.json`; one in another discovered package; mobile
-   telemetry reactivation (guard removed / constant flipped); an upstream and an
+   `packages/product-ui/package.json`; one in another discovered package; a real
+   SDK dependency (fails) versus prefix-only names (`posthog-analytics`,
+   `segment-analytics`, `@sentryfoo/thing`) that must **not** false-positive; a
+   legitimate subpath import outside the allowlist (fails); a backtick
+   `import(...)`; an observability package pinned via `overrides` or a
+   `resolutions` selector (fails); mobile telemetry
+   reactivation (guard removed / constant flipped); an upstream and an
    unauthorized release target. A clean tree must pass, including the dormant
    implementations and their reviewed tests.
 3. **Behavioral tests** for the known composition points: daemon composition (no
@@ -293,23 +319,28 @@ environment):
   closed policy assertion.
 - Frontend: `npm run typecheck` passes; the privacy/release-target tests pass.
 - Mobile: `npm run typecheck` passes; the mobile privacy tests pass.
-- Guard: `scripts/privacy-guard.test.sh` passes (clean tree passes; seventeen
-  single-condition reintroductions fail with the expected non-zero exit code);
+- Guard: `scripts/privacy-guard.test.sh` passes (clean tree passes; the
+  single-condition reintroductions — including the multiline, alias, and
+  package-boundary cases — fail with the expected non-zero exit code);
   `scripts/privacy-guard.sh` returns OK end-to-end.
 
-**Historical / comparative execution evidence (NOT the current commit):** the
+**Historical / comparative execution evidence (NOT the current HEAD):** the
 controlled daemon-run traffic observation
 ([privacy-fork-traffic-report.md](privacy-fork-traffic-report.md)) was performed
-on the **previous commit `6bfdccd2d`, not on the current `d77f30f26`**. It
-remains relevant for the paths that did not change — the daemon telemetry sink
-(`newTelemetrySink` local-only), the renderer/mobile init, and the daemon
-env-stamping are untouched by the current commit, whose changes are the guard,
-docs, mobile-Sentry early return, release target, and the Go policy
-representation (the latter strictly tighter: an always-blank DSN instead of a
-branch). But the **binary for `d77f30f26` has not itself been observed**, so the
-run is recorded as *historical/comparative*, not as execution evidence of the
-final artifact. Repeat the run on the final commit before claiming execution
-evidence for it (method in the traffic report).
+on commit **`6bfdccd2d`**. The branch has since moved through two review cycles —
+`d77f30f26` (guard gates, mobile Sentry early return, release-target authority,
+Go policy coherence) and `cecf213db` (import-specifier scanner, widened
+coverage, per-condition self-tests) — and then this commit, which adds multiline
+import/require detection and package-name boundaries. None of those commits
+change the daemon outbound paths the run exercised (`newTelemetrySink`
+local-only, renderer/mobile init, daemon env-stamping), and the Go Sentry change
+made the DSN path strictly tighter (always blank), so the run remains relevant
+as **historical / comparative** evidence for those paths.
+
+There is **no full traffic capture on the final HEAD**, and the final commit's
+own binary has **not been observed**. Do not read the historical run as dynamic
+validation of the final artifact; repeat it on the final commit (method in the
+traffic report) before claiming execution evidence for it.
 
 **Pending / not verifiable in this environment:**
 
