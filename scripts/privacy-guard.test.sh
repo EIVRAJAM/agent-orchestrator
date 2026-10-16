@@ -1682,6 +1682,177 @@ export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } 
 EOF
 check "a class static block that mutates the import invalidates it (fail)" fail "$d"
 
+# --- Default parameter values -------------------------------------------------
+
+d="$base/default-param-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function replaceResolver(helper = path) {
+  helper.resolve = () => "@sentry/electron";
+}
+replaceResolver();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating a defaulted parameter invalidates its default (fail)" fail "$d"
+
+d="$base/default-arrow-object-assign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const f = (helper = path) => {
+  Object.assign(helper, { resolve: fake });
+};
+f();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign on a defaulted parameter invalidates its default (fail)" fail "$d"
+
+d="$base/default-param-chain"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f(first = path, second = first) {
+  second.resolve = fake;
+}
+f();
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a default referring to an earlier parameter propagates in order (fail)" fail "$d"
+
+d="$base/default-param-read-only"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f(helper = path) { return helper.resolve; }
+f();
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a defaulted parameter that is only read leaves the default trusted (pass)" pass "$d"
+
+d="$base/default-param-explicit-argument"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function f(helper = path) { helper.resolve = fake; }
+f(local);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an explicit independent argument avoids the default (pass)" pass "$d"
+
+d="$base/default-param-independent"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function f(helper = local) { helper.resolve = fake; }
+f();
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an independent default does not share the helper (pass)" pass "$d"
+
+# --- Destructured parameters --------------------------------------------------
+
+d="$base/destructured-object-param"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function replaceResolver({ helper }) {
+  helper.resolve = fake;
+}
+replaceResolver({ helper: path });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an object-destructured parameter invalidates the matching property (fail)" fail "$d"
+
+d="$base/destructured-renamed-property"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f({ source: helper }) { helper.resolve = fake; }
+f({ source: path });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a renamed destructured property maps by key (fail)" fail "$d"
+
+d="$base/destructured-array-param"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function replaceResolver([helper]) { helper.resolve = fake; }
+replaceResolver([path]);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an array-destructured parameter invalidates the matching element (fail)" fail "$d"
+
+d="$base/destructured-nested-pattern"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f({ a: { b } }) { b.resolve = fake; }
+f({ a: { b: path } });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a nested destructured pattern invalidates the leaf value (fail)" fail "$d"
+
+d="$base/destructured-default-in-pattern"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f({ helper = path }) { helper.resolve = fake; }
+f({});
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a default inside a destructured pattern is used when the key is absent (fail)" fail "$d"
+
+d="$base/destructured-call-chain"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function outer({ helper }) { inner(helper); }
+function inner(x) { x.resolve = fake; }
+outer({ helper: path });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a call chain forwarding a destructured binding invalidates the helper (fail)" fail "$d"
+
+d="$base/destructured-object-assign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f({ helper }) { Object.assign(helper, { resolve: fake }); }
+f({ helper: path });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign on a destructured binding invalidates the helper (fail)" fail "$d"
+
+d="$base/destructured-read-only"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function f({ helper }) { return helper.resolve; }
+f({ helper: path });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a destructured binding that is only read does not invalidate the argument (pass)" pass "$d"
+
+d="$base/destructured-independent-property"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function f({ a, b }) { a.resolve = fake; }
+f({ a: local, b: path });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "mutating one destructured property leaves another property trusted (pass)" pass "$d"
+
+d="$base/destructured-array-other-element"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function f([a, b]) { a.resolve = fake; }
+f([local, path]);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "mutating one array element leaves another element trusted (pass)" pass "$d"
+
+d="$base/destructured-explicit-argument"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function f({ helper = path }) { helper.resolve = fake; }
+f({ helper: local });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an explicit argument overrides a pattern default that holds the helper (pass)" pass "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

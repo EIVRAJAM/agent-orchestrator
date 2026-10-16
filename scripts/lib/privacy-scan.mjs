@@ -631,10 +631,13 @@ function collectPatternNames(pattern, out = []) {
 // — a member write, a destructuring write, `Object.assign(…)`, … — at any depth
 // propagates across every alias that shares the object and invalidates the
 // original helper. For a statically-resolvable local function (declaration, arrow
-// or function expression, plus simple alias chains), a call relates positional
-// arguments to parameters, so a mutation through a parameter invalidates the
-// argument. Mutations are propagated even when a function is not proven to run
-// (conservative); an alias that is never written invalidates nothing.
+// or function expression, plus simple alias chains), a call relates its arguments
+// to parameters by identity, default and destructuring: a mutated parameter
+// binding invalidates the argument it was bound to — a positional argument, the
+// parameter's default initializer when the argument is absent, or the matching
+// property/element of an object/array pattern. Mutations are propagated even when
+// a function is not proven to run (conservative); an alias that is never written
+// invalidates nothing.
 function createBindingContext(source) {
   const scopeBindings = new Map(); // scopeNode -> Map(name -> declNameNode)
   const declInitializer = new Map(); // declNameNode -> initializer Expression
@@ -927,28 +930,127 @@ function createBindingContext(source) {
     if (!changed) break;
   }
 
-  // Relate each call's positional arguments to its parameters: if a parameter (or
-  // an alias of it) is object-mutated, the corresponding argument is tainted. The
-  // fixpoint also covers calls that pass a parameter on to another local function.
+  // Relate each call's arguments to its parameters — identifier, default and
+  // destructured patterns alike: a parameter binding that is object-mutated
+  // taints the value it was bound to. The fixpoint also covers calls that pass a
+  // binding on to another local function.
+  const initializerOf = (decl) => (decl ? declInitializer.get(decl) ?? null : null);
+  const isTrustworthyBinding = (decl) =>
+    Boolean(decl) && !mutableDecls.has(decl) && !reassignedDecls.has(decl) && !mutated.has(decl);
   const taintArgument = (argument) => {
     const node = unwrap(argument);
     if (!node || !ts.isIdentifier(node)) return false;
     return addMutated(resolve(node));
   };
+  // Static text of an object/array binding element or property key (identifier,
+  // string or numeric); a computed name has none.
+  const staticKeyOf = (node) => {
+    const target = unwrap(node);
+    if (!target) return null;
+    if (ts.isIdentifier(target) || ts.isStringLiteral(target) || ts.isNumericLiteral(target)) return target.text;
+    return null;
+  };
+  // A spread or a computed key makes an object literal unmatchable by key.
+  const hasAmbiguousKeys = (literal) =>
+    literal.properties.some(
+      (property) => ts.isSpreadAssignment(property) || (property.name && ts.isComputedPropertyName(property.name)),
+    );
+  const objectPropertyValue = (literal, key) => {
+    for (const property of literal.properties) {
+      if (ts.isPropertyAssignment(property) && staticKeyOf(property.name) === key) return property.initializer;
+      if (ts.isShorthandPropertyAssignment(property) && staticKeyOf(property.name) === key) return property.name;
+    }
+    return null;
+  };
   const applyCall = (call) => {
     const fn = functionOf.get(resolve(call.expression));
     if (!fn) return false;
-    let changed = false;
-    for (let index = 0; index < fn.parameters.length; index += 1) {
-      const parameter = fn.parameters[index];
-      const names = collectPatternNames(parameter.name);
-      const mutatedParam = names.some(isMutated);
-      if (parameter.dotDotDotToken) {
-        if (mutatedParam) for (let rest = index; rest < call.arguments.length; rest += 1) changed = taintArgument(call.arguments[rest]) || changed;
-        break;
+    const parameterBindings = new Set();
+    for (const parameter of fn.parameters) for (const name of collectPatternNames(parameter.name)) parameterBindings.add(name);
+    const bindingSources = new Map(); // binding decl -> source decl (or null)
+    // Follow one level of a literal initializer (`const o = { h: path }; f(o)`)
+    // but never follow a reassigned, mutable or mutated binding.
+    const literalOf = (expression) => {
+      const node = unwrap(expression);
+      if (!node) return null;
+      if (ts.isObjectLiteralExpression(node) || ts.isArrayLiteralExpression(node)) return node;
+      if (ts.isIdentifier(node)) {
+        const decl = resolve(node);
+        if (!isTrustworthyBinding(decl)) return null;
+        const initializer = unwrap(initializerOf(decl));
+        if (initializer && (ts.isObjectLiteralExpression(initializer) || ts.isArrayLiteralExpression(initializer))) return initializer;
       }
-      const argument = call.arguments[index];
-      if (mutatedParam && argument) changed = taintArgument(argument) || changed;
+      return null;
+    };
+    // The declaration a value derives from; a reference to another parameter uses
+    // that parameter's already-computed value (defaults evaluate left to right).
+    const sourceOf = (expression) => {
+      const node = unwrap(expression);
+      if (!node || !ts.isIdentifier(node)) return null;
+      const decl = resolve(node);
+      if (decl && parameterBindings.has(decl)) return bindingSources.get(decl) ?? null;
+      return decl;
+    };
+    const bindPattern = (pattern, value) => {
+      if (ts.isIdentifier(pattern)) {
+        bindingSources.set(pattern, value ? sourceOf(value) : null);
+        return;
+      }
+      if (ts.isObjectBindingPattern(pattern)) {
+        const literal = value ? literalOf(value) : null;
+        if (!literal || !ts.isObjectLiteralExpression(literal) || hasAmbiguousKeys(literal)) {
+          for (const name of collectPatternNames(pattern)) if (!bindingSources.has(name)) bindingSources.set(name, null);
+          return;
+        }
+        for (const element of pattern.elements) {
+          if (!ts.isBindingElement(element)) continue;
+          if (element.dotDotDotToken) {
+            // Object rest is a shallow copy, not an alias of the source.
+            for (const name of collectPatternNames(element.name)) bindingSources.set(name, null);
+            continue;
+          }
+          const key = staticKeyOf(element.propertyName ?? element.name);
+          const property = key === null ? null : objectPropertyValue(literal, key);
+          bindPattern(element.name, property ?? element.initializer ?? null);
+        }
+        return;
+      }
+      if (ts.isArrayBindingPattern(pattern)) {
+        const literal = value ? literalOf(value) : null;
+        if (!literal || !ts.isArrayLiteralExpression(literal) || literal.elements.some((element) => ts.isSpreadElement(element))) {
+          for (const name of collectPatternNames(pattern)) if (!bindingSources.has(name)) bindingSources.set(name, null);
+          return;
+        }
+        for (let index = 0; index < pattern.elements.length; index += 1) {
+          const element = pattern.elements[index];
+          if (!ts.isBindingElement(element)) continue;
+          if (element.dotDotDotToken) {
+            // Array rest is a new array, not an alias of the source.
+            for (const name of collectPatternNames(element.name)) bindingSources.set(name, null);
+            continue;
+          }
+          const source = literal.elements[index];
+          bindPattern(element.name, source && !ts.isOmittedExpression(source) ? source : (element.initializer ?? null));
+        }
+        return;
+      }
+      for (const name of collectPatternNames(pattern)) if (!bindingSources.has(name)) bindingSources.set(name, null);
+    };
+    let changed = false;
+    if (!call.arguments.some((argument) => ts.isSpreadElement(argument))) {
+      for (let index = 0; index < fn.parameters.length; index += 1) {
+        const parameter = fn.parameters[index];
+        if (parameter.dotDotDotToken) {
+          if (collectPatternNames(parameter.name).some(isMutated)) {
+            for (let rest = index; rest < call.arguments.length; rest += 1) changed = taintArgument(call.arguments[rest]) || changed;
+          }
+          break;
+        }
+        bindPattern(parameter.name, call.arguments[index] ?? parameter.initializer ?? null);
+      }
+    }
+    for (const [binding, source] of bindingSources) {
+      if (source && isMutated(binding)) changed = addMutated(source) || changed;
     }
     return changed;
   };
@@ -968,7 +1070,6 @@ function createBindingContext(source) {
   for (const decl of reassignedDecls) invalidated.add(decl);
   for (const decl of mutated) invalidated.add(decl);
 
-  const initializerOf = (decl) => (decl ? declInitializer.get(decl) ?? null : null);
   const isInvalidated = (decl) => Boolean(decl) && invalidated.has(decl);
   const seedOf = (decl) => {
     if (!decl || invalidated.has(decl)) return null;
