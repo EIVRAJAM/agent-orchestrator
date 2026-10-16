@@ -13,9 +13,10 @@ what was and was not observed, and about the limits of the method.
 > `e66d5af01` (AST-based import analysis and indirection-alias detection),
 > `66e069c77` (broadened Vite/Babel/Metro resolution-config discovery and a
 > manifest-scoped dependency allowlist), `cdfdfea64` (strict fail-closed
-> classification of alias targets, shorthand/spread/indirection), and
+> classification of alias targets, shorthand/spread/indirection),
 > `7a78c78f` (indirect Vite-export resolution and verified `path`/`url` helper
-> provenance). It is kept as
+> provenance), and `0764a0c3` (`require` provenance, helper invalidation on
+> member mutation, `__dirname`/`__filename`, Vite+Vitest discovery). It is kept as
 > **historical / comparative** evidence, not as execution evidence of the current
 > HEAD. It stays
 > relevant because the daemon outbound paths it exercised — `newTelemetrySink`

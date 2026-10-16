@@ -69,6 +69,9 @@ flipped, so a change fails closed and loudly instead of exporting silently.
      `defineConfig(<binding|() => obj>)`, `module.exports`, relative re-export)
      and verified provenance for the `path`/`url` helpers and the Babel plugin
      name.
+  9. `0764a0c3` — `require` provenance, helper invalidation on member mutation,
+     provenance-checked `__dirname`/`__filename`, and Vite+Vitest config
+     discovery.
 
 ## 3. Inventory of mechanisms
 
@@ -277,33 +280,45 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      renames an observability package fails everywhere because it hides the
      import site.
    - **resolution configs**: discovered under `frontend/**` and `packages/**` —
-     Vite (`vite.config.{ts,js,mts,mjs,cts,cjs}` and
-     `vite.<name>.config.*`), Babel (`babel.config.*`) and Metro
-     (`metro.config.*`) — and inspected through the AST (not every string):
-     Vite `resolve.alias` in object and `{find, replacement}` array form; Babel
-     `module-resolver` (`module-resolver`, `babel-plugin-module-resolver`,
-     scoped variants); Metro `resolver.extraNodeModules`. Shorthand properties,
-     spreads, and `resolve`/`alias`/`extraNodeModules` stored in a variable are
-     handled: resolved when a top-level `const` binding is fully static, rejected
+     Vite and Vitest (`^(?:vite|vitest)(\.[^/\\]+)?\.config.{ts,js,mts,mjs,cts,cjs}`),
+     Babel (`babel.config.*`) and Metro (`metro.config.*`) — and inspected through
+     the AST (not every string): `resolve.alias` in object and
+     `{find, replacement}` array form; Babel `module-resolver` (`module-resolver`,
+     `babel-plugin-module-resolver`, scoped variants); Metro
+     `resolver.extraNodeModules`. Shorthand properties, spreads, and
+     `resolve`/`alias`/`extraNodeModules` stored in a variable are handled:
+     resolved when a top-level `const` binding is fully static, rejected
      fail-closed otherwise. tsconfig values are checked too.
    - **indirect Vite exports**: the exported config is resolved through a static
      `const` binding (`export default config`), `defineConfig(<obj | binding |
      () => obj>)`, `module.exports = <obj | () => obj>`, and a relative
-     `export { default } from "./…"` re-export (the repo's
-     `frontend/vitest.config.ts` re-exports the renderer config). A branch, an
-     arbitrary call, a mutation or anything not fully determinable is rejected
+     `export { default } from "./…"` re-export (followed into the target file;
+     this is how `frontend/vitest.config.ts` re-exports the renderer config). A
+     branch, an arbitrary call, a mutation, a missing/cyclic re-export, a
+     non-relative re-export, or anything not fully determinable is rejected
      fail-closed, and a file with no analyzable export is reported — never a
      silent empty list. `defineConfig` itself is matched by name (documented).
    - **helper provenance**: `path.resolve`/`path.join`/`path.posix.*` and
      `fileURLToPath`/`url.fileURLToPath` are treated as safe only when the callee
      resolves, through the file's own imports/requires, to `node:path`/`path` or
      `node:url`/`url` (default, namespace, named `as`, and
-     `const { resolve } = require("node:path")` forms). A local object/function
-     with the same name, a reassigned or locally shadowed binding, a helper
-     received as a parameter, an import from another package, or an alias
-     (`const resolve = path.resolve`) with any non-static argument is rejected
-     fail-closed. `new URL` is trusted only as the un-shadowed global or a
-     `node:url`/`url` import.
+     `const { resolve } = require("node:path")` forms), **and `require` is the
+     implicit CommonJS global** (a local declaration, function, parameter,
+     reassignment or import of `require` disables require-based trust for the
+     whole file). A local object/function with the same name, a reassigned or
+     locally shadowed binding, a helper received as a parameter, an import from
+     another package, or an alias (`const resolve = path.resolve`) with any
+     non-static argument is rejected fail-closed. **Any mutation of a helper or
+     one of its members** — `path.resolve = …`, `path.posix.resolve = …`,
+     `path["resolve"] = …`, compound assignment, `++`, `delete`, or
+     `Object.assign`/`Object.defineProperty`/`Reflect.set` on the helper —
+     invalidates the whole helper. `new URL` is trusted only as the un-shadowed
+     global or a `node:url`/`url` import.
+   - **`__dirname` / `__filename`**: treated as an implicit base only when not
+     declared, shadowed or reassigned; a static local `const` is resolved and
+     analysed (a `const __dirname = "node_modules/@sentry"` is caught), while a
+     dynamic or mutable one fails closed. `import.meta.url` remains an intrinsic,
+     non-reassignable base.
    - **strict alias-target classification** (fail-closed): a target is accepted
      only when its value is **fully determined** — a string / no-substitution
      template literal, or a recognized local construction (`path.resolve`/
@@ -371,7 +386,19 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    `const { resolve: pathResolve } = require("node:path")` (pass); **Babel plugin
    name via bindings** — short, full and scoped `module-resolver` names via a
    binding and a reassigned binding (fail) versus a benign plugin name via a
-   binding (pass); the **manifest-scoped dependency**
+   binding (pass); **require provenance** — a local `const`/`function require`,
+   a `require` parameter and a reassigned `require` (fail) versus the implicit
+   `require` (pass); **helper member mutations** — assignment to `resolve`,
+   `join`, `posix.resolve`, `posix.join`, `fileURLToPath`, `URL`, bracket
+   notation, compound assignment, `++` and `Object.assign(path, …)` (fail) versus
+   the same helpers left unmodified (pass); **`__dirname`/`__filename`** — the
+   implicit bases and `import.meta.url` (pass) versus a local const pointing at
+   an SDK, a mutable `let`, and a parameter (fail), plus a benign static local
+   const (pass); **relative re-exports and Vitest** — a Vitest config re-exporting
+   a config with an observability alias, a missing re-export, a cycle, a
+   non-relative re-export, and a direct observability alias in a discovered
+   `vitest.config.ts` (fail) versus a benign relative re-export (pass); the
+   **manifest-scoped dependency**
    cases — each dormant dependency in its own manifest (pass), a dormant
    dependency in another manifest via `dependencies`/`devDependencies`/
    `optionalDependencies`/`peerDependencies`, a self-alias outside its manifest,
@@ -406,16 +433,19 @@ mandatory part.
   (`require(name)`), a Go raw-string/URL import, a **Metro `resolver.resolveRequest`
   that computes the module name without naming an SDK literally**, a
   **`defineConfig`-like helper faked under that name**, a **Babel plugin whose
-  name is computed at runtime**, or a resolver alias the scanner does not know
-  are not detectable here; the scan showing "OK" proves nothing about absence. An
-  alias **target or map** that is not fully static — including a partially
-  literal one, an interpolated template, a concatenation, a dynamic binding, a
-  shorthand, or a spread — is *not* silently accepted: it is rejected
-  fail-closed because it cannot be proven safe. The same applies to a dynamic
-  Vite export and to a `path`/`url` helper whose provenance is not a real
-  `node:path`/`node:url` binding. The deliberate exception is Metro
-  `resolver.resolveRequest`, a function the repo already uses, where a fully
-  computed module name cannot be rejected without breaking it.
+  name is computed at runtime**, **a re-export from a non-relative package**
+  (rejected), or a resolver alias the scanner does not know are not detectable
+  here; the scan showing "OK" proves nothing about absence. An alias **target or
+  map** that is not fully static — including a partially literal one, an
+  interpolated template, a concatenation, a dynamic binding, a shorthand, or a
+  spread — is *not* silently accepted: it is rejected fail-closed because it
+  cannot be proven safe. The same applies to a dynamic Vite export, to a
+  `path`/`url` helper whose provenance is not a real `node:path`/`node:url`
+  binding (or whose members are mutated), and to a `__dirname`/`__filename`
+  rebound to a non-static value. A mutation the scanner cannot attribute to a
+  helper (e.g. a target computed at runtime) is not detected. The deliberate
+  exception is Metro `resolver.resolveRequest`, a function the repo already uses,
+  where a fully computed module name cannot be rejected without breaking it.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -456,9 +486,11 @@ import/require detection, package-name boundaries, backtick, `overrides`/
 `resolutions`), `e66d5af01` (AST-based import analysis and indirection-alias
 detection), `66e069c77` (broadened Vite/Babel/Metro resolution-config discovery
 and a manifest-scoped dependency allowlist), `cdfdfea64` (strict
-fail-closed classification of alias targets, shorthand/spread/indirection), and
+fail-closed classification of alias targets, shorthand/spread/indirection),
 `7a78c78f` (indirect Vite-export resolution and verified `path`/`url` helper
-provenance). None of those commits change the daemon
+provenance), and `0764a0c3` (`require` provenance, helper invalidation on member
+mutation, `__dirname`/`__filename`, Vite+Vitest discovery). None of those commits
+change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
