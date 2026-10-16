@@ -443,13 +443,6 @@ function discoverResolutionConfigs() {
   return found;
 }
 
-function nameOfProperty(node) {
-  if (!node || !ts.isPropertyAssignment(node)) return null;
-  const name = node.name;
-  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return name.text;
-  return null;
-}
-
 function collectLiteralStrings(node, out) {
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
     out.push(node.text);
@@ -477,112 +470,404 @@ function scanTsconfigConfig(rel, text) {
 
 const lineOfNode = (source) => (node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
 
-function inspectAliasMap(rel, lineOf, value, label) {
-  if (ts.isObjectLiteralExpression(value)) {
-    for (const property of value.properties) {
-      if (!ts.isPropertyAssignment(property)) {
-        report(rel, lineOf(property), null, `unanalyzable ${label} entry (not allowlisted)`);
-        continue;
-      }
-      const literals = collectLiteralStrings(property.initializer, []);
-      if (literals.length === 0) {
-        report(rel, lineOf(property), null, `unanalyzable ${label} target: a dynamically built alias cannot be verified (not allowlisted)`);
-        continue;
-      }
-      for (const literal of literals) {
-        if (OBSERVABILITY_SPECIFIER.test(literal)) {
-          report(rel, lineOf(property), literal, `${label} target references an observability SDK (not allowlisted)`);
-        }
-      }
-    }
-    return;
+// --- Strict static resolution ------------------------------------------------
+//
+// A target is analyzable ONLY if its value is fully determined: a string /
+// no-substitution template literal, or a recognized local construction
+// (`path.resolve`/`path.join` whose args are all static or local bases, and
+// `fileURLToPath(new URL(<static>, ...))`). A single benign literal inside an
+// otherwise dynamic expression (a call, an identifier, a concatenation, a
+// template with interpolation, a property access, `process.env`, a spread) does
+// NOT make it static: such a target is rejected fail-closed.
+
+function unwrap(node) {
+  let current = node;
+  while (
+    current &&
+    (ts.isParenthesizedExpression(current) ||
+      ts.isAsExpression(current) ||
+      ts.isNonNullExpression(current) ||
+      (typeof ts.isSatisfiesExpression === "function" && ts.isSatisfiesExpression(current)))
+  ) {
+    current = current.expression;
   }
-  if (ts.isArrayLiteralExpression(value)) {
-    for (const element of value.elements) inspectAliasArrayElement(rel, lineOf, element, label);
-    return;
-  }
-  report(rel, lineOf(value), null, `unanalyzable ${label}: a dynamically built alias map cannot be verified (not allowlisted)`);
+  return current;
 }
 
-function inspectAliasArrayElement(rel, lineOf, element, label) {
-  if (ts.isStringLiteral(element) || ts.isNoSubstitutionTemplateLiteral(element)) {
-    if (OBSERVABILITY_SPECIFIER.test(element.text)) {
-      report(rel, lineOf(element), element.text, `${label} entry references an observability SDK (not allowlisted)`);
+function propertyNameOf(node) {
+  if (
+    ts.isPropertyAssignment(node) ||
+    ts.isShorthandPropertyAssignment(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isPropertyDeclaration(node)
+  ) {
+    const name = node.name;
+    if (name && (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name))) {
+      return name.text;
+    }
+  }
+  return null;
+}
+
+function callTargetName(expression) {
+  if (ts.isIdentifier(expression)) return expression.text;
+  if (ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression)) {
+    return `${expression.expression.text}.${expression.name.text}`;
+  }
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    ts.isPropertyAccessExpression(expression.expression) &&
+    ts.isIdentifier(expression.expression.expression)
+  ) {
+    return `${expression.expression.expression.text}.${expression.expression.name.text}.${expression.name.text}`;
+  }
+  return null;
+}
+
+const PATH_CALLS = new Set(["path.resolve", "path.join", "path.posix.resolve", "path.posix.join"]);
+const FILE_URL_CALLS = new Set(["fileURLToPath", "url.fileURLToPath"]);
+
+// A filesystem base that contributes no package name (the module's own location).
+function isLocalBase(node) {
+  if (ts.isIdentifier(node) && (node.text === "__dirname" || node.text === "__filename")) return true;
+  if (ts.isPropertyAccessExpression(node) && node.expression.kind === ts.SyntaxKind.MetaProperty && node.name.text === "url") {
+    return true;
+  }
+  return false;
+}
+
+// True when a path string names an observability package as a path segment (e.g.
+// "node_modules/@sentry/electron" or "node_modules/posthog-js").
+function pathReferencesObservability(text) {
+  const segments = text.split(/[\\/]+/).filter((segment) => segment && segment !== "." && segment !== "..");
+  for (let i = 0; i < segments.length; i += 1) {
+    if (OBSERVABILITY_SPECIFIER.test(segments[i])) return true;
+    if (i + 1 < segments.length && OBSERVABILITY_SPECIFIER.test(`${segments[i]}/${segments[i + 1]}`)) return true;
+  }
+  return false;
+}
+
+function isObservabilityTarget(text) {
+  return OBSERVABILITY_SPECIFIER.test(text) || pathReferencesObservability(text);
+}
+
+// Top-level `const` identifier bindings, so a simple local alias can be resolved.
+// Anything declared with let/var, destructured, redeclared, reassigned or
+// declared in a nested scope is marked unsafe and treated as dynamic.
+function createBindingContext(source) {
+  const bindings = new Map();
+  const unsafe = new Set();
+  const isTopLevel = (node) => {
+    let parent = node.parent;
+    while (parent) {
+      if (parent === source) return true;
+      if (ts.isFunctionLike(parent) || ts.isBlock(parent) || ts.isModuleBlock(parent)) return false;
+      parent = parent.parent;
+    }
+    return false;
+  };
+  const markPattern = (pattern) => {
+    if (ts.isIdentifier(pattern)) unsafe.add(pattern.text);
+    else ts.forEachChild(pattern, markPattern);
+  };
+  const visit = (node) => {
+    if (ts.isVariableDeclaration(node) && node.initializer && isTopLevel(node)) {
+      if (ts.isIdentifier(node.name)) {
+        const isConst = ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const) !== 0;
+        if (!isConst || bindings.has(node.name.text)) unsafe.add(node.name.text);
+        else bindings.set(node.name.text, node.initializer);
+      } else {
+        markPattern(node.name);
+      }
+    }
+    if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left)) unsafe.add(node.left.text);
+    if ((ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) && ts.isIdentifier(node.operand)) {
+      unsafe.add(node.operand.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return { bindings, unsafe };
+}
+
+function resolveStaticString(node, ctx, seen) {
+  const target = unwrap(node);
+  if (!target) return null;
+  if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) return target.text;
+  if (ts.isIdentifier(target)) {
+    if (ctx.unsafe.has(target.text) || seen.has(target.text)) return null;
+    const binding = ctx.bindings.get(target.text);
+    if (!binding) return null;
+    const next = new Set(seen);
+    next.add(target.text);
+    return resolveStaticString(binding, ctx, next);
+  }
+  return null;
+}
+
+function resolvePathCallArgument(node, ctx, seen) {
+  const target = unwrap(node);
+  if (!target) return null;
+  if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) return target.text;
+  if (isLocalBase(target)) return "";
+  if (ts.isIdentifier(target)) return resolveStaticString(target, ctx, seen);
+  return null;
+}
+
+function resolveNewUrl(node, ctx, seen) {
+  const name = callTargetName(node.expression);
+  if (name !== "URL" && name !== "url.URL") return null;
+  const first = resolveStaticString(node.arguments && node.arguments[0], ctx, seen);
+  if (first === null) return null;
+  return { type: "path", value: first };
+}
+
+function resolveStatic(node, ctx, seen) {
+  const target = unwrap(node);
+  if (!target) return { type: "dynamic" };
+  if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) {
+    return { type: "string", value: target.text };
+  }
+  if (ts.isObjectLiteralExpression(target)) return { type: "object", node: target };
+  if (ts.isArrayLiteralExpression(target)) return { type: "array", node: target };
+  if (ts.isIdentifier(target)) {
+    if (ctx.unsafe.has(target.text) || seen.has(target.text)) return { type: "dynamic" };
+    const binding = ctx.bindings.get(target.text);
+    if (!binding) return { type: "dynamic" };
+    const next = new Set(seen);
+    next.add(target.text);
+    return resolveStatic(binding, ctx, next);
+  }
+  if (ts.isNewExpression(target)) {
+    return resolveNewUrl(target, ctx, seen) ?? { type: "dynamic" };
+  }
+  if (ts.isCallExpression(target)) {
+    const name = callTargetName(target.expression);
+    if (name && PATH_CALLS.has(name)) {
+      const parts = [];
+      for (const argument of target.arguments) {
+        const part = resolvePathCallArgument(argument, ctx, seen);
+        if (part === null) return { type: "dynamic" };
+        parts.push(part);
+      }
+      return { type: "path", value: parts.filter(Boolean).join("/") };
+    }
+    if (name && FILE_URL_CALLS.has(name)) {
+      const argument = unwrap(target.arguments && target.arguments[0]);
+      if (argument && ts.isNewExpression(argument)) {
+        return resolveNewUrl(argument, ctx, seen) ?? { type: "dynamic" };
+      }
+      const text = resolveStaticString(argument, ctx, seen);
+      return text === null ? { type: "dynamic" } : { type: "path", value: text };
+    }
+    return { type: "dynamic" };
+  }
+  return { type: "dynamic" };
+}
+
+function classifyAliasTarget(rel, lineOf, node, label, ctx) {
+  const resolved = resolveStatic(node, ctx, new Set());
+  if (resolved.type === "string" || resolved.type === "path") {
+    if (isObservabilityTarget(resolved.value)) {
+      report(rel, lineOf(node), resolved.value, `${label} target references an observability SDK (not allowlisted)`);
     }
     return;
   }
-  if (ts.isObjectLiteralExpression(element)) {
-    let target = null;
-    for (const property of element.properties) {
-      if (ts.isPropertyAssignment(property) && nameOfProperty(property) === "replacement") target = property.initializer;
+  // A call/identifier/concatenation/interpolation/spread whose value is not fully
+  // determined: reject fail-closed.
+  report(rel, lineOf(node), null, `unanalyzable ${label} target: a dynamically built alias cannot be verified (not allowlisted)`);
+}
+
+function inspectAliasObject(rel, lineOf, object, label, ctx) {
+  for (const property of object.properties) {
+    if (ts.isSpreadAssignment(property)) {
+      report(rel, lineOf(property), null, `unanalyzable spread inside ${label} (not allowlisted)`);
+      continue;
     }
-    const literals = collectLiteralStrings(target ?? element, []);
-    if (literals.length === 0) {
+    if (ts.isShorthandPropertyAssignment(property)) {
+      classifyAliasTarget(rel, lineOf, property.name, label, ctx);
+      continue;
+    }
+    if (ts.isPropertyAssignment(property)) {
+      classifyAliasTarget(rel, lineOf, property.initializer, label, ctx);
+      continue;
+    }
+    report(rel, lineOf(property), null, `unanalyzable ${label} entry (not allowlisted)`);
+  }
+}
+
+function inspectAliasArrayElement(rel, lineOf, element, label, ctx) {
+  const target = unwrap(element);
+  if (ts.isSpreadElement(target)) {
+    report(rel, lineOf(element), null, `unanalyzable spread inside ${label} (not allowlisted)`);
+    return;
+  }
+  if (ts.isStringLiteral(target) || ts.isNoSubstitutionTemplateLiteral(target)) {
+    classifyAliasTarget(rel, lineOf, target, label, ctx);
+    return;
+  }
+  const resolved = resolveStatic(target, ctx, new Set());
+  if (resolved.type === "object") {
+    let replacement = null;
+    for (const property of resolved.node.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        report(rel, lineOf(property), null, `unanalyzable spread inside ${label} entry (not allowlisted)`);
+        continue;
+      }
+      if (ts.isPropertyAssignment(property) && propertyNameOf(property) === "replacement") replacement = property.initializer;
+      else if (ts.isShorthandPropertyAssignment(property) && property.name.text === "replacement") replacement = property.name;
+    }
+    if (!replacement) {
       report(rel, lineOf(element), null, `unanalyzable ${label} {find, replacement} target (not allowlisted)`);
       return;
     }
-    for (const literal of literals) {
-      if (OBSERVABILITY_SPECIFIER.test(literal)) {
-        report(rel, lineOf(element), literal, `${label} {replacement} references an observability SDK (not allowlisted)`);
-      }
-    }
+    classifyAliasTarget(rel, lineOf, replacement, `${label} {replacement}`, ctx);
     return;
   }
   report(rel, lineOf(element), null, `unanalyzable ${label} array element (not allowlisted)`);
 }
 
-function scanViteConfig(rel, source) {
-  const lineOf = lineOfNode(source);
-  const visit = (node) => {
-    if (
-      ts.isPropertyAssignment(node) &&
-      nameOfProperty(node) === "alias" &&
-      ts.isObjectLiteralExpression(node.parent) &&
-      ts.isPropertyAssignment(node.parent.parent) &&
-      nameOfProperty(node.parent.parent) === "resolve"
-    ) {
-      inspectAliasMap(rel, lineOf, node.initializer, "resolve.alias");
-    }
-    ts.forEachChild(node, visit);
-  };
-  visit(source);
+function inspectAliasMap(rel, lineOf, node, label, ctx) {
+  const resolved = resolveStatic(node, ctx, new Set());
+  if (resolved.type === "object") {
+    inspectAliasObject(rel, lineOf, resolved.node, label, ctx);
+    return;
+  }
+  if (resolved.type === "array") {
+    for (const element of resolved.node.elements) inspectAliasArrayElement(rel, lineOf, element, label, ctx);
+    return;
+  }
+  report(rel, lineOf(node), null, `unanalyzable ${label}: a dynamically built alias map cannot be verified (not allowlisted)`);
 }
 
-function scanBabelConfig(rel, source) {
-  const lineOf = lineOfNode(source);
-  const inspectPlugin = (name, options) => {
-    if (!name || !/(^|\/)module-resolver$/.test(name)) return;
-    if (!options) return;
-    if (!ts.isObjectLiteralExpression(options)) {
-      report(rel, lineOf(options), null, "unanalyzable Babel module-resolver options (not allowlisted)");
+function inspectResolveObject(rel, lineOf, object, ctx) {
+  for (const property of object.properties) {
+    if (ts.isSpreadAssignment(property)) {
+      report(rel, lineOf(property), null, "unanalyzable spread inside resolve (not allowlisted)");
+      continue;
+    }
+    if (propertyNameOf(property) !== "alias") continue;
+    if (ts.isShorthandPropertyAssignment(property)) inspectAliasMap(rel, lineOf, property.name, "resolve.alias", ctx);
+    else if (ts.isPropertyAssignment(property)) inspectAliasMap(rel, lineOf, property.initializer, "resolve.alias", ctx);
+    else report(rel, lineOf(property), null, "unanalyzable resolve.alias entry (not allowlisted)");
+  }
+}
+
+function inspectResolveProperty(rel, lineOf, property, ctx) {
+  const node = ts.isPropertyAssignment(property) ? property.initializer : property.name;
+  const resolved = resolveStatic(node, ctx, new Set());
+  if (resolved.type !== "object") {
+    report(rel, lineOf(property), null, "unanalyzable resolve: a dynamically built resolve cannot be verified (not allowlisted)");
+    return;
+  }
+  inspectResolveObject(rel, lineOf, resolved.node, ctx);
+}
+
+// The exported config object: `export default <obj>`, `export default
+// defineConfig(<obj>)`, or `module.exports = <obj>`. Only these are inspected, so
+// a plugin's own `resolve` method is never mistaken for `resolve.alias`.
+function exportedConfigObjects(source) {
+  const objects = [];
+  const consider = (expression) => {
+    const node = unwrap(expression);
+    if (!node) return;
+    if (ts.isCallExpression(node) && callTargetName(node.expression) === "defineConfig") {
+      consider(node.arguments && node.arguments[0]);
       return;
     }
-    for (const property of options.properties) {
-      if (ts.isPropertyAssignment(property) && nameOfProperty(property) === "alias") {
-        inspectAliasMap(rel, lineOf, property.initializer, "Babel module-resolver alias");
+    if (ts.isObjectLiteralExpression(node)) objects.push(node);
+  };
+  for (const statement of source.statements) {
+    if (ts.isExportAssignment(statement)) consider(statement.expression);
+    if (ts.isExpressionStatement(statement) && ts.isBinaryExpression(statement.expression)) {
+      const left = statement.expression.left;
+      if (
+        ts.isPropertyAccessExpression(left) &&
+        ts.isIdentifier(left.expression) &&
+        left.expression.text === "module" &&
+        left.name.text === "exports"
+      ) {
+        consider(statement.expression.right);
       }
     }
-  };
+  }
+  return objects;
+}
+
+function scanViteConfig(rel, source, ctx) {
+  const lineOf = lineOfNode(source);
+  for (const object of exportedConfigObjects(source)) {
+    for (const property of object.properties) {
+      if (ts.isSpreadAssignment(property)) {
+        report(rel, lineOf(property), null, "unanalyzable spread in the exported config object (not allowlisted)");
+        continue;
+      }
+      if (propertyNameOf(property) === "resolve") inspectResolveProperty(rel, lineOf, property, ctx);
+    }
+  }
+}
+
+function isModuleResolverPluginName(name) {
+  return typeof name === "string" && /^(?:@[^/]+\/)?(?:babel-plugin-)?module-resolver$/.test(name);
+}
+
+function inspectBabelPluginOptions(rel, lineOf, options, ctx) {
+  const resolved = resolveStatic(options, ctx, new Set());
+  if (resolved.type !== "object") {
+    report(rel, lineOf(options), null, "unanalyzable Babel module-resolver options (not allowlisted)");
+    return;
+  }
+  for (const property of resolved.node.properties) {
+    if (ts.isSpreadAssignment(property)) {
+      report(rel, lineOf(property), null, "unanalyzable spread inside Babel module-resolver options (not allowlisted)");
+      continue;
+    }
+    if (propertyNameOf(property) !== "alias") continue;
+    if (ts.isShorthandPropertyAssignment(property)) inspectAliasMap(rel, lineOf, property.name, "Babel module-resolver alias", ctx);
+    else if (ts.isPropertyAssignment(property)) inspectAliasMap(rel, lineOf, property.initializer, "Babel module-resolver alias", ctx);
+    else report(rel, lineOf(property), null, "unanalyzable Babel module-resolver alias entry (not allowlisted)");
+  }
+}
+
+function scanBabelConfig(rel, source, ctx) {
+  const lineOf = lineOfNode(source);
   const visit = (node) => {
-    if (ts.isArrayLiteralExpression(node) && node.elements.length >= 1 && ts.isStringLiteral(node.elements[0])) {
-      inspectPlugin(node.elements[0].text, node.elements[1]);
+    if (ts.isArrayLiteralExpression(node) && node.elements.length >= 1) {
+      const first = unwrap(node.elements[0]);
+      if (first && ts.isStringLiteral(first) && isModuleResolverPluginName(first.text) && node.elements.length >= 2) {
+        inspectBabelPluginOptions(rel, lineOf, node.elements[1], ctx);
+      }
     }
     if (ts.isObjectLiteralExpression(node)) {
       let name = null;
       let options = null;
       for (const property of node.properties) {
         if (!ts.isPropertyAssignment(property)) continue;
-        if (nameOfProperty(property) === "name" && ts.isStringLiteral(property.initializer)) name = property.initializer.text;
-        if (nameOfProperty(property) === "options") options = property.initializer;
+        const initializer = unwrap(property.initializer);
+        if (propertyNameOf(property) === "name" && ts.isStringLiteral(initializer)) name = initializer.text;
+        if (propertyNameOf(property) === "options") options = property.initializer;
       }
-      inspectPlugin(name, options);
+      if (isModuleResolverPluginName(name) && options) inspectBabelPluginOptions(rel, lineOf, options, ctx);
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
 }
 
-function scanMetroConfig(rel, source) {
+function inspectMetroResolverObject(rel, lineOf, object, ctx) {
+  for (const property of object.properties) {
+    if (ts.isSpreadAssignment(property)) {
+      report(rel, lineOf(property), null, "unanalyzable spread inside Metro resolver (not allowlisted)");
+      continue;
+    }
+    if (propertyNameOf(property) !== "extraNodeModules") continue;
+    if (ts.isShorthandPropertyAssignment(property)) inspectAliasMap(rel, lineOf, property.name, "Metro resolver.extraNodeModules", ctx);
+    else if (ts.isPropertyAssignment(property)) inspectAliasMap(rel, lineOf, property.initializer, "Metro resolver.extraNodeModules", ctx);
+    else report(rel, lineOf(property), null, "unanalyzable Metro resolver.extraNodeModules entry (not allowlisted)");
+  }
+}
+
+function scanMetroConfig(rel, source, ctx) {
   const lineOf = lineOfNode(source);
   const assignmentTarget = (node) =>
     ts.isBinaryExpression(node) &&
@@ -591,15 +876,21 @@ function scanMetroConfig(rel, source) {
       ? node.left.name.text
       : null;
   const visit = (node) => {
-    // Object-literal form and assignment form are both supported because Metro
-    // configs use either (`{ resolver: { extraNodeModules } }` or
-    // `config.resolver.extraNodeModules = ...`).
-    if (ts.isPropertyAssignment(node) && nameOfProperty(node) === "extraNodeModules") {
-      inspectAliasMap(rel, lineOf, node.initializer, "Metro resolver.extraNodeModules");
+    // Object-literal form (`{ resolver: { extraNodeModules } }`).
+    if (ts.isObjectLiteralExpression(node)) {
+      for (const property of node.properties) {
+        if (propertyNameOf(property) !== "resolver") continue;
+        const value = ts.isShorthandPropertyAssignment(property) ? property.name : property.initializer;
+        const resolved = resolveStatic(value, ctx, new Set());
+        if (resolved.type === "object") inspectMetroResolverObject(rel, lineOf, resolved.node, ctx);
+        else report(rel, lineOf(property), null, "unanalyzable Metro resolver: a dynamically built resolver cannot be verified (not allowlisted)");
+      }
     }
+    // Assignment form (`config.resolver.extraNodeModules = ...`,
+    // `config.resolver.resolveRequest = fn`).
     const target = assignmentTarget(node);
     if (target === "extraNodeModules") {
-      inspectAliasMap(rel, lineOf, node.right, "Metro resolver.extraNodeModules");
+      inspectAliasMap(rel, lineOf, node.right, "Metro resolver.extraNodeModules", ctx);
     }
     if (target === "resolveRequest") {
       // Dynamic resolver: only literal module names are visible; a computed name
@@ -630,11 +921,12 @@ function scanResolutionConfigs() {
       continue;
     }
     const scriptKind = SCRIPT_KIND[path.extname(abs)] ?? ts.ScriptKind.JS;
-    // setParentNodes=true: the resolve.alias walk needs node.parent.
+    // setParentNodes=true: the resolve.alias walk and binding scoping need parents.
     const source = ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true, scriptKind);
-    if (kind === "vite") scanViteConfig(rel, source);
-    else if (kind === "babel") scanBabelConfig(rel, source);
-    else if (kind === "metro") scanMetroConfig(rel, source);
+    const ctx = createBindingContext(source);
+    if (kind === "vite") scanViteConfig(rel, source, ctx);
+    else if (kind === "babel") scanBabelConfig(rel, source, ctx);
+    else if (kind === "metro") scanMetroConfig(rel, source, ctx);
   }
 }
 

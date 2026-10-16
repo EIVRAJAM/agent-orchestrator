@@ -545,6 +545,133 @@ put "$d/frontend/package.json" <<'EOF'
 EOF
 check "a new observability package fails in an authorized manifest" fail "$d"
 
+# --- Strict static classification of alias targets ---------------------------
+
+d="$base/alias-call-partial-literal"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const target = "@sentry/electron";
+export default { resolve: { alias: { reporter: resolveAlias("production", target) } } };
+EOF
+check "a call with a benign literal and a dynamic identifier (fail)" fail "$d"
+
+d="$base/alias-template-interpolation"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const dir = "./src";
+export default { resolve: { alias: { reporter: `${dir}/ui` } } };
+EOF
+check "a template literal with interpolation (fail)" fail "$d"
+
+d="$base/alias-concatenation"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const name = "ui";
+export default { resolve: { alias: { reporter: "./src/" + name } } };
+EOF
+check "a partially dynamic concatenation (fail)" fail "$d"
+
+d="$base/alias-path-resolve-local"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src/ui") } } };
+EOF
+check "a legitimate local path.resolve() target (pass)" pass "$d"
+
+d="$base/alias-path-resolve-node-modules-sdk"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import path from "node:path";
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "node_modules/@sentry/electron") } } };
+EOF
+check "path.resolve() into node_modules/@sentry/electron (fail)" fail "$d"
+
+d="$base/alias-file-url-local"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { fileURLToPath } from "node:url";
+export default { resolve: { alias: { "@": fileURLToPath(new URL("./src/renderer", import.meta.url)) } } };
+EOF
+check "the repository's fileURLToPath(new URL(...)) local alias (pass)" pass "$d"
+
+d="$base/alias-file-url-node-modules-sdk"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { fileURLToPath } from "node:url";
+export default { resolve: { alias: { reporter: fileURLToPath(new URL("./node_modules/@sentry/electron", import.meta.url)) } } };
+EOF
+check "fileURLToPath(new URL(...)) into a node_modules SDK (fail)" fail "$d"
+
+d="$base/alias-literal-benign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export default { resolve: { alias: { "@ui": "./src/ui" } } };
+EOF
+check "a literal benign alias target (pass)" pass "$d"
+
+d="$base/alias-literal-observability"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export default { resolve: { alias: { reporter: "@sentry/electron" } } };
+EOF
+check "a literal observability alias target (fail)" fail "$d"
+
+# --- Shorthand, spreads and indirection --------------------------------------
+
+d="$base/vite-shorthand-resolvable"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const alias = { reporter: "./src/local-reporter" };
+export default { resolve: { alias } };
+EOF
+check "a resolvable Vite shorthand alias (pass)" pass "$d"
+
+d="$base/vite-shorthand-dynamic"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const alias = buildAliases();
+export default { resolve: { alias } };
+EOF
+check "a dynamic Vite shorthand alias (fail)" fail "$d"
+
+d="$base/babel-shorthand-dynamic"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+const alias = buildAliases();
+module.exports = { plugins: [["module-resolver", { alias }]] };
+EOF
+check "a dynamic Babel module-resolver shorthand (fail)" fail "$d"
+
+d="$base/metro-shorthand-dynamic"; make_fixture "$d"
+put "$d/packages/mobile/metro.config.js" <<'EOF'
+const extraNodeModules = buildModules();
+module.exports = { resolver: { extraNodeModules } };
+EOF
+check "a dynamic Metro extraNodeModules shorthand (fail)" fail "$d"
+
+d="$base/vite-spread-in-resolve"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const base = {};
+export default { resolve: { ...base, alias: { "@ui": "./src/ui" } } };
+EOF
+check "a dynamic spread inside resolve (fail)" fail "$d"
+
+d="$base/vite-spread-in-alias"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const base = {};
+export default { resolve: { alias: { ...base } } };
+EOF
+check "a dynamic spread inside alias (fail)" fail "$d"
+
+d="$base/vite-resolve-indirect-resolvable"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const resolve = { alias: { "@ui": "./src/ui" } };
+export default { resolve };
+EOF
+check "an indirect but resolvable resolve object (pass)" pass "$d"
+
+d="$base/vite-resolve-indirect-unresolvable"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const resolve = buildResolve();
+export default { resolve };
+EOF
+check "an indirect unresolvable resolve object (fail)" fail "$d"
+
+d="$base/babel-full-plugin-name"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+module.exports = { plugins: [["babel-plugin-module-resolver", { alias: { reporter: "@sentry/electron" } }]] };
+EOF
+check "the full babel-plugin-module-resolver name (fail)" fail "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0
