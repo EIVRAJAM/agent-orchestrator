@@ -411,6 +411,140 @@ const double = 'from "posthog-js"';
 EOF
 check "SDK name with different inner delimiters" pass "$d"
 
+# --- Resolution configs: Vite, Babel, Metro ----------------------------------
+
+d="$base/vite-product-ui-alias"; make_fixture "$d"
+put "$d/packages/product-ui/vite.build.config.ts" <<'EOF'
+export default { resolve: { alias: { reporter: "@sentry/electron" } } };
+EOF
+check "Vite resolve.alias in packages/product-ui (object form)" fail "$d"
+
+d="$base/vite-conventional-defineConfig"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import { defineConfig } from "vite";
+export default defineConfig({ resolve: { alias: { reporter: "@sentry/electron" } } });
+EOF
+check "conventional vite.config.ts with defineConfig resolve.alias" fail "$d"
+
+d="$base/vite-outside-frontend-mjs"; make_fixture "$d"
+put "$d/packages/product-ui/vite.config.mjs" <<'EOF'
+export default { resolve: { alias: { reporter: "@sentry/electron" } } };
+EOF
+check "Vite config outside frontend (packages/product-ui, .mjs)" fail "$d"
+
+d="$base/vite-array-find-replacement"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export default { resolve: { alias: [{ find: "reporter", replacement: "@sentry/electron" }] } };
+EOF
+check "Vite resolve.alias { find, replacement } array form" fail "$d"
+
+d="$base/vite-non-alias-sdk-string"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const banner = "generated without @sentry/electron";
+export default { resolve: { alias: { "@ui": "./src/ui" } }, build: { banner } };
+EOF
+check "an SDK string in a Vite config that is not an alias" pass "$d"
+
+d="$base/vite-benign-alias"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+export default { resolve: { alias: { "@ui": "./src/ui", "@utils": "./src/utils" } } };
+EOF
+check "a benign Vite resolve.alias" pass "$d"
+
+d="$base/vite-dynamic-alias-unsupported"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const aliases = buildAliasMap();
+export default { resolve: { alias: aliases } };
+EOF
+check "a dynamic (non-literal) Vite resolve.alias is rejected fail-closed" fail "$d"
+
+d="$base/babel-module-resolver-alias"; make_fixture "$d"
+put "$d/packages/mobile/babel.config.js" <<'EOF'
+module.exports = { plugins: [["module-resolver", { alias: { reporter: "@sentry/electron" } }]] };
+EOF
+check "Babel module-resolver alias to an SDK" fail "$d"
+
+d="$base/metro-extra-node-modules"; make_fixture "$d"
+put "$d/packages/mobile/metro.config.js" <<'EOF'
+const config = {};
+config.resolver.extraNodeModules = { reporter: "@sentry/electron" };
+module.exports = config;
+EOF
+check "Metro resolver.extraNodeModules alias to an SDK" fail "$d"
+
+d="$base/metro-resolve-request-literal"; make_fixture "$d"
+put "$d/packages/mobile/metro.config.js" <<'EOF'
+const config = {};
+config.resolver.resolveRequest = (ctx, name, platform) => (name === "@sentry/electron" ? ctx.resolveRequest(ctx, name, platform) : null);
+module.exports = config;
+EOF
+check "Metro resolver.resolveRequest naming an SDK literally" fail "$d"
+
+d="$base/metro-resolve-request-computed"; make_fixture "$d"
+put "$d/packages/mobile/metro.config.js" <<'EOF'
+const sdk = ["post", "hog-js"].join("");
+const config = {};
+config.resolver.resolveRequest = (ctx, name, platform) => (name === sdk ? ctx.resolveRequest(ctx, name, platform) : null);
+module.exports = config;
+EOF
+check "Metro resolver with a computed module name (documented gap: not detected)" pass "$d"
+
+# --- Manifest-scoped dependency allowlist ------------------------------------
+
+d="$base/dep-allowed-frontend"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "@sentry/electron": "7.17.0", "posthog-js": "^1.0.0" } }
+EOF
+check "frontend's dormant dependencies pass in frontend/package.json" pass "$d"
+
+d="$base/dep-allowed-mobile"; make_fixture "$d"
+put "$d/packages/mobile/package.json" <<'EOF'
+{ "name": "@agent-orchestrator/mobile", "version": "0.0.0", "dependencies": { "posthog-react-native": "^4.62.0" } }
+EOF
+check "mobile's dormant dependency passes in packages/mobile/package.json" pass "$d"
+
+d="$base/dep-foreign-direct"; make_fixture "$d"
+put "$d/packages/product-ui/package.json" <<'EOF'
+{ "name": "@aoagents/product-ui", "version": "0.0.0", "dependencies": { "@sentry/electron": "7.17.0" } }
+EOF
+check "a dormant dependency in a foreign manifest (dependencies)" fail "$d"
+
+d="$base/dep-foreign-dev"; make_fixture "$d"
+put "$d/packages/product-ui/package.json" <<'EOF'
+{ "name": "@aoagents/product-ui", "version": "0.0.0", "devDependencies": { "@sentry/electron": "7.17.0" } }
+EOF
+check "a dormant dependency in a foreign manifest (devDependencies)" fail "$d"
+
+d="$base/dep-foreign-optional"; make_fixture "$d"
+put "$d/packages/product-ui/package.json" <<'EOF'
+{ "name": "@aoagents/product-ui", "version": "0.0.0", "optionalDependencies": { "posthog-js": "^1.0.0" } }
+EOF
+check "a dormant dependency in a foreign manifest (optionalDependencies)" fail "$d"
+
+d="$base/dep-foreign-peer"; make_fixture "$d"
+put "$d/packages/product-ui/package.json" <<'EOF'
+{ "name": "@aoagents/product-ui", "version": "0.0.0", "peerDependencies": { "@sentry/electron": "7.17.0" } }
+EOF
+check "a dormant dependency in a foreign manifest (peerDependencies)" fail "$d"
+
+d="$base/self-alias-foreign-manifest"; make_fixture "$d"
+put "$d/packages/product-ui/package.json" <<'EOF'
+{ "name": "@aoagents/product-ui", "version": "0.0.0", "dependencies": { "@sentry/electron": "npm:@sentry/electron@7.0.0" } }
+EOF
+check "a self-alias outside its authorized manifest" fail "$d"
+
+d="$base/override-foreign-manifest"; make_fixture "$d"
+put "$d/packages/product-ui/package.json" <<'EOF'
+{ "name": "@aoagents/product-ui", "version": "0.0.0", "overrides": { "reporter": "npm:@sentry/electron@7.0.0" } }
+EOF
+check "an override alias in a foreign manifest" fail "$d"
+
+d="$base/new-obs-package-authorized-manifest"; make_fixture "$d"
+put "$d/frontend/package.json" <<'EOF'
+{ "name": "agent-orchestrator", "version": "0.0.0", "dependencies": { "@datadog/browser-rum": "5.0.0" } }
+EOF
+check "a new observability package fails in an authorized manifest" fail "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

@@ -11,9 +11,13 @@
 //   - Go imports of github.com/getsentry/sentry-go and friends under any alias;
 //   - unreviewed observability dependencies, including npm aliases
 //     ("reporter": "npm:@sentry/electron@^7.0.0") and package.json "imports"
-//     maps ("#reporter": "@sentry/electron"), in every discovered manifest;
-//   - observability targets hidden behind the repository's own module aliases
-//     (tsconfig "paths" and Vite "resolve.alias").
+//     maps ("#reporter": "@sentry/electron"), in every discovered manifest, with a
+//     manifest-scoped allowlist (a dormant dep is only allowed in the manifest
+//     that declares it);
+//   - observability targets hidden behind the repository's resolution configs:
+//     tsconfig "paths", Vite "resolve.alias" (object and {find, replacement}
+//     array forms), Babel "module-resolver" aliases and Metro
+//     "resolver.extraNodeModules".
 //
 // A reintroduction can hide an SDK in three ways that a name search misses: an
 // aliased import (the identifier differs), an import split across lines, and an
@@ -147,8 +151,15 @@ const CALL_ALLOW = new Set([
   "packages/mobile/lib/telemetry/runtime.ts",
 ]);
 
-// Direct observability dependencies allowed to be present (dormant adapters).
-const DEPENDENCY_ALLOW = new Set(["posthog-js", "posthog-react-native", "@sentry/electron"]);
+// Manifest-scoped allowlist of deliberately dormant observability dependencies.
+// Exact repo-relative manifest -> the package names allowed IN THAT MANIFEST.
+// A dormant dependency in any other manifest, a self-alias outside its
+// authorized manifest, or a new observability package anywhere is flagged.
+const DEPENDENCY_ALLOW = new Map([
+  ["frontend/package.json", new Set(["@sentry/electron", "posthog-js"])],
+  ["packages/mobile/package.json", new Set(["posthog-react-native"])],
+]);
+const EMPTY_ALLOW = new Set();
 
 // --- Covered tree ------------------------------------------------------------
 
@@ -403,45 +414,227 @@ function scanGoFile(rel, text) {
   }
 }
 
-// --- Module-alias configuration (tsconfig paths, Vite resolve.alias) ---------
+// --- Module resolution configuration -----------------------------------------
+//
+// Resolution configs can hide an SDK behind an alias. Vite `resolve.alias`,
+// Babel `module-resolver` and Metro `resolver.extraNodeModules` are inspected
+// through the AST, so only real alias targets are read — not every string in the
+// file. A dynamic (non-literal) alias map or target is rejected fail-closed: it
+// cannot be proven safe. Metro's `resolver.resolveRequest` is a function; only
+// observability literals inside it are flagged, and a fully computed module name
+// is a documented gap (see docs/privacy-fork.md).
 
-function discoverAliasConfigs() {
-  const found = new Set();
+const VITE_CONFIG_NAME = /^vite(\.[^/\\]+)?\.config\.[cm]?[jt]s$/;
+const BABEL_CONFIG_NAME = /^babel\.config\.[cm]?[jt]s$/;
+const METRO_CONFIG_NAME = /^metro\.config\.[cm]?[jt]s$/;
+
+function discoverResolutionConfigs() {
+  const found = [];
+  const add = (abs, kind) => found.push({ abs, kind });
   for (const baseRoot of ["frontend", "packages"]) {
-    const base = path.join(root, baseRoot);
-    walk(base, (abs) => {
+    walk(path.join(root, baseRoot), (abs) => {
       const name = path.basename(abs);
-      if (/^tsconfig[^/\\]*\.json$/.test(name)) {
-        found.add(abs);
-        return;
-      }
-      // Only the bundler configs at the frontend root (e.g. vite.renderer.config.ts).
-      if (/^vite\..*\.config\.[cm]?ts$/.test(name) && path.dirname(abs) === path.join(root, "frontend")) {
-        found.add(abs);
-      }
+      if (/^tsconfig[^/\\]*\.json$/.test(name)) return add(abs, "tsconfig");
+      if (VITE_CONFIG_NAME.test(name)) return add(abs, "vite");
+      if (BABEL_CONFIG_NAME.test(name) || name === "babel.config.json") return add(abs, "babel");
+      if (METRO_CONFIG_NAME.test(name)) return add(abs, "metro");
     });
   }
-  return [...found];
+  return found;
 }
 
-function scanAliasConfig(abs) {
-  const rel = relPath(abs);
-  let text;
-  try {
-    text = readFileSync(abs, "utf8");
-  } catch {
-    report(rel, 0, null, "could not read config file");
-    return;
+function nameOfProperty(node) {
+  if (!node || !ts.isPropertyAssignment(node)) return null;
+  const name = node.name;
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return name.text;
+  return null;
+}
+
+function collectLiteralStrings(node, out) {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    out.push(node.text);
+    return out;
   }
+  ts.forEachChild(node, (child) => {
+    collectLiteralStrings(child, out);
+  });
+  return out;
+}
+
+// tsconfig is JSON: every string is a value (no executable code), so a
+// string-literal sweep of the file is targeted here rather than indiscriminate.
+function scanTsconfigConfig(rel, text) {
   const blanked = blankComments(text);
   const lineOf = lineLookup(blanked);
   const re = /["'`]([^"'`\n]+)["'`]/g;
   let captured;
   while ((captured = re.exec(blanked)) !== null) {
-    const target = captured[1].replace(/^@\//, "@");
-    if (OBSERVABILITY_SPECIFIER.test(captured[1]) || OBSERVABILITY_SPECIFIER.test(target)) {
-      report(rel, lineOf(captured.index), captured[1], "module-alias/config target references an observability SDK (not allowlisted)");
+    if (OBSERVABILITY_SPECIFIER.test(captured[1])) {
+      report(rel, lineOf(captured.index), captured[1], "tsconfig value references an observability SDK (not allowlisted)");
     }
+  }
+}
+
+const lineOfNode = (source) => (node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+
+function inspectAliasMap(rel, lineOf, value, label) {
+  if (ts.isObjectLiteralExpression(value)) {
+    for (const property of value.properties) {
+      if (!ts.isPropertyAssignment(property)) {
+        report(rel, lineOf(property), null, `unanalyzable ${label} entry (not allowlisted)`);
+        continue;
+      }
+      const literals = collectLiteralStrings(property.initializer, []);
+      if (literals.length === 0) {
+        report(rel, lineOf(property), null, `unanalyzable ${label} target: a dynamically built alias cannot be verified (not allowlisted)`);
+        continue;
+      }
+      for (const literal of literals) {
+        if (OBSERVABILITY_SPECIFIER.test(literal)) {
+          report(rel, lineOf(property), literal, `${label} target references an observability SDK (not allowlisted)`);
+        }
+      }
+    }
+    return;
+  }
+  if (ts.isArrayLiteralExpression(value)) {
+    for (const element of value.elements) inspectAliasArrayElement(rel, lineOf, element, label);
+    return;
+  }
+  report(rel, lineOf(value), null, `unanalyzable ${label}: a dynamically built alias map cannot be verified (not allowlisted)`);
+}
+
+function inspectAliasArrayElement(rel, lineOf, element, label) {
+  if (ts.isStringLiteral(element) || ts.isNoSubstitutionTemplateLiteral(element)) {
+    if (OBSERVABILITY_SPECIFIER.test(element.text)) {
+      report(rel, lineOf(element), element.text, `${label} entry references an observability SDK (not allowlisted)`);
+    }
+    return;
+  }
+  if (ts.isObjectLiteralExpression(element)) {
+    let target = null;
+    for (const property of element.properties) {
+      if (ts.isPropertyAssignment(property) && nameOfProperty(property) === "replacement") target = property.initializer;
+    }
+    const literals = collectLiteralStrings(target ?? element, []);
+    if (literals.length === 0) {
+      report(rel, lineOf(element), null, `unanalyzable ${label} {find, replacement} target (not allowlisted)`);
+      return;
+    }
+    for (const literal of literals) {
+      if (OBSERVABILITY_SPECIFIER.test(literal)) {
+        report(rel, lineOf(element), literal, `${label} {replacement} references an observability SDK (not allowlisted)`);
+      }
+    }
+    return;
+  }
+  report(rel, lineOf(element), null, `unanalyzable ${label} array element (not allowlisted)`);
+}
+
+function scanViteConfig(rel, source) {
+  const lineOf = lineOfNode(source);
+  const visit = (node) => {
+    if (
+      ts.isPropertyAssignment(node) &&
+      nameOfProperty(node) === "alias" &&
+      ts.isObjectLiteralExpression(node.parent) &&
+      ts.isPropertyAssignment(node.parent.parent) &&
+      nameOfProperty(node.parent.parent) === "resolve"
+    ) {
+      inspectAliasMap(rel, lineOf, node.initializer, "resolve.alias");
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+}
+
+function scanBabelConfig(rel, source) {
+  const lineOf = lineOfNode(source);
+  const inspectPlugin = (name, options) => {
+    if (!name || !/(^|\/)module-resolver$/.test(name)) return;
+    if (!options) return;
+    if (!ts.isObjectLiteralExpression(options)) {
+      report(rel, lineOf(options), null, "unanalyzable Babel module-resolver options (not allowlisted)");
+      return;
+    }
+    for (const property of options.properties) {
+      if (ts.isPropertyAssignment(property) && nameOfProperty(property) === "alias") {
+        inspectAliasMap(rel, lineOf, property.initializer, "Babel module-resolver alias");
+      }
+    }
+  };
+  const visit = (node) => {
+    if (ts.isArrayLiteralExpression(node) && node.elements.length >= 1 && ts.isStringLiteral(node.elements[0])) {
+      inspectPlugin(node.elements[0].text, node.elements[1]);
+    }
+    if (ts.isObjectLiteralExpression(node)) {
+      let name = null;
+      let options = null;
+      for (const property of node.properties) {
+        if (!ts.isPropertyAssignment(property)) continue;
+        if (nameOfProperty(property) === "name" && ts.isStringLiteral(property.initializer)) name = property.initializer.text;
+        if (nameOfProperty(property) === "options") options = property.initializer;
+      }
+      inspectPlugin(name, options);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+}
+
+function scanMetroConfig(rel, source) {
+  const lineOf = lineOfNode(source);
+  const assignmentTarget = (node) =>
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    ts.isPropertyAccessExpression(node.left)
+      ? node.left.name.text
+      : null;
+  const visit = (node) => {
+    // Object-literal form and assignment form are both supported because Metro
+    // configs use either (`{ resolver: { extraNodeModules } }` or
+    // `config.resolver.extraNodeModules = ...`).
+    if (ts.isPropertyAssignment(node) && nameOfProperty(node) === "extraNodeModules") {
+      inspectAliasMap(rel, lineOf, node.initializer, "Metro resolver.extraNodeModules");
+    }
+    const target = assignmentTarget(node);
+    if (target === "extraNodeModules") {
+      inspectAliasMap(rel, lineOf, node.right, "Metro resolver.extraNodeModules");
+    }
+    if (target === "resolveRequest") {
+      // Dynamic resolver: only literal module names are visible; a computed name
+      // is a documented gap (docs/privacy-fork.md).
+      for (const literal of collectLiteralStrings(node.right, [])) {
+        if (OBSERVABILITY_SPECIFIER.test(literal)) {
+          report(rel, lineOf(node), literal, "Metro resolver.resolveRequest references an observability SDK (not allowlisted)");
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+}
+
+function scanResolutionConfigs() {
+  for (const { abs, kind } of discoverResolutionConfigs()) {
+    const rel = relPath(abs);
+    let text;
+    try {
+      text = readFileSync(abs, "utf8");
+    } catch {
+      report(rel, 0, null, "could not read config file");
+      continue;
+    }
+    if (kind === "tsconfig" || path.extname(abs) === ".json") {
+      scanTsconfigConfig(rel, text);
+      continue;
+    }
+    const scriptKind = SCRIPT_KIND[path.extname(abs)] ?? ts.ScriptKind.JS;
+    // setParentNodes=true: the resolve.alias walk needs node.parent.
+    const source = ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true, scriptKind);
+    if (kind === "vite") scanViteConfig(rel, source);
+    else if (kind === "babel") scanBabelConfig(rel, source);
+    else if (kind === "metro") scanMetroConfig(rel, source);
   }
 }
 
@@ -514,18 +707,23 @@ function scanManifest(manifest) {
     }
   }
 
+  const allowed = DEPENDENCY_ALLOW.get(rel) ?? EMPTY_ALLOW;
+
   for (const name of directNames) {
-    if (OBSERVABILITY_SPECIFIER.test(name) && !DEPENDENCY_ALLOW.has(name)) {
-      report(rel, 0, name, "unreviewed observability dependency");
+    if (OBSERVABILITY_SPECIFIER.test(name) && !allowed.has(name)) {
+      report(rel, 0, name, "unreviewed observability dependency for this manifest");
     }
   }
-  // An alias that renames an observability package is an indirection that hides
-  // the import site, so it is flagged even when the target is an allowlisted
-  // dormant dependency. A self-alias ("posthog-js": "npm:posthog-js@1") is not a
-  // rename and is not flagged here.
+  // An alias that renames an observability package hides the import site, so it
+  // fails even in an authorized manifest. A self-alias ("posthog-js":
+  // "npm:posthog-js@1") is only acceptable when the target is allowed in THIS
+  // manifest; a self-alias outside its authorized manifest fails.
   for (const [key, target] of aliasTargets) {
-    if (OBSERVABILITY_SPECIFIER.test(target) && target !== packageNameOf(key)) {
+    if (!OBSERVABILITY_SPECIFIER.test(target)) continue;
+    if (target !== packageNameOf(key)) {
       report(rel, 0, target, `aliased as ${JSON.stringify(key)} (npm alias, not allowlisted)`);
+    } else if (!allowed.has(target)) {
+      report(rel, 0, target, `self-alias in an unauthorized manifest (not allowlisted here)`);
     }
   }
   for (const target of importMapValues(pkg.imports)) {
@@ -561,7 +759,7 @@ for (const dir of CODE_ROOTS) {
   });
 }
 
-for (const abs of discoverAliasConfigs()) scanAliasConfig(abs);
+scanResolutionConfigs();
 
 const manifests = new Set();
 const addRootManifest = path.join(root, "package.json");
