@@ -16,7 +16,9 @@ what was and was not observed, and about the limits of the method.
 > classification of alias targets, shorthand/spread/indirection),
 > `7a78c78f` (indirect Vite-export resolution and verified `path`/`url` helper
 > provenance), and `0764a0c3` (`require` provenance, helper invalidation on
-> member mutation, `__dirname`/`__filename`, Vite+Vitest discovery). It is kept as
+> member mutation, `__dirname`/`__filename`, Vite+Vitest discovery), and
+> `ff604abc` (helper mutation propagation through identifier aliases; writes
+> restricted to assignment operators). It is kept as
 > **historical / comparative** evidence, not as execution evidence of the current
 > HEAD. It stays
 > relevant because the daemon outbound paths it exercised — `newTelemetrySink`

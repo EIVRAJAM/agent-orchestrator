@@ -72,6 +72,9 @@ flipped, so a change fails closed and loudly instead of exporting silently.
   9. `0764a0c3` — `require` provenance, helper invalidation on member mutation,
      provenance-checked `__dirname`/`__filename`, and Vite+Vitest config
      discovery.
+  10. `ff604abc` — helper mutation propagated through top-level identifier
+      aliases, and writes restricted to TypeScript assignment operators
+      (comparisons/arithmetic no longer invalidate a binding).
 
 ## 3. Inventory of mechanisms
 
@@ -308,12 +311,20 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      whole file). A local object/function with the same name, a reassigned or
      locally shadowed binding, a helper received as a parameter, an import from
      another package, or an alias (`const resolve = path.resolve`) with any
-     non-static argument is rejected fail-closed. **Any mutation of a helper or
-     one of its members** — `path.resolve = …`, `path.posix.resolve = …`,
-     `path["resolve"] = …`, compound assignment, `++`, `delete`, or
-     `Object.assign`/`Object.defineProperty`/`Reflect.set` on the helper —
-     invalidates the whole helper. `new URL` is trusted only as the un-shadowed
-     global or a `node:url`/`url` import.
+     non-static argument is rejected fail-closed.
+   - **mutation, and its propagation through aliases**: a write to a helper or one
+     of its members invalidates the whole helper. Writes are exactly the
+     TypeScript assignment operators (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`,
+     `<<=`, `>>=`, `>>>=`, `&=`, `^=`, `|=`, `&&=`, `||=`, `??=`), plus `++`/`--`
+     and `delete`; comparisons and arithmetic/bitwise expressions are **not**
+     writes. A write to `path.resolve`, `path.posix.resolve`, `path["resolve"]`,
+     a compound assignment, `++`, `delete`, or an object-level mutator
+     (`Object.assign`/`Object.defineProperty`/`Reflect.set`) on the helper
+     invalidates it, **and** the invalidation propagates to every top-level
+     identifier alias that shares the object (`const p = path; p.resolve = fake;`
+     invalidates `path`), including alias chains and cycles. Unmutated aliases
+     stay trusted (`const p = path; p.resolve(__dirname, "src")` works). `new URL`
+     is trusted only as the un-shadowed global or a `node:url`/`url` import.
    - **`__dirname` / `__filename`**: treated as an implicit base only when not
      declared, shadowed or reassigned; a static local `const` is resolved and
      analysed (a `const __dirname = "node_modules/@sentry"` is caught), while a
@@ -391,7 +402,13 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    `require` (pass); **helper member mutations** — assignment to `resolve`,
    `join`, `posix.resolve`, `posix.join`, `fileURLToPath`, `URL`, bracket
    notation, compound assignment, `++` and `Object.assign(path, …)` (fail) versus
-   the same helpers left unmodified (pass); **`__dirname`/`__filename`** — the
+   the same helpers left unmodified (pass); **alias mutation propagation** —
+   mutating an alias (`const p = path; p.resolve = fake`), an alias chain, or an
+   alias via bracket/compound/`++`/`delete`/`Object.assign`/`Object.defineProperty`
+   invalidates the original helper (fail) versus unmutated ESM/require namespace
+   aliases (pass); **assignment operators** — `-=`, `||=`, `??=` and `|=` are
+   writes (fail) while comparisons and arithmetic/bitwise expressions are not
+   (pass); **`__dirname`/`__filename`** — the
    implicit bases and `import.meta.url` (pass) versus a local const pointing at
    an SDK, a mutable `let`, and a parameter (fail), plus a benign static local
    const (pass); **relative re-exports and Vitest** — a Vitest config re-exporting
@@ -442,10 +459,17 @@ mandatory part.
   cannot be proven safe. The same applies to a dynamic Vite export, to a
   `path`/`url` helper whose provenance is not a real `node:path`/`node:url`
   binding (or whose members are mutated), and to a `__dirname`/`__filename`
-  rebound to a non-static value. A mutation the scanner cannot attribute to a
-  helper (e.g. a target computed at runtime) is not detected. The deliberate
-  exception is Metro `resolver.resolveRequest`, a function the repo already uses,
-  where a fully computed module name cannot be rejected without breaking it.
+  rebound to a non-static value. Mutation invalidation propagates through
+  **top-level identifier aliases** and through the binding table for member access
+  (`const p = path`), so a mutated alias invalidates the original helper
+  transitively (chains and cycles included). A mutation the scanner cannot
+  attribute to a helper — a target computed at runtime, a member reachable only
+  through a value the scanner cannot resolve (e.g. an element access with a
+  non-static key, or a `let`/destructured alias whose object identity is unclear)
+  — is not detected; such a case is rejected fail-closed when it appears as an
+  alias target, but a mutation hidden behind it is not. The deliberate exception
+  is Metro `resolver.resolveRequest`, a function the repo already uses, where a
+  fully computed module name cannot be rejected without breaking it.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -488,8 +512,10 @@ detection), `66e069c77` (broadened Vite/Babel/Metro resolution-config discovery
 and a manifest-scoped dependency allowlist), `cdfdfea64` (strict
 fail-closed classification of alias targets, shorthand/spread/indirection),
 `7a78c78f` (indirect Vite-export resolution and verified `path`/`url` helper
-provenance), and `0764a0c3` (`require` provenance, helper invalidation on member
-mutation, `__dirname`/`__filename`, Vite+Vitest discovery). None of those commits
+provenance), `0764a0c3` (`require` provenance, helper invalidation on member
+mutation, `__dirname`/`__filename`, Vite+Vitest discovery), and `ff604abc`
+(helper mutation propagation through identifier aliases; writes restricted to
+assignment operators). None of those commits
 change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
