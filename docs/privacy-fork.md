@@ -75,6 +75,10 @@ flipped, so a change fails closed and loudly instead of exporting silently.
   10. `ff604abc` — helper mutation propagated through top-level identifier
       aliases, and writes restricted to TypeScript assignment operators
       (comparisons/arithmetic no longer invalidate a binding).
+  11. `07eea972` — scope-aware, declaration-identity binding model: mutation
+      propagation from aliases in blocks/functions/callbacks, destructuring
+      write targets, and `++`/`--`/`delete` distinguished from read-only unary
+      operators.
 
 ## 3. Inventory of mechanisms
 
@@ -315,16 +319,24 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    - **mutation, and its propagation through aliases**: a write to a helper or one
      of its members invalidates the whole helper. Writes are exactly the
      TypeScript assignment operators (`=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`,
-     `<<=`, `>>=`, `>>>=`, `&=`, `^=`, `|=`, `&&=`, `||=`, `??=`), plus `++`/`--`
-     and `delete`; comparisons and arithmetic/bitwise expressions are **not**
-     writes. A write to `path.resolve`, `path.posix.resolve`, `path["resolve"]`,
-     a compound assignment, `++`, `delete`, or an object-level mutator
+     `<<=`, `>>=`, `>>>=`, `&=`, `^=`, `|=`, `&&=`, `||=`, `??=`), `++`/`--`
+     (prefix and postfix) and `delete`; comparisons, arithmetic/bitwise
+     expressions and the read-only unary operators `void`, `typeof`, `!`, `+`,
+     `-`, `~` are **not** writes. Destructuring targets are walked too, so
+     `[path.resolve] = […]` and `({ x: path.resolve } = …)` are writes. A write to
+     `path.resolve`, `path.posix.resolve`, `path["resolve"]`, a compound
+     assignment, `++`, `delete`, or an object-level mutator
      (`Object.assign`/`Object.defineProperty`/`Reflect.set`) on the helper
-     invalidates it, **and** the invalidation propagates to every top-level
-     identifier alias that shares the object (`const p = path; p.resolve = fake;`
-     invalidates `path`), including alias chains and cycles. Unmutated aliases
-     stay trusted (`const p = path; p.resolve(__dirname, "src")` works). `new URL`
-     is trusted only as the un-shadowed global or a `node:url`/`url` import.
+     invalidates it, **and** the invalidation propagates to every identifier alias
+     that shares the object, at **any scope depth** (a block, a function, a
+     callback), including alias chains and cycles. Bindings are identified by
+     their declaration, not by text, so same-text bindings in different scopes
+     stay distinct: shadowing neither hides a real mutation nor invalidates an
+     unrelated helper, and an alias that is never written invalidates nothing.
+     Unmutated aliases stay trusted (`const p = path; p.resolve(__dirname, "src")`
+     works). A mutation observed anywhere in a function is propagated even if the
+     function is not proven to run (conservative). `new URL` is trusted only as
+     the un-shadowed global or a `node:url`/`url` import.
    - **`__dirname` / `__filename`**: treated as an implicit base only when not
      declared, shadowed or reassigned; a static local `const` is resolved and
      analysed (a `const __dirname = "node_modules/@sentry"` is caught), while a
@@ -408,6 +420,14 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    invalidates the original helper (fail) versus unmutated ESM/require namespace
    aliases (pass); **assignment operators** — `-=`, `||=`, `??=` and `|=` are
    writes (fail) while comparisons and arithmetic/bitwise expressions are not
+   (pass); **nested-scope aliases** — an alias mutated inside a block, a function,
+   a callback, an alias chain or via `Object.assign` invalidates the original
+   helper, and shadowing does not hide the real mutation (fail) versus an
+   unmutated local alias, same-text bindings in different scopes, and an
+   independent local reassignment (pass); **destructuring writes** — an array or
+   object destructuring write to a helper member, directly or through an alias
+   (fail) versus normal destructuring (pass); **unary operators** — prefix and
+   postfix `++`/`--` and `delete` (fail) versus `void`/`typeof`/`!`/`+`/`-`/`~`
    (pass); **`__dirname`/`__filename`** — the
    implicit bases and `import.meta.url` (pass) versus a local const pointing at
    an SDK, a mutable `let`, and a parameter (fail), plus a benign static local
@@ -460,16 +480,20 @@ mandatory part.
   `path`/`url` helper whose provenance is not a real `node:path`/`node:url`
   binding (or whose members are mutated), and to a `__dirname`/`__filename`
   rebound to a non-static value. Mutation invalidation propagates through
-  **top-level identifier aliases** and through the binding table for member access
-  (`const p = path`), so a mutated alias invalidates the original helper
-  transitively (chains and cycles included). A mutation the scanner cannot
-  attribute to a helper — a target computed at runtime, a member reachable only
-  through a value the scanner cannot resolve (e.g. an element access with a
-  non-static key, or a `let`/destructured alias whose object identity is unclear)
-  — is not detected; such a case is rejected fail-closed when it appears as an
-  alias target, but a mutation hidden behind it is not. The deliberate exception
-  is Metro `resolver.resolveRequest`, a function the repo already uses, where a
-  fully computed module name cannot be rejected without breaking it.
+  **identifier aliases at any scope depth** (blocks, functions, callbacks; chains
+  and cycles included) using declaration identity, so a mutated alias invalidates
+  the original helper. A mutation the scanner cannot attribute to a helper — a
+  target computed at runtime, or a member reachable only through a value the
+  scanner cannot resolve (e.g. an element access whose object comes from a
+  computed expression) — is not detected; such a case is rejected fail-closed when
+  it appears as an alias target, but a mutation hidden behind it is not. Further
+  deliberate limits: a destructuring *declaration* (`const { a } = x`) is a new
+  binding, not a write, so it never invalidates `x`; `Reflect.deleteProperty`,
+  computed property names on the assignment target itself and other exotic write
+  forms are not modelled; and a helper modelled only through a value the scanner
+  cannot follow is treated as unresolvable rather than trusted. The deliberate
+  exception is Metro `resolver.resolveRequest`, a function the repo already uses,
+  where a fully computed module name cannot be rejected without breaking it.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -513,9 +537,11 @@ and a manifest-scoped dependency allowlist), `cdfdfea64` (strict
 fail-closed classification of alias targets, shorthand/spread/indirection),
 `7a78c78f` (indirect Vite-export resolution and verified `path`/`url` helper
 provenance), `0764a0c3` (`require` provenance, helper invalidation on member
-mutation, `__dirname`/`__filename`, Vite+Vitest discovery), and `ff604abc`
+mutation, `__dirname`/`__filename`, Vite+Vitest discovery), `ff604abc`
 (helper mutation propagation through identifier aliases; writes restricted to
-assignment operators). None of those commits
+assignment operators), and `07eea972` (scope-aware declaration-identity model:
+aliases in blocks/functions/callbacks, destructuring write targets, and
+`++`/`--`/`delete` vs read-only unary operators). None of those commits
 change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly

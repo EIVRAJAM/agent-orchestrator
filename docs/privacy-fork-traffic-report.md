@@ -18,7 +18,10 @@ what was and was not observed, and about the limits of the method.
 > provenance), and `0764a0c3` (`require` provenance, helper invalidation on
 > member mutation, `__dirname`/`__filename`, Vite+Vitest discovery), and
 > `ff604abc` (helper mutation propagation through identifier aliases; writes
-> restricted to assignment operators). It is kept as
+> restricted to assignment operators), and `07eea972` (scope-aware
+> declaration-identity model: aliases in blocks/functions/callbacks,
+> destructuring write targets, and `++`/`--`/`delete` vs read-only unary
+> operators). It is kept as
 > **historical / comparative** evidence, not as execution evidence of the current
 > HEAD. It stays
 > relevant because the daemon outbound paths it exercised — `newTelemetrySink`
