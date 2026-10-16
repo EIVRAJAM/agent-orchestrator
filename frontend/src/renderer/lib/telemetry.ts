@@ -3,6 +3,7 @@ import { aoBridge } from "./bridge";
 import { isLoopbackHostname } from "./loopback";
 import { ORCHESTRATOR_SPAWN_SOURCES } from "./orchestrator-spawn-sources";
 import { DEFAULT_POSTHOG_HOST, DEFAULT_POSTHOG_PROJECT_KEY } from "../../shared/posthog-config";
+import { EXTERNAL_TELEMETRY_EXPORT_ALLOWED } from "../../shared/fork-privacy";
 import { EDITOR_IDS } from "../../shared/editor-handoff";
 import { captureExceptionToSentry, initSentry } from "./sentry";
 
@@ -925,6 +926,12 @@ export function buildPostHogConfig(distinctId: string): PostHogInitOptions {
 export async function initTelemetry(): Promise<boolean> {
 	if (initPromise) return initPromise;
 	const attempt = (async () => {
+		// Fork privacy policy: never construct the PostHog client. This is the
+		// composition point that would call posthog.init(), so returning false
+		// here keeps the renderer export off even if a bootstrap were somehow
+		// supplied. No environment variable, consent record, or remote config
+		// can bypass it. See src/shared/fork-privacy.ts.
+		if (!EXTERNAL_TELEMETRY_EXPORT_ALLOWED) return false;
 		if (!POSTHOG_KEY) return false;
 		const bootstrap = await aoBridge.telemetry.getBootstrap();
 		// Null means the supervisor withheld it: no key, no data dir, or an

@@ -13,14 +13,19 @@ export const MOBILE_POSTHOG_HOST =
 	process.env.EXPO_PUBLIC_POSTHOG_HOST?.trim() || "https://us.i.posthog.com";
 
 /**
- * Kill switches, mirroring the desktop's AO_TELEMETRY_DISABLED_EVENTS. Build-time
- * (EXPO_PUBLIC_* is inlined), so it controls the next build. A shipped binary
- * cannot be hotfixed from here; the runtime kill switch for an event already in
- * the field is the PostHog-side ingestion drop rule, the same lever used for the
- * legacy desktop events (see docs/posthog-cost-controls.md).
+ * Fork privacy policy: mobile PostHog telemetry is permanently disabled as a
+ * code property, matching the desktop's src/shared/fork-privacy.ts. This is not
+ * a build-time flag any more: no EXPO_PUBLIC_* environment variable, consent
+ * record, or remote config can re-enable the client, because
+ * initMobileTelemetry() returns early on this value. Reverting it requires
+ * editing this file. See docs/privacy-fork.md.
+ *
+ * Upstream behavior, retained only as documentation: this used to read
+ * `EXPO_PUBLIC_AO_TELEMETRY_DISABLED === "1"`, so a shipped binary could not be
+ * hotfixed and the runtime kill switch was the PostHog-side ingestion drop rule
+ * (see docs/posthog-cost-controls.md).
  */
-export const MOBILE_TELEMETRY_DISABLED =
-	(process.env.EXPO_PUBLIC_AO_TELEMETRY_DISABLED ?? "").trim() === "1";
+export const MOBILE_TELEMETRY_DISABLED = true;
 
 export const MOBILE_DISABLED_EVENTS = (process.env.EXPO_PUBLIC_AO_TELEMETRY_DISABLED_EVENTS ?? "")
 	.split(",")

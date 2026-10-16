@@ -1,5 +1,14 @@
 # Product telemetry
 
+> **This is a fork.** This document describes upstream behavior. In this fork,
+> AO's own outbound telemetry and diagnostics are **disabled by construction**:
+> no PostHog client, no Sentry transport, no install identifier sent, and no
+> environment variable, preference, or consent record can re-enable them. See
+> [privacy-fork.md](privacy-fork.md) for the policy, the inventory of
+> mechanisms, the verification, and how to keep the fork in sync with upstream.
+> Everything below is retained for reference so a maintainer can recognize an
+> upstream change that would reintroduce an export.
+
 Orchestrator.inc collects limited product-usage and reliability data to learn which parts of
 the app are useful and whether releases are working as expected. Orchestrator.inc does not
 attach an email address. Some events include a GitHub project owner or an

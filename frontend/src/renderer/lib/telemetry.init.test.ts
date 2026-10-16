@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// initTelemetry memoizes its result in a module-scoped promise, so each test
-// resets the module registry and re-mocks the heavy boundaries (posthog, the
-// Electron bridge) before importing. This exercises the real init control flow.
+// Fork privacy policy regression: initTelemetry must never construct the
+// PostHog client, so every capture helper has to stay a no-op no matter what
+// bootstrap the main process could hand the renderer. This is the renderer
+// composition point; see src/shared/fork-privacy.ts and docs/privacy-fork.md.
 
 const posthogStub = {
 	init: vi.fn(),
@@ -19,40 +20,23 @@ function mockPosthog() {
 	}));
 }
 
-describe("initTelemetry recovery", () => {
+const enabledBootstrap = {
+	appVersion: "1.2.3",
+	platform: "darwin",
+	distinctId: "ins_test",
+	disabledEvents: [] as string[],
+	eventsEnabled: true,
+	consentGeneration: "generation-1",
+};
+
+describe("initTelemetry fork privacy policy", () => {
 	beforeEach(() => {
 		vi.resetModules();
 		vi.clearAllMocks();
 	});
 
-	it("retries init after a transient thrown failure instead of caching it", async () => {
-		let calls = 0;
-		mockPosthog();
-		vi.doMock("./bridge", () => ({
-			aoBridge: {
-				telemetry: {
-					getBootstrap: vi.fn(async () => {
-						calls++;
-						if (calls === 1) throw new Error("transient bootstrap failure");
-						return { appVersion: "1.2.3", platform: "darwin", distinctId: "ins_test", disabledEvents: [], eventsEnabled: true, consentGeneration: "generation-1" };
-					}),
-				},
-				updateSettings: { get: vi.fn(async () => ({})) },
-			},
-		}));
-
-		const { initTelemetry } = await import("./telemetry");
-		// First attempt throws -> caught -> false, and the memoized promise is dropped.
-		expect(await initTelemetry()).toBe(false);
-		// A later call retries and succeeds, rather than the whole session staying dark.
-		expect(await initTelemetry()).toBe(true);
-		expect(calls).toBe(2);
-	});
-
-	it("keeps a deliberately withheld result memoized (no retry, no re-bootstrap)", async () => {
-		// Null bootstrap = telemetry withheld (no key / not opted in). That is a
-		// deliberate false, not an error, so it must stay cached and NOT retry.
-		const getBootstrap = vi.fn(async () => null);
+	it("never constructs the PostHog client or fetches a bootstrap", async () => {
+		const getBootstrap = vi.fn(async () => enabledBootstrap);
 		mockPosthog();
 		vi.doMock("./bridge", () => ({
 			aoBridge: {
@@ -63,29 +47,31 @@ describe("initTelemetry recovery", () => {
 
 		const { initTelemetry } = await import("./telemetry");
 		expect(await initTelemetry()).toBe(false);
+		// Memoized: still false, and the composition point never ran posthog.init.
 		expect(await initTelemetry()).toBe(false);
-		// Memoized: the withheld result is not re-attempted.
-		expect(getBootstrap).toHaveBeenCalledTimes(1);
+		expect(posthogStub.init).not.toHaveBeenCalled();
+		// No bootstrap round-trip means the per-install id is never read for export.
+		expect(getBootstrap).not.toHaveBeenCalled();
 	});
 
-	it("initializes PostHog when failure reporting is disabled", async () => {
+	it("drops every renderer capture even when a bootstrap is available", async () => {
 		mockPosthog();
 		vi.doMock("./bridge", () => ({
 			aoBridge: {
-				telemetry: {
-					getBootstrap: vi.fn(async () => ({
-						appVersion: "1.2.3", platform: "darwin", distinctId: "ins_test",
-						disabledEvents: [], eventsEnabled: false, consentGeneration: "generation-off",
-					})),
-				},
+				telemetry: { getBootstrap: vi.fn(async () => enabledBootstrap) },
 				updateSettings: { get: vi.fn(async () => ({})) },
 			},
 		}));
 
-		const { applyRendererTelemetryPolicy, clearRendererTelemetryQueues, initTelemetry } = await import("./telemetry");
-		expect(await initTelemetry()).toBe(true);
-		expect(posthogStub.init).toHaveBeenCalledOnce();
-		expect(() => clearRendererTelemetryQueues()).not.toThrow();
-		expect(() => applyRendererTelemetryPolicy(false)).not.toThrow();
+		const { addRendererExceptionStep, captureRendererEvent, captureRendererException } = await import(
+			"./telemetry"
+		);
+		await captureRendererEvent("ao.app.active", { channel: "renderer" });
+		await captureRendererException(new Error("boom"), { source: "react-error-boundary" });
+		await addRendererExceptionStep("a step");
+
+		expect(posthogStub.capture).not.toHaveBeenCalled();
+		expect(posthogStub.captureException).not.toHaveBeenCalled();
+		expect(posthogStub.addExceptionStep).not.toHaveBeenCalled();
 	});
 });

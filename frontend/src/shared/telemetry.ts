@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { EXTERNAL_TELEMETRY_EXPORT_ALLOWED } from "./fork-privacy";
 import type { TelemetryPolicySnapshot } from "./telemetry-policy";
 
 export type TelemetryBootstrap = {
@@ -35,14 +36,21 @@ export function parseDisabledEvents(raw: string | undefined): string[] {
 /**
  * Whether the renderer may export to PostHog.
  *
- * Unpackaged builds are off by default so a developer's ordinary session does
- * not land in the production project as a real install. Setting
- * `AO_TELEMETRY_RENDERER=on` opts a dev build back in for deliberate testing.
+ * Fork privacy policy: this is permanently false. The gate is kept as the
+ * single choke point so that no environment variable, packaged/unpackaged
+ * distinction, or consent record can turn the renderer's PostHog client back
+ * on. See src/shared/fork-privacy.ts.
+ *
+ * (Upstream behavior, retained below for reference only: unpackaged builds were
+ * off by default so a developer's ordinary session did not land in the
+ * production project as a real install, and `AO_TELEMETRY_RENDERER=on` opted a
+ * dev build back in for deliberate testing.)
  */
 export function rendererTelemetryEnabled(
 	env: Record<string, string | undefined>,
 	isPackaged: boolean,
 ): boolean {
+	if (!EXTERNAL_TELEMETRY_EXPORT_ALLOWED) return false;
 	const explicit = env.AO_TELEMETRY_RENDERER?.trim().toLowerCase();
 	if (explicit === "on") return true;
 	if (explicit === "off") return false;
@@ -85,7 +93,9 @@ export async function buildTelemetryBootstrap(
 	// Returning null is the whole switch: initTelemetry() bails on a null
 	// bootstrap, so the renderer never constructs a PostHog client at all. That
 	// is stronger than gating each capture, because it also removes the SDK's
-	// own background requests.
+	// own background requests. Under the fork policy rendererTelemetryEnabled()
+	// is always false, so this always returns null and the per-install id below
+	// is never generated for export.
 	if (!rendererTelemetryEnabled(env, isPackaged)) return null;
 	const dataDir = defaultDataDir(platform, env, homeDir);
 	if (!dataDir) return null;

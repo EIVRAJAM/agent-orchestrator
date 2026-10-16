@@ -6,8 +6,10 @@ import type { UpdateSettings } from "./update-settings";
 const GITHUB_API = "https://api.github.com";
 
 // Default when the baked app-update.yml cannot be read (dev, or a malformed
-// bundle). Matches forge.config.ts DEFAULT_RELEASE_REPO.
-const DEFAULT_REPO = { owner: "Untrivial-ai", repo: "agent-orchestrator" } as const;
+// bundle). Matches forge.config.ts DEFAULT_RELEASE_REPO. This fork must default
+// to its own repo, never upstream, so a fork build can never list or install an
+// upstream artifact with a different privacy policy (see docs/privacy-fork.md).
+const DEFAULT_REPO = { owner: "EIVRAJAM", repo: "agent-orchestrator" } as const;
 
 // Resolve the GitHub repo the app updates from by reading the same bundled
 // app-update.yml that electron-updater uses. Both are baked from AO_RELEASE_REPO

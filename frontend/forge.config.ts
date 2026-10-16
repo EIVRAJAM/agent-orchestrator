@@ -13,13 +13,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { BUNDLED_TMUX_VERSION } from "./scripts/tmux-version.mjs";
 
-// Default GitHub release target (production). Releases land on Untrivial-ai
-// (the org the repo was transferred to in July 2026; AgentWrapper and aoagents
-// are prior homes). Builds cut by CI must NOT rely on this fallback: the
-// workflows set AO_RELEASE_REPO to the repo they run in, and build-artifacts.yml
-// asserts the baked app-update.yml matches it, so a future org/repo rename
-// fails the build instead of stranding the fleet on a redirect (#3523).
-const DEFAULT_RELEASE_REPO = "Untrivial-ai/agent-orchestrator";
+// Default GitHub release target for this fork. Upstream (the org the repo was
+// transferred to in July 2026) is Untrivial-ai; this fork lives at
+// EIVRAJAM/agent-orchestrator and MUST NOT default to the upstream repo, or a
+// packaged fork build would poll and silently stage an upstream artifact with a
+// different privacy policy on quit (see docs/privacy-fork.md). Builds cut by CI
+// override this: the workflows set AO_RELEASE_REPO to the repo they run in, and
+// build-artifacts.yml asserts the baked app-update.yml matches it, so a future
+// rename fails the build instead of stranding the fleet on a redirect (#3523).
+const DEFAULT_RELEASE_REPO = "EIVRAJAM/agent-orchestrator";
 
 // The packaged binary name (no extension). Single source of truth: the packager
 // names the exe/ELF from this, and the NSIS + deb makers must point their

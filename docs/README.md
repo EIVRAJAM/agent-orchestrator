@@ -33,9 +33,11 @@ in [gemini-cli.md](gemini-cli.md).
 | [STATUS.md](STATUS.md)                                 | What is shipped on `main` today and what is still in flight.                                                          |
 | [stack.md](stack.md)                                   | Accepted library/runtime choices, pending stack decisions, and dependencies explicitly avoided for V1.                |
 | [telemetry.md](telemetry.md)                           | User-facing overview of product telemetry, privacy safeguards, and opt-out controls.                                    |
+| [privacy-fork.md](privacy-fork.md)                     | This fork's policy: AO's own external telemetry/diagnostics disabled by construction, with verification and sync procedure. |
+| [privacy-fork-traffic-report.md](privacy-fork-traffic-report.md) | Controlled daemon-run traffic observation for the fork policy, with scope and limits.                          |
 | [posthog-cost-controls.md](posthog-cost-controls.md)   | PostHog event-name migration, ingestion drop rules, and dashboard queries for reducing telemetry spend.              |
 
-See [startup-cues.md](startup-cues.md) for command cues that gate a new worktree’s opening turn.
+See [startup-cues.md](startup-cues.md) for command cues that gate a new worktreeï¿½s opening turn.
 
 ## Mental model
 

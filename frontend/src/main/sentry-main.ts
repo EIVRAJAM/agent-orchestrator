@@ -1,7 +1,10 @@
 // Electron main is the only permitted desktop Sentry intake/sender boundary.
-// The production release gate is intentionally closed in Task 6, so this
-// module constructs no network client. Controller tests inject an in-memory
-// transport; a later release task may add a privacy-approved main transport.
+// Fork privacy policy: this module constructs no network client, ever. The
+// guard below is unconditional — no version, cache root, environment variable
+// (AO_SENTRY_DSN), consent record, or production flag can make it return a
+// transport. Controller tests inject an in-memory transport; nothing in the
+// shipping composition does. See src/shared/fork-privacy.ts.
+import { EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED } from "../shared/fork-privacy";
 import type { RendererTelemetryCapture } from "../shared/telemetry-policy";
 import type { DesktopTelemetryTransport } from "./desktop-telemetry-controller";
 
@@ -25,6 +28,7 @@ const HOME_PATH = /\/(?:Users|home)\/[^\s"']+/g;
 const WIN_PATH = /[A-Za-z]:\\[^\s"']+|\\\\[^\s"']+/g;
 
 export async function initMainSentry(_version: string, _cacheRoot: string): Promise<DesktopTelemetryTransport | null> {
+	if (!EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED) return null;
 	return null;
 }
 

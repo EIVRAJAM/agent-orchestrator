@@ -240,9 +240,12 @@ func Run() error {
 
 	// Consent and event metadata are established before any reporting surface or
 	// recovery enrollment exists. SQLite is forced off first on every boot so a
-	// stale enabled mirror can never authorize work after a restart.
-	destination, destinationErr := sentryobs.ParseAgentSwitchDSN(cfg.Telemetry.SentryDSN, true)
-	if destinationErr != nil && cfg.Telemetry.SentryDSN != "" {
+	// stale enabled mirror can never authorize work after a restart. The DSN is
+	// resolved through the fork privacy policy, which keeps it blank, so the
+	// staged agent-switch Sentry sender can never be built (see fork_privacy.go).
+	sentryDSN := daemonSentryDSN(cfg.Telemetry)
+	destination, destinationErr := sentryobs.ParseAgentSwitchDSN(sentryDSN, true)
+	if destinationErr != nil && sentryDSN != "" {
 		log.Warn("agent switch failure sender disabled", "error", destinationErr)
 	}
 	policyCoordinator := agentswitchobs.NewPolicyCoordinator(store, agentswitchobs.PolicyOptions{
@@ -273,15 +276,12 @@ func Run() error {
 	telemetryCfg.Telemetry.Events = policyCoordinator.EventsEnabled()
 	telemetrySink := newTelemetrySink(telemetryCfg, store, log)
 	defer func() { _ = telemetrySink.Close(context.Background()) }()
-	// Daemon Sentry: captures genuine 5xx/panics with their Go stack. Gated on
-	// Initialize the transport once so a later policy opt-in works without a
-	// daemon restart. The policy gate remains fail-closed and is checked before
-	// every capture; a blank DSN still leaves this as a no-op.
-	if err := sentryobs.Init(sentryobs.Config{
-		DSN:         cfg.Telemetry.SentryDSN,
-		Release:     cfg.Telemetry.AppVersion,
-		Environment: sentryEnvironment(cfg.Telemetry.AppVersion),
-	}); err != nil {
+	// Daemon Sentry: captures genuine 5xx/panics with their Go stack. Fork
+	// privacy policy keeps the DSN blank (see fork_privacy.go), so sentryobs
+	// stays a no-op: no transport, no upload, no queue. Initializing it here
+	// keeps the policy gate wired for a future approved build, but the
+	// fail-closed gate plus the blank DSN mean nothing can be sent.
+	if err := sentryobs.Init(newDaemonSentryConfig(cfg.Telemetry)); err != nil {
 		log.Warn("daemon sentry disabled", "err", err)
 	}
 	defer sentryobs.Flush(2 * time.Second)

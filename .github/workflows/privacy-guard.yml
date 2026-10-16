@@ -1,0 +1,49 @@
+name: Privacy guard
+
+# Blocks a PR that reintroduces AO's outbound telemetry/diagnostics export, points
+# the updater at upstream, or adds an unreviewed observability dependency. Combines
+# behavioral tests with static alarms; see docs/privacy-fork.md. This fork's policy
+# is that AO's own analytics and error reporting never leave the machine.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "packages/mobile/**"
+      - "desktop-version-floor.json"
+      - "scripts/privacy-guard.sh"
+      - ".github/workflows/privacy-guard.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: privacy-guard-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  privacy-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Privacy guard
+        run: bash scripts/privacy-guard.sh

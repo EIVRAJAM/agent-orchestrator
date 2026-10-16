@@ -42,49 +42,38 @@ test("buildTelemetryBootstrap returns null when no home dir is available", async
 	await expect(buildTelemetryBootstrap({}, "1.2.3", "linux", "", true, enabledPolicy)).resolves.toBeNull();
 });
 
-test("renderer telemetry is off on unpackaged builds unless explicitly opted in", () => {
+// Fork privacy policy: the renderer export gate is permanently false. No env
+// variable, packaged/unpackaged distinction, or consent record turns it back
+// on. See src/shared/fork-privacy.ts.
+test("renderer telemetry export is disabled for every environment", () => {
 	expect(rendererTelemetryEnabled({}, false)).toBe(false);
-	expect(rendererTelemetryEnabled({}, true)).toBe(true);
-	expect(rendererTelemetryEnabled({ AO_TELEMETRY_RENDERER: " ON " }, false)).toBe(true);
-	expect(rendererTelemetryEnabled({ AO_TELEMETRY_RENDERER: "off" }, true)).toBe(false);
+	expect(rendererTelemetryEnabled({}, true)).toBe(false);
+	expect(rendererTelemetryEnabled({ AO_TELEMETRY_RENDERER: " ON " }, false)).toBe(false);
+	expect(rendererTelemetryEnabled({ AO_TELEMETRY_RENDERER: "on" }, true)).toBe(false);
+	expect(rendererTelemetryEnabled({ AO_TELEMETRY_RENDERER: "off" }, false)).toBe(false);
 });
 
-// A null bootstrap is the switch itself: initTelemetry bails on it, so an
-// unpackaged build never constructs a PostHog client at all.
-test("buildTelemetryBootstrap withholds the bootstrap on an unpackaged build", async () => {
+// A null bootstrap is the switch itself: initTelemetry bails on it, so the
+// renderer never constructs a PostHog client at all — even for a packaged build
+// with an enabled policy and an explicit opt-in.
+test("buildTelemetryBootstrap always withholds the bootstrap", async () => {
 	const dir = await mkdtemp(path.join(os.tmpdir(), "ao-telemetry-"));
 	tempDirs.push(dir);
 
-	const disabled = await buildTelemetryBootstrap({}, "0.11.2", "linux", dir, false, enabledPolicy);
-	expect(disabled).toBeNull();
-	const optedIn = await buildTelemetryBootstrap({ AO_TELEMETRY_RENDERER: "on" }, "0.11.2", "linux", dir, false, enabledPolicy);
-	expect(optedIn?.appVersion).toBe("0.11.2");
-});
-
-test("failure-reporting opt-out does not withhold PostHog identity", async () => {
-	const dir = await mkdtemp(path.join(os.tmpdir(), "ao-telemetry-"));
-	tempDirs.push(dir);
-	const bootstrap = await buildTelemetryBootstrap({}, "0.11.2", "linux", dir, true, {
-		...enabledPolicy,
-		eventsEnabled: false,
-	});
-	expect(bootstrap?.eventsEnabled).toBe(false);
-	expect(bootstrap?.distinctId).toMatch(/^ins_/);
-});
-
-test("buildTelemetryBootstrap carries the deny list across the process boundary", async () => {
-	const dir = await mkdtemp(path.join(os.tmpdir(), "ao-telemetry-"));
-	tempDirs.push(dir);
-
-	const bootstrap = await buildTelemetryBootstrap(
-		{ AO_TELEMETRY_DISABLED_EVENTS: "ao.v2.app.active, ao.renderer.* ,, " },
-		"0.11.2",
-		"linux",
-		dir,
-		true,
-		enabledPolicy,
-	);
-	expect(bootstrap?.disabledEvents).toEqual(["ao.v2.app.active", "ao.renderer.*"]);
+	expect(await buildTelemetryBootstrap({}, "0.11.2", "linux", dir, false, enabledPolicy)).toBeNull();
+	expect(
+		await buildTelemetryBootstrap({ AO_TELEMETRY_RENDERER: "on" }, "0.11.2", "linux", dir, true, enabledPolicy),
+	).toBeNull();
+	expect(
+		await buildTelemetryBootstrap(
+			{ AO_TELEMETRY_DISABLED_EVENTS: "ao.v2.app.active, ao.renderer.* ,, " },
+			"0.11.2",
+			"linux",
+			dir,
+			true,
+			enabledPolicy,
+		),
+	).toBeNull();
 });
 
 test("parseDisabledEvents treats absent or blank policy as no policy", () => {
