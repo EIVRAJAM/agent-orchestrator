@@ -1086,6 +1086,165 @@ export default { resolve: { alias: { reporter: "@sentry/electron" } } };
 EOF
 check "an observability alias in a discovered vitest.config.ts (fail)" fail "$d"
 
+# --- Alias mutation propagation ----------------------------------------------
+
+d="$base/alias-mutate-require"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+const mutablePath = path;
+mutablePath.resolve = () => "@sentry/electron";
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating an alias invalidates the original require helper (fail)" fail "$d"
+
+d="$base/alias-mutate-esm"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+p.resolve = fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating an alias invalidates the original ESM helper (fail)" fail "$d"
+
+d="$base/alias-object-assign"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+const p = path;
+Object.assign(p, { resolve: fake });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "Object.assign on an alias invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-define-property-url"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as url from "node:url";
+const u = url;
+Object.defineProperty(u, "fileURLToPath", { value: fake });
+export default { resolve: { alias: { reporter: u.fileURLToPath(__dirname) } } };
+EOF
+check "Object.defineProperty on an alias invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-chain-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const a = path;
+const b = a;
+b.resolve = fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "mutating an alias chain invalidates the original helper (fail)" fail "$d"
+
+d="$base/alias-bracket-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+p["resolve"] = fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "bracket-notation mutation through an alias invalidates the helper (fail)" fail "$d"
+
+d="$base/alias-compound-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+p.resolve += fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "compound mutation through an alias invalidates the helper (fail)" fail "$d"
+
+d="$base/alias-increment-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+p.resolve++;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "increment through an alias invalidates the helper (fail)" fail "$d"
+
+d="$base/alias-delete-mutate"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+delete p.resolve;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "delete through an alias invalidates the helper (fail)" fail "$d"
+
+d="$base/alias-unmutated-esm"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const p = path;
+const a = p;
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src"), "@u2": p.resolve(__dirname, "src2"), "@u3": a.join(__dirname, "src3") } } };
+EOF
+check "unmutated ESM namespace aliases remain trusted (pass)" pass "$d"
+
+d="$base/alias-unmutated-require"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+const path = require("node:path");
+const p = path;
+export default { resolve: { alias: { "@ui": p.resolve(__dirname, "src"), "@u2": path.join(__dirname, "src2") } } };
+EOF
+check "unmutated require namespace alias remains trusted (pass)" pass "$d"
+
+# --- Assignment-operator classification --------------------------------------
+
+d="$base/compound-minus"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve -= fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a compound -= assignment is a write (fail)" fail "$d"
+
+d="$base/compound-logical-or"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve ||= fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a logical ||= assignment is a write (fail)" fail "$d"
+
+d="$base/compound-nullish"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve ??= fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a nullish ??= assignment is a write (fail)" fail "$d"
+
+d="$base/compound-bit-or"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+path.resolve |= fake;
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a bitwise |= assignment is a write (fail)" fail "$d"
+
+d="$base/comparison-not-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const expected = path;
+if (path === expected) { }
+if (path !== expected) { }
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "comparisons do not invalidate a helper (pass)" pass "$d"
+
+d="$base/arithmetic-not-write"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const value = 1;
+const other = 2;
+const sum = value + other;
+const flags = 4;
+const mask = 1;
+const bits = flags | mask;
+void sum; void bits;
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "arithmetic/bitwise operations do not invalidate a helper (pass)" pass "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

@@ -579,6 +579,11 @@ function createBindingContext(source) {
   const shadowed = new Set();
   const declared = new Set();
   const helpers = new Map();
+  // Identifier aliases (`const p = path`) that share one object, and the roots
+  // whose object was mutated. A mutation through any alias invalidates the whole
+  // shared-object component.
+  const aliasPairs = [];
+  const objectMutated = new Set();
   const isTopLevel = (node) => {
     let parent = node.parent;
     while (parent) {
@@ -604,12 +609,14 @@ function createBindingContext(source) {
     }
     ts.forEachChild(name, (child) => markNames(child, topLevel));
   };
-  // Any assignment (`=`, `+=`, `++`, `delete`, `Object.assign`, …) to a binding or
-  // to a member of it invalidates the whole binding: a mutated helper is never
-  // trusted.
-  const markMutated = (node) => {
+  // A write invalidates the target binding. A write to a *member* (or to an object
+  // through an object-level mutator) also marks the root object as mutated, so the
+  // mutation propagates to every identifier alias that shares that object.
+  const markWrite = (node, objectMutation) => {
     const root = rootIdentifierOf(node);
-    if (root) unsafe.add(root.text);
+    if (!root) return;
+    unsafe.add(root.text);
+    if (objectMutation) objectMutated.add(root.text);
   };
   const visit = (node) => {
     if (ts.isVariableDeclaration(node)) {
@@ -617,6 +624,8 @@ function createBindingContext(source) {
       const isConst = ts.isVariableDeclarationList(node.parent) && (node.parent.flags & ts.NodeFlags.Const) !== 0;
       if (topLevel && node.initializer && ts.isIdentifier(node.name)) {
         declared.add(node.name.text);
+        const initializer = unwrap(node.initializer);
+        if (initializer && ts.isIdentifier(initializer)) aliasPairs.push([node.name.text, initializer.text]);
         if (!isConst || bindings.has(node.name.text)) unsafe.add(node.name.text);
         else bindings.set(node.name.text, node.initializer);
       } else if (topLevel) {
@@ -645,21 +654,65 @@ function createBindingContext(source) {
         for (const element of named.elements) declared.add(element.name.text);
       }
     }
-    if (ts.isBinaryExpression(node)) markMutated(node.left);
-    if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) markMutated(node.operand);
-    if (ts.isDeleteExpression(node)) markMutated(node.expression);
+    if (ts.isBinaryExpression(node) && ts.isAssignmentOperator(node.operatorToken.kind)) {
+      const target = unwrap(node.left);
+      markWrite(node.left, !ts.isIdentifier(target));
+    }
+    if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+      const target = unwrap(node.operand);
+      markWrite(node.operand, !ts.isIdentifier(target));
+    }
+    if (ts.isDeleteExpression(node)) {
+      const target = unwrap(node.expression);
+      markWrite(node.expression, !ts.isIdentifier(target));
+    }
     if (ts.isCallExpression(node)) {
       const callee = callTargetName(node.expression);
       if (
         (callee === "Object.assign" || callee === "Object.defineProperty" || callee === "Reflect.set") &&
         node.arguments.length >= 1
       ) {
-        markMutated(node.arguments[0]);
+        markWrite(node.arguments[0], true);
       }
     }
     ts.forEachChild(node, visit);
   };
   visit(source);
+  // Propagate an object mutation across every identifier alias that shares the
+  // object, so `const p = path; p.resolve = fake;` invalidates `path` too. Cycles
+  // are handled by the union-find. A name that is not part of any alias keeps the
+  // invalidation added directly by markWrite.
+  const aliasParent = new Map();
+  const findRoot = (name) => {
+    let root = name;
+    while (aliasParent.has(root) && aliasParent.get(root) !== root) root = aliasParent.get(root);
+    let current = name;
+    while (aliasParent.has(current) && aliasParent.get(current) !== current) {
+      const next = aliasParent.get(current);
+      aliasParent.set(current, root);
+      current = next;
+    }
+    return root;
+  };
+  for (const [left, right] of aliasPairs) {
+    if (!aliasParent.has(left)) aliasParent.set(left, left);
+    if (!aliasParent.has(right)) aliasParent.set(right, right);
+    const leftRoot = findRoot(left);
+    const rightRoot = findRoot(right);
+    if (leftRoot !== rightRoot) aliasParent.set(leftRoot, rightRoot);
+  }
+  if (objectMutated.size > 0 && aliasParent.size > 0) {
+    const groups = new Map();
+    for (const name of aliasParent.keys()) {
+      const root = findRoot(name);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(name);
+    }
+    for (const mutated of objectMutated) {
+      if (!aliasParent.has(mutated)) continue;
+      for (const member of groups.get(findRoot(mutated)) ?? []) unsafe.add(member);
+    }
+  }
   // `require` is trusted only as the implicit CommonJS global. A local
   // declaration, shadowing, reassignment, parameter or import of `require` makes
   // every `require(...)` in the file ambiguous, so no require binding is trusted.
@@ -734,10 +787,10 @@ function helperIdentity(node, ctx, seen) {
       segments.unshift(current.name.text);
       current = current.expression;
     }
-    if (!ts.isIdentifier(current)) return null;
-    const namespace = ctx.helpers.get(current.text);
-    if (!namespace || namespace.member !== null) return null;
-    return { module: namespace.module, member: segments.join(".") };
+    // Resolve the base through the alias chain (`const p = path; p.resolve`).
+    const base = helperIdentity(current, ctx, seen);
+    if (!base || base.member !== null) return null;
+    return { module: base.module, member: segments.join(".") };
   }
   return null;
 }
@@ -751,9 +804,9 @@ function isTrustedUrlClass(node, ctx) {
     if (helper) return MODULE_URL.has(helper.module) && helper.member === "URL";
     return !ctx.declared.has("URL");
   }
-  if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.name.text === "URL") {
-    const namespace = ctx.helpers.get(node.expression.text);
-    return Boolean(namespace && namespace.member === null && MODULE_URL.has(namespace.module));
+  if (ts.isPropertyAccessExpression(node) && node.name.text === "URL") {
+    const base = helperIdentity(node.expression, ctx, new Set());
+    return Boolean(base && base.member === null && MODULE_URL.has(base.module));
   }
   return false;
 }
