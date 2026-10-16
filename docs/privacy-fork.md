@@ -65,6 +65,10 @@ flipped, so a change fails closed and loudly instead of exporting silently.
   7. `cdfdfea64` — strict static classification of alias targets
      (fail-closed on any partially literal / dynamic target), shorthand/spread/
      indirection coverage, and the full `babel-plugin-module-resolver` name.
+  8. `7a78c78f` — indirect Vite exports resolved (`export default <binding>`,
+     `defineConfig(<binding|() => obj>)`, `module.exports`, relative re-export)
+     and verified provenance for the `path`/`url` helpers and the Babel plugin
+     name.
 
 ## 3. Inventory of mechanisms
 
@@ -276,13 +280,30 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      Vite (`vite.config.{ts,js,mts,mjs,cts,cjs}` and
      `vite.<name>.config.*`), Babel (`babel.config.*`) and Metro
      (`metro.config.*`) — and inspected through the AST (not every string):
-     Vite `resolve.alias` in object and `{find, replacement}` array form, inside
-     `defineConfig(...)` or a direct export; Babel `module-resolver`
-     (`module-resolver`, `babel-plugin-module-resolver`, scoped variants);
-     Metro `resolver.extraNodeModules`. Shorthand properties, spreads, and
-     `resolve`/`alias`/`extraNodeModules` stored in a variable are handled:
-     resolved when a top-level `const` binding is fully static, rejected
+     Vite `resolve.alias` in object and `{find, replacement}` array form; Babel
+     `module-resolver` (`module-resolver`, `babel-plugin-module-resolver`,
+     scoped variants); Metro `resolver.extraNodeModules`. Shorthand properties,
+     spreads, and `resolve`/`alias`/`extraNodeModules` stored in a variable are
+     handled: resolved when a top-level `const` binding is fully static, rejected
      fail-closed otherwise. tsconfig values are checked too.
+   - **indirect Vite exports**: the exported config is resolved through a static
+     `const` binding (`export default config`), `defineConfig(<obj | binding |
+     () => obj>)`, `module.exports = <obj | () => obj>`, and a relative
+     `export { default } from "./…"` re-export (the repo's
+     `frontend/vitest.config.ts` re-exports the renderer config). A branch, an
+     arbitrary call, a mutation or anything not fully determinable is rejected
+     fail-closed, and a file with no analyzable export is reported — never a
+     silent empty list. `defineConfig` itself is matched by name (documented).
+   - **helper provenance**: `path.resolve`/`path.join`/`path.posix.*` and
+     `fileURLToPath`/`url.fileURLToPath` are treated as safe only when the callee
+     resolves, through the file's own imports/requires, to `node:path`/`path` or
+     `node:url`/`url` (default, namespace, named `as`, and
+     `const { resolve } = require("node:path")` forms). A local object/function
+     with the same name, a reassigned or locally shadowed binding, a helper
+     received as a parameter, an import from another package, or an alias
+     (`const resolve = path.resolve`) with any non-static argument is rejected
+     fail-closed. `new URL` is trusted only as the un-shadowed global or a
+     `node:url`/`url` import.
    - **strict alias-target classification** (fail-closed): a target is accepted
      only when its value is **fully determined** — a string / no-substitution
      template literal, or a recognized local construction (`path.resolve`/
@@ -293,7 +314,10 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
      interpolated template, a property access, `process.env`, a spread, or a
      destructured/reassigned binding are all rejected. A resolved path that names
      an observability package as a path segment (`node_modules/@sentry/electron`,
-     `node_modules/posthog-js`) also fails.
+     `node_modules/posthog-js`) also fails. The Babel plugin name is resolved
+     through static string bindings the same way; a reassigned/shadowed name
+     binding fails closed, while an unknown dynamic plugin name is left alone
+     (documented limit).
    - **deliberate exception**: Metro `resolver.resolveRequest` is a function, so
      only observability literals inside it are flagged; a **fully computed**
      module name there is not detected (documented gap).
@@ -334,7 +358,20 @@ by `.github/workflows/privacy-guard.yml`. It has three layers:
    literal observability target (fail); **shorthand/spread/indirection** — a
    resolvable Vite shorthand and an indirect resolvable `resolve` (pass) versus a
    dynamic shorthand (Vite/Babel/Metro), a spread inside `resolve`/`alias`, and an
-   indirect unresolvable `resolve` (fail); the **manifest-scoped dependency**
+   indirect unresolvable `resolve` (fail); **indirect Vite exports** — `export
+   default <const binding>`, `defineConfig(<binding>)`, `module.exports =
+   <binding>`, `defineConfig(() => ({…}))` and `module.exports = () => ({…})`
+   with an observability alias (fail) versus an arrow with a fully static benign
+   return and an indirect static benign config (pass), plus a dynamic/unresolvable
+   export (fail); **helper provenance** — a local `path` object or
+   `fileURLToPath` function, an alias of `path.resolve` with a dynamic argument, a
+   reassigned or shadowed helper, a helper received as a parameter, and a
+   same-named import from another package (fail) versus `import * as path from
+   "node:path"`, `const path = require("node:path")` and
+   `const { resolve: pathResolve } = require("node:path")` (pass); **Babel plugin
+   name via bindings** — short, full and scoped `module-resolver` names via a
+   binding and a reassigned binding (fail) versus a benign plugin name via a
+   binding (pass); the **manifest-scoped dependency**
    cases — each dormant dependency in its own manifest (pass), a dormant
    dependency in another manifest via `dependencies`/`devDependencies`/
    `optionalDependencies`/`peerDependencies`, a self-alias outside its manifest,
@@ -367,15 +404,18 @@ mandatory part.
 - **No static search is a guarantee.** A hand-written HTTP exporter with no SDK
   and no known marker, a module specifier computed at runtime
   (`require(name)`), a Go raw-string/URL import, a **Metro `resolver.resolveRequest`
-  that computes the module name without naming an SDK literally**, or a resolver
-  alias the scanner does not know are not detectable here; the scan showing "OK"
-  proves nothing about absence. An alias **target or map** that is not fully
-  static — including a partially literal one, an interpolated template, a
-  concatenation, a dynamic binding, a shorthand, or a spread — is *not* silently
-  accepted: it is rejected fail-closed because it cannot be proven safe. The one
-  deliberate exception is Metro `resolver.resolveRequest`, a function the repo
-  already uses, where a fully computed module name cannot be rejected without
-  breaking it.
+  that computes the module name without naming an SDK literally**, a
+  **`defineConfig`-like helper faked under that name**, a **Babel plugin whose
+  name is computed at runtime**, or a resolver alias the scanner does not know
+  are not detectable here; the scan showing "OK" proves nothing about absence. An
+  alias **target or map** that is not fully static — including a partially
+  literal one, an interpolated template, a concatenation, a dynamic binding, a
+  shorthand, or a spread — is *not* silently accepted: it is rejected
+  fail-closed because it cannot be proven safe. The same applies to a dynamic
+  Vite export and to a `path`/`url` helper whose provenance is not a real
+  `node:path`/`node:url` binding. The deliberate exception is Metro
+  `resolver.resolveRequest`, a function the repo already uses, where a fully
+  computed module name cannot be rejected without breaking it.
 - Upstream merges therefore still require **code review** and, where warranted,
   **traffic inspection**. A reintroduction that avoids the static patterns is
   not automatically caught by the current tests.
@@ -415,9 +455,10 @@ scanner, widened coverage, per-condition self-tests), `ff51dbbe5` (multiline
 import/require detection, package-name boundaries, backtick, `overrides`/
 `resolutions`), `e66d5af01` (AST-based import analysis and indirection-alias
 detection), `66e069c77` (broadened Vite/Babel/Metro resolution-config discovery
-and a manifest-scoped dependency allowlist), and `cdfdfea64` (strict
-fail-closed classification of alias targets, shorthand/spread/indirection).
-None of those commits change the daemon
+and a manifest-scoped dependency allowlist), `cdfdfea64` (strict
+fail-closed classification of alias targets, shorthand/spread/indirection), and
+`7a78c78f` (indirect Vite-export resolution and verified `path`/`url` helper
+provenance). None of those commits change the daemon
 outbound paths the run exercised (`newTelemetrySink` local-only, renderer/mobile
 init, daemon env-stamping), and the Go Sentry change made the DSN path strictly
 tighter (always blank), so the run remains relevant as **historical /
