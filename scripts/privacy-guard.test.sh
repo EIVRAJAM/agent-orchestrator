@@ -1853,6 +1853,195 @@ export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } }
 EOF
 check "an explicit argument overrides a pattern default that holds the helper (pass)" pass "$d"
 
+# --- Static `undefined` values activate defaults ------------------------------
+
+d="$base/undefined-argument"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate(helper = path) { helper.resolve = fake; }
+mutate(undefined);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an explicit undefined argument activates the default (fail)" fail "$d"
+
+d="$base/void-argument"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate(helper = path) { helper.resolve = fake; }
+mutate(void 0);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a void argument activates the default (fail)" fail "$d"
+
+d="$base/undefined-object-property"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate({ helper = path }) { helper.resolve = fake; }
+mutate({ helper: undefined });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an undefined object property activates the pattern default (fail)" fail "$d"
+
+d="$base/undefined-array-element"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate([helper = path]) { helper.resolve = fake; }
+mutate([undefined]);
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an undefined array element activates the pattern default (fail)" fail "$d"
+
+d="$base/undefined-nested"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate({ a: { helper = path } }) { helper.resolve = fake; }
+mutate({ a: { helper: undefined } });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an undefined value in a nested pattern activates its default (fail)" fail "$d"
+
+d="$base/undefined-shadowed"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+const undefined = local;
+function mutate(helper = path) { helper.resolve = fake; }
+mutate(undefined);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a shadowed undefined is not the global and does not activate the default (pass)" pass "$d"
+
+d="$base/undefined-explicit-argument"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate(helper = path) { helper.resolve = fake; }
+mutate(local);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an explicit independent argument overrides the default (pass)" pass "$d"
+
+d="$base/undefined-explicit-property"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate({ helper = path }) { helper.resolve = fake; }
+mutate({ helper: local });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an explicit independent object property overrides the pattern default (pass)" pass "$d"
+
+d="$base/undefined-explicit-element"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate([helper = path]) { helper.resolve = fake; }
+mutate([local]);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "an explicit independent array element overrides the pattern default (pass)" pass "$d"
+
+d="$base/undefined-read-only"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate(helper = path) { return helper.resolve; }
+mutate(undefined);
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a defaulted parameter that is only read leaves the default trusted (pass)" pass "$d"
+
+# --- Duplicate object keys ----------------------------------------------------
+
+d="$base/duplicate-key-last-path"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper: local, helper: path });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a duplicate key uses the last definition, which holds the helper (fail)" fail "$d"
+
+d="$base/duplicate-key-shorthand-last"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+const helper = path;
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper: local, helper });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a trailing shorthand duplicate resolves to the helper alias (fail)" fail "$d"
+
+d="$base/duplicate-key-string"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper: local, "helper": path });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "an identifier key and an equivalent string key are the same key (fail)" fail "$d"
+
+d="$base/duplicate-key-ambiguous-last"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper: path, helper() {} });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a later ambiguous definition overrides the helper, so it is distrusted (fail)" fail "$d"
+
+d="$base/duplicate-key-getter"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ get helper() { return path; } });
+export default { resolve: { alias: { reporter: path.resolve(__dirname, "src") } } };
+EOF
+check "a getter that collides with the required key is distrusted (fail)" fail "$d"
+
+d="$base/duplicate-key-last-independent"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper: path, helper: local });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a duplicate key whose last definition is independent leaves the helper trusted (pass)" pass "$d"
+
+d="$base/duplicate-key-middle-path"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper: local, helper: path, helper: local });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a helper in the middle of duplicates is overridden by an independent last value (pass)" pass "$d"
+
+d="$base/duplicate-key-distinct"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+function mutate({ a }) { a.resolve = fake; }
+mutate({ a: local, b: path });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "distinct keys do not collide, so the helper stays trusted (pass)" pass "$d"
+
+d="$base/duplicate-key-shorthand-independent"; make_fixture "$d"
+put "$d/frontend/vite.config.ts" <<'EOF'
+import * as path from "node:path";
+const local = { resolve: 1 };
+const helper = local;
+function mutate({ helper }) { helper.resolve = fake; }
+mutate({ helper });
+export default { resolve: { alias: { "@ui": path.resolve(__dirname, "src") } } };
+EOF
+check "a shorthand duplicate resolves to the independent value (pass)" pass "$d"
+
 if [[ "$failures" -eq 0 ]]; then
   printf 'privacy-guard self-tests: OK\n'
   exit 0

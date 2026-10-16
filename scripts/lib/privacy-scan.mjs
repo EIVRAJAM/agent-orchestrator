@@ -634,8 +634,14 @@ function collectPatternNames(pattern, out = []) {
 // or function expression, plus simple alias chains), a call relates its arguments
 // to parameters by identity, default and destructuring: a mutated parameter
 // binding invalidates the argument it was bound to — a positional argument, the
-// parameter's default initializer when the argument is absent, or the matching
-// property/element of an object/array pattern. Mutations are propagated even when
+// parameter's default initializer when the argument is absent *or statically
+// `undefined`* (the global `undefined` or any `void …`, unless shadowed), or the
+// matching property/element of an object/array pattern (also falling back to the
+// pattern default when the value is statically `undefined`). A duplicate object
+// key resolves to its last definition, matching equivalent identifier/string/
+// numeric keys; a spread, computed key, method or accessor that could define the
+// key makes the resolution ambiguous, and a mutated ambiguous binding fails
+// closed by distrusting every helper seed. Mutations are propagated even when
 // a function is not proven to run (conservative); an alias that is never written
 // invalidates nothing.
 function createBindingContext(source) {
@@ -950,24 +956,57 @@ function createBindingContext(source) {
     if (ts.isIdentifier(target) || ts.isStringLiteral(target) || ts.isNumericLiteral(target)) return target.text;
     return null;
   };
-  // A spread or a computed key makes an object literal unmatchable by key.
-  const hasAmbiguousKeys = (literal) =>
-    literal.properties.some(
-      (property) => ts.isSpreadAssignment(property) || (property.name && ts.isComputedPropertyName(property.name)),
-    );
-  const objectPropertyValue = (literal, key) => {
+  // A value that is statically `undefined`: any `void …`, or the un-shadowed
+  // global `undefined` (a local binding of that name resolves to a declaration).
+  const isStaticUndefined = (expression) => {
+    const node = unwrap(expression);
+    if (!node) return false;
+    if (ts.isVoidExpression(node)) return true;
+    if (ts.isIdentifier(node) && node.text === "undefined") return resolve(node) === null;
+    return false;
+  };
+  // Effective value of `key` in an object literal, in property order: the last
+  // definition wins, equivalent keys (identifier/string/numeric) match, and a
+  // spread, computed key, method or accessor that could define `key` makes the
+  // resolution ambiguous rather than silently permissive.
+  const AMBIGUOUS = Symbol("ambiguous");
+  const resolveObjectKey = (literal, key) => {
+    let found = false;
+    let value = null;
+    let ambiguous = false;
     for (const property of literal.properties) {
-      if (ts.isPropertyAssignment(property) && staticKeyOf(property.name) === key) return property.initializer;
-      if (ts.isShorthandPropertyAssignment(property) && staticKeyOf(property.name) === key) return property.name;
+      if (ts.isSpreadAssignment(property)) {
+        ambiguous = true;
+        continue;
+      }
+      const propertyKey = staticKeyOf(property.name);
+      if (propertyKey === null) {
+        ambiguous = true;
+        continue;
+      }
+      if (propertyKey !== key) continue;
+      if (ts.isPropertyAssignment(property)) {
+        found = true;
+        value = property.initializer;
+        ambiguous = false;
+      } else if (ts.isShorthandPropertyAssignment(property)) {
+        found = true;
+        value = property.name;
+        ambiguous = false;
+      } else {
+        found = true;
+        value = null;
+        ambiguous = true;
+      }
     }
-    return null;
+    return { found, value, ambiguous };
   };
   const applyCall = (call) => {
     const fn = functionOf.get(resolve(call.expression));
     if (!fn) return false;
     const parameterBindings = new Set();
     for (const parameter of fn.parameters) for (const name of collectPatternNames(parameter.name)) parameterBindings.add(name);
-    const bindingSources = new Map(); // binding decl -> source decl (or null)
+    const bindingSources = new Map(); // binding decl -> source decl | AMBIGUOUS | null
     // Follow one level of a literal initializer (`const o = { h: path }; f(o)`)
     // but never follow a reassigned, mutable or mutated binding.
     const literalOf = (expression) => {
@@ -991,6 +1030,12 @@ function createBindingContext(source) {
       if (decl && parameterBindings.has(decl)) return bindingSources.get(decl) ?? null;
       return decl;
     };
+    // An explicit value that is not statically `undefined` wins; otherwise the
+    // binding's own default applies.
+    const effectiveValue = (explicit, fallback) => {
+      if (explicit && !isStaticUndefined(explicit)) return explicit;
+      return fallback ?? null;
+    };
     const bindPattern = (pattern, value) => {
       if (ts.isIdentifier(pattern)) {
         bindingSources.set(pattern, value ? sourceOf(value) : null);
@@ -998,7 +1043,7 @@ function createBindingContext(source) {
       }
       if (ts.isObjectBindingPattern(pattern)) {
         const literal = value ? literalOf(value) : null;
-        if (!literal || !ts.isObjectLiteralExpression(literal) || hasAmbiguousKeys(literal)) {
+        if (!literal || !ts.isObjectLiteralExpression(literal)) {
           for (const name of collectPatternNames(pattern)) if (!bindingSources.has(name)) bindingSources.set(name, null);
           return;
         }
@@ -1010,8 +1055,17 @@ function createBindingContext(source) {
             continue;
           }
           const key = staticKeyOf(element.propertyName ?? element.name);
-          const property = key === null ? null : objectPropertyValue(literal, key);
-          bindPattern(element.name, property ?? element.initializer ?? null);
+          if (key === null) {
+            for (const name of collectPatternNames(element.name)) if (!bindingSources.has(name)) bindingSources.set(name, null);
+            continue;
+          }
+          const property = resolveObjectKey(literal, key);
+          if (property.ambiguous) {
+            for (const name of collectPatternNames(element.name)) bindingSources.set(name, AMBIGUOUS);
+            continue;
+          }
+          const explicit = property.found ? property.value : null;
+          bindPattern(element.name, effectiveValue(explicit, element.initializer));
         }
         return;
       }
@@ -1030,7 +1084,8 @@ function createBindingContext(source) {
             continue;
           }
           const source = literal.elements[index];
-          bindPattern(element.name, source && !ts.isOmittedExpression(source) ? source : (element.initializer ?? null));
+          const explicit = source && !ts.isOmittedExpression(source) ? source : null;
+          bindPattern(element.name, effectiveValue(explicit, element.initializer));
         }
         return;
       }
@@ -1046,11 +1101,18 @@ function createBindingContext(source) {
           }
           break;
         }
-        bindPattern(parameter.name, call.arguments[index] ?? parameter.initializer ?? null);
+        bindPattern(parameter.name, effectiveValue(call.arguments[index], parameter.initializer));
       }
     }
     for (const [binding, source] of bindingSources) {
-      if (source && isMutated(binding)) changed = addMutated(source) || changed;
+      if (!isMutated(binding)) continue;
+      if (source === AMBIGUOUS) {
+        // A mutated binding whose value cannot be resolved could be the helper:
+        // fail closed by distrusting every helper seed rather than assuming none.
+        for (const decl of helperSeeds.keys()) changed = addMutated(decl) || changed;
+      } else if (source) {
+        changed = addMutated(source) || changed;
+      }
     }
     return changed;
   };
