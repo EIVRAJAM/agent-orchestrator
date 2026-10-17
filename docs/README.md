@@ -34,6 +34,7 @@ in [gemini-cli.md](gemini-cli.md).
 | [stack.md](stack.md)                                   | Accepted library/runtime choices, pending stack decisions, and dependencies explicitly avoided for V1.                |
 | [telemetry.md](telemetry.md)                           | User-facing overview of product telemetry, privacy safeguards, and opt-out controls.                                    |
 | [privacy-fork.md](privacy-fork.md)                     | This fork's policy: AO's own external telemetry/diagnostics disabled by construction, with verification and sync procedure. |
+| [privacy-fork-release.md](privacy-fork-release.md)     | Fork-only Linux release conductor, Sigstore provenance, draft workflow, verification, and native-signing limits.       |
 | [privacy-fork-traffic-report.md](privacy-fork-traffic-report.md) | Controlled daemon-run traffic observation for the fork policy, with scope and limits.                          |
 | [posthog-cost-controls.md](posthog-cost-controls.md)   | PostHog event-name migration, ingestion drop rules, and dashboard queries for reducing telemetry spend.              |
 

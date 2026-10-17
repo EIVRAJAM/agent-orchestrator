@@ -1,0 +1,28 @@
+name: Fork release tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "scripts/prepare-fork-linux-release.mjs"
+      - "scripts/prepare-fork-linux-release.test.mjs"
+      - ".github/workflows/fork-linux-release.yml"
+      - ".github/workflows/fork-release-tests.yml"
+      - "package.json"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Check assembler syntax
+        run: node --check scripts/prepare-fork-linux-release.mjs
+      - name: Run fail-closed release tests
+        run: npm run release:linux:test

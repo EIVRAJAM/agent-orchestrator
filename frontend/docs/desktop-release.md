@@ -1,5 +1,12 @@
 # Desktop release architecture
 
+> **Privacy fork:** `EIVRAJAM/agent-orchestrator` has a fork-specific, Linux-only
+> draft conductor documented in
+> [`docs/privacy-fork-release.md`](../../docs/privacy-fork-release.md). It stages
+> Sigstore-attested prereleases and never publishes them automatically. The
+> upstream private-conductor policy below remains the architectural reference;
+> it does not supply releases or credentials for this fork.
+
 Canonical desktop releases are conducted from the private
 `Untrivial-ai/ao-releases` repository. That conductor is the only system allowed
 to publish stable, nightly, or preview releases. The public
