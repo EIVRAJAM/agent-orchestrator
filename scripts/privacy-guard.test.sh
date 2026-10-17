@@ -57,7 +57,12 @@ put() { # dir-relative path, then stdin content
 }
 
 run_guard() { # dir -> exit code
-  PRIVACY_GUARD_ROOT="$1" PRIVACY_GUARD_STATIC_ONLY=1 bash "$guard" >/dev/null 2>&1
+  # GitHub Actions exports CI=true, while fixture runs intentionally exercise
+  # the guard's local-only static mode. Remove CI only for this nested harness;
+  # the workflow's subsequent full guard invocation still inherits CI=true and
+  # therefore continues to reject every PRIVACY_GUARD_SKIP_* / STATIC_ONLY
+  # bypass.
+  env -u CI PRIVACY_GUARD_ROOT="$1" PRIVACY_GUARD_STATIC_ONLY=1 bash "$guard" >/dev/null 2>&1
   printf '%s' "$?"
 }
 
