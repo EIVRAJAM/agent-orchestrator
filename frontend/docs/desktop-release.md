@@ -1,9 +1,10 @@
 # Desktop release architecture
 
 > **Privacy fork:** `EIVRAJAM/agent-orchestrator` has a fork-specific, Linux-only
-> draft conductor documented in
-> [`docs/privacy-fork-release.md`](../../docs/privacy-fork-release.md). It stages
-> Sigstore-attested prereleases and never publishes them automatically. The
+> candidate handoff documented in
+> [`docs/privacy-fork-release.md`](../../docs/privacy-fork-release.md). It
+> produces Sigstore-attested workflow artifacts for a separate private
+> conductor and cannot mutate releases or tags. The
 > upstream private-conductor policy below remains the architectural reference;
 > it does not supply releases or credentials for this fork.
 

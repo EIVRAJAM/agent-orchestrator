@@ -1,11 +1,17 @@
-name: Fork Linux release conductor
+name: Fork Linux signed candidate
 
-# The sole release conductor for the EIVRAJAM privacy fork. It consumes a
+# Public, non-publishing handoff for the EIVRAJAM privacy fork. It consumes a
 # successful, pinned Desktop build artifacts run, verifies its digest handoff,
 # prepares Linux packages and updater metadata, signs their provenance through
-# GitHub's Sigstore-backed artifact attestations, and stages a draft prerelease.
-# It never publishes the draft. macOS and Windows stay out until native signing
-# credentials and platform verification are configured.
+# GitHub's Sigstore-backed artifact attestations, and uploads a short-lived
+# signed candidate for the private conductor. It cannot create releases or
+# tags. macOS and Windows stay out until native signing credentials and platform
+# verification are configured.
+#
+# The Sigstore attestation proves provenance of these exact bytes; it is NOT a
+# native apt/rpm repository signature, Authenticode signature, or Apple
+# Developer ID/notarization. Those require separate external credentials and are
+# out of scope here.
 on:
   workflow_dispatch:
     inputs:
@@ -27,29 +33,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  stage-draft:
+  signed-candidate:
     if: github.repository == 'EIVRAJAM/agent-orchestrator'
     runs-on: ubuntu-latest
-    environment: fork-release
     permissions:
       actions: read
       attestations: write
       artifact-metadata: write
-      contents: write
+      contents: read
       id-token: write
     steps:
-      - name: Require the fork owner as conductor
+      - name: Require the fork owner as candidate operator
         shell: bash
         run: |
           set -euo pipefail
           if [ "$GITHUB_ACTOR" != "$GITHUB_REPOSITORY_OWNER" ]; then
-            echo "::error::Only the repository owner may conduct a fork release." >&2
+            echo "::error::Only the repository owner may prepare a fork candidate." >&2
             exit 1
           fi
 
       - uses: actions/checkout@v4
         with:
-          # Run the conductor code from trusted main. The validation below
+          # Run the candidate assembly code from trusted main. The validation below
           # requires the requested source SHA to be this exact commit.
           ref: main
           persist-credentials: false
@@ -168,31 +173,3 @@ jobs:
           path: release/*
           if-no-files-found: error
           retention-days: 30
-
-      - name: Stage draft prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          VERSION: ${{ inputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > release-notes.md <<EOF
-          Linux privacy-fork candidate built from \`$SOURCE_SHA\`.
-
-          This draft contains an AppImage, deb and rpm plus updater metadata.
-          The exact bytes listed in \`SHA256SUMS\` have a GitHub artifact
-          attestation backed by Sigstore; \`provenance.sigstore.json\` is the
-          portable attestation bundle. The packages do not have native deb/rpm
-          repository signatures. macOS and Windows are intentionally absent
-          until their native signing credentials and platform checks exist.
-
-          Build run: https://github.com/$GITHUB_REPOSITORY/actions/runs/${{ inputs.build_run_id }}
-          EOF
-          gh release create "v$VERSION" release/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_SHA" \
-            --title "Agent Orchestrator $VERSION" \
-            --notes-file release-notes.md \
-            --draft \
-            --prerelease
