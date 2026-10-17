@@ -618,21 +618,31 @@ release target, or dependencies changes: `backend/**`, `frontend/**`,
 **Implemented:** the policy and composition changes in §5, the release-target
 authority in §6, and the guard/scanner/self-tests/workflow in §7.
 
-**Verified by automated tests on the current commit** (all green in this
-environment):
+**Verified by automated tests on the current commit:**
 
 - Go: `go build ./...`; `gofmt`/`go vet` clean; `golangci-lint v2.13.2` on the
-  touched packages reports 0 issues; `go test ./internal/daemon/...` passes;
-  the privacy tests assert the local-only sink, the blank Sentry DSN, and the
-  closed policy assertion.
+  touched packages reports 0 issues; the privacy tests assert the local-only
+  sink, the blank Sentry DSN, and the closed policy assertion.
+- **Full Go suite** `go test -race -count=1 -timeout=20m ./...`: 192 packages
+  pass; 9 packages fail **identically on the base `7dceb0ec7`** — the Codex
+  secure-credential tests (`internal/service/agent`), the opencode adapters
+  (`agent/{fake,modelcatalog,opencode,opencodev2}`, `reviewer/opencodev2`),
+  `gitworktree`, `internal/integration`, and `internal/storage/sqlite` (which
+  exceeds the `-race` timeout in this container — it timed out at 24m on **both**
+  the branch and the base — but passes without `-race` in ~52s for all 107
+  tests). These are pre-existing/environment-sensitive, not branch regressions.
 - Frontend: `npm run typecheck` passes (needs
   `NODE_OPTIONS=--max-old-space-size=4096` in this memory-constrained container;
-  the default heap is OOM-killed); the privacy/release-target tests pass.
-- Mobile: `npm run typecheck` passes; the mobile privacy tests pass.
-- Guard: `scripts/privacy-guard.test.sh` passes (clean tree passes; the
-  single-condition reintroductions — including the multiline, alias, and
-  package-boundary cases — fail with the expected non-zero exit code);
-  `scripts/privacy-guard.sh` returns OK end-to-end.
+  the default heap is OOM-killed); **full `vitest run`** → 8056 pass / 6 fail
+  across 4 files (`ChatWorkspace`, `ContextMeter`, `AgentModelCombobox`,
+  `BillingSection`), all **reproduced identically on the base** (locale/`Intl`).
+- Mobile: `npm run typecheck` passes; **full `vitest run`** → 1912 pass / 1 fail
+  (`conversationChrome`, locale), reproduced on base.
+- Guard: `scripts/privacy-guard.test.sh` passes (236 cases); `scripts/privacy-guard.sh`
+  returns OK end-to-end, including `CI=true`; the CI-bypass env vars exit 2.
+- Reproducible workflow commands run directly (no container runtime here):
+  `e2e-gate-tests` (17/17), `version-floor-guard`, `pricing-catalog-validate`
+  (`valid`).
 
 **Historical / comparative execution evidence (NOT the current HEAD):** the
 controlled daemon-run traffic observation
@@ -709,10 +719,13 @@ not from the historical `6bfdccd2d` run.
 | --- | --- | --- |
 | Daemon Go (local-only telemetry sink, blank Sentry DSN) | I, VS, VT, VD | `newTelemetrySink`/`newDaemonSentryConfig` + `go test ./internal/daemon/...`, guard; live run hit **zero** canary requests |
 | Electron main + renderer (PostHog/Sentry off) | I, VS, VT, VD | `initTelemetry`/`initMainSentry` + vitest privacy tests; real dev + packaged app, zero canary requests, no install id |
-| Mobile app (PostHog/Sentry off) | I, VS, VT | `fork-privacy.ts` + mobile vitest privacy tests; **runtime P** (no simulator/Expo) |
-| PostHog (renderer, daemon, mobile) | I, VS, VT, VD | composition tests + guard; no client built; zero canary requests |
-| Sentry (daemon, main, renderer, mobile) | I, VS, VT, VD | composition tests; `sentryobs.Enabled()` false with a DSN present; zero canary requests |
-| Environment variables cannot re-enable export | I, VS, VT, VD | gate/tests for `AO_TELEMETRY_*`, `AO_SENTRY_DSN`, `VITE_AO_*`, `EXPO_PUBLIC_*`; export "enabled" by env produced no request |
+| Mobile app (PostHog/Sentry off) | I, VS, VT | `fork-privacy.ts` + mobile vitest tests (full mobile suite: 1912 pass / 1 pre-existing locale failure, reproduced on base); **runtime P** (no simulator/Expo) |
+| PostHog — renderer/daemon | I, VS, VT, VD | composition tests + guard; no client built; zero canary requests |
+| PostHog — mobile | I, VS, VT | `MOBILE_EXTERNAL_TELEMETRY_EXPORT_ALLOWED=false` + mobile tests; **no Expo runtime P** |
+| Sentry — daemon/main/renderer | I, VS, VT, VD | composition tests; `sentryobs.Enabled()` false with a DSN present; zero canary requests |
+| Sentry — mobile | I, VS, VT | `MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED=false` + mobile tests; **no Expo runtime P** |
+| Environment variables — desktop/daemon | I, VS, VT, VD | `AO_TELEMETRY_*`, `AO_SENTRY_DSN`, `VITE_AO_*`; export "enabled" by env produced no request |
+| Environment variables — mobile (`EXPO_PUBLIC_*`) | I, VS, VT | mobile policy/composition tests; **no Expo runtime** to exercise them live |
 | Internal events and local logs preserved | I, VS, VT, VD | daemon local SQLite sink test; run recorded `ao.daemon.started` etc.; `change_log`/`conversation_provider_events` |
 | Updater + authorized release target | I, VS, VT, VD | `release-target.ts` tests + guard; packaged `app-update.yml` → `EIVRAJAM/agent-orchestrator`, version floor → fork, upstream/unauthorized/malformed rejected at runtime. **Signing/install/effective download P** |
 | Privacy guard + CI | I, VS, VT, VD | `privacy-guard.test.sh` (236 fixtures), `privacy-guard.sh` incl. `CI=true`; bypasses exit 2. **Remote CI P** |

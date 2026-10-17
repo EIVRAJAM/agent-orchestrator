@@ -210,6 +210,56 @@ supersedes the run above for evidence purposes.
   Chromium cache are the app's own modules served by the Vite dev server
   (`localhost:5173/src/...`), not responses from an observability endpoint.
 
+### KWallet / secure storage (exact behaviour)
+
+- On the first dev run (default password store), Chromium/Electron raised a
+  **`kdewallet` (KWallet) access request** ("La aplicación … ha solicitado abrir
+  la cartera «kdewallet»"). This is the OS keychain, **not telemetry and not
+  PostHog/Sentry**.
+- **No password was entered and the request was not granted.** No input-injection
+  tool was available (no `xdotool`/root) and the prompt was left unanswered; it
+  was neither satisfied nor explicitly cancelled by entering a password.
+- With `--password-store=basic` (the task's prescribed flag) **no KWallet prompt
+  appeared**, and a probe using the same Electron build (33.4.11) reported
+  `safeStorage.getSelectedStorageBackend()` → **`basic_text`** and
+  `safeStorage.isEncryptionAvailable()` → **`false`**. Without the flag the probe
+  reported **`kwallet6`** with `isEncryptionAvailable()` → **`false`**.
+- Because encryption is unavailable, the app's `cloud-auth.ts` refuses to persist
+  the cloud auth token (`if (!safeStorage.isEncryptionAvailable()) return false`).
+  **Persistent cloud authentication was therefore NOT validated with secure
+  storage.**
+- **Credential isolation is not fully proven**: what happened to the wallet after
+  the unanswered prompt was not observable without the wallet password. This is
+  recorded as a limit, not as a pass.
+
+### Network inspection without root (Chromium NetLog)
+
+Because `tcpdump`/`strace`/`tshark`/root are unavailable, both the dev app and the
+extracted `.deb` were re-run with Chromium's own network log:
+
+```
+--log-net-log=/tmp/ao-privacy-netlog.json --net-log-capture-mode=Everything
+```
+
+The NetLog can contain URLs, cookies and headers; only hosts, ports and event
+types were extracted — the file is **not** committed and not reproduced here.
+
+- **Dev app URL hosts:** `http://localhost:5173` (Vite modules, 6040 requests),
+  `http://127.0.0.1:13006` (daemon, 401), `https://redirector.gvt1.com` (4),
+  `https://rr2---sn-0ox-jubl.gvt1.com` (2). **No PostHog/Sentry host.**
+- **Dev app socket peers:** `[2800:e0:c79::d]:443` (resolved by the NetLog to
+  `rr2.sn-0ox-jubl.gvt1.com`, Google `gvt1.com` CDN), `[2001:4860:4860::8888]:443`
+  (Google DNS), `[::1]:5173` (Vite), `127.0.0.1:13006` (daemon),
+  `100.100.100.100:53` (Tailscale DNS), `[2607:f8b0:…]:443` (Google).
+- **The `posthog`/`sentry` strings in the NetLog are Vite module paths**
+  (`/src/shared/posthog-config.ts`, `/src/renderer/lib/sentry.ts`), not request
+  hosts.
+- **Extracted `.deb` URL hosts:** `http://127.0.0.1:13007` (daemon),
+  `redirector.gvt1.com`, `rr2---sn-0ox-jubl.gvt1.com`; same socket peers;
+  **no PostHog/Sentry host**.
+- **Scope:** the NetLog materially improves Chromium-level observation (it named
+  the previously unknown IPv6) but it is still **not** a full system capture.
+
 ### Packaged artifact result
 
 - `electron-forge make` produced a local **deb**
@@ -228,6 +278,36 @@ supersedes the run above for evidence purposes.
 - The packaged app booted (screenshot), loaded its renderer, and made **no**
   PostHog/Sentry request.
 
+### Extracted `.deb` (no root)
+
+- `dpkg-deb -x <artifact>.deb /tmp/ao-deb-extracted` extracted the tree without
+  root (no `dpkg -i`). SHA-256 of the local `.deb`:
+  `f4b062cea5d252ba7cd30446f9c11cf19ac583cca202408bd7a198f2aaa29f65`.
+- `usr/lib/agent-orchestrator/resources/app-update.yml` → `owner: EIVRAJAM`,
+  `repo: agent-orchestrator`; the deb control `Homepage` is
+  `https://github.com/aoagents/agent-orchestrator` (a metadata link, not the
+  updater feed).
+- The extracted binary was run with `HOME`/`AO_DATA_DIR` under `/tmp`, the
+  canaries, `--password-store=basic` and a NetLog: it booted, loaded its
+  renderer, added a lab project, and made **no** PostHog/Sentry request.
+- **Installation via `dpkg -i` remains pending** (no root); only extraction and
+  direct execution were validated.
+
+### Codex chat with a compatible, isolated version
+
+- The daemon had resolved `~/.local/bin/codex` (0.144.5), below AO's tested
+  minimum 0.146.0. A compatible **0.160.0** was already present at
+  `~/.nvm/versions/node/v24.21.0/bin/codex`; no install or user config change was
+  needed. A standalone lab daemon was run with that bin first on `PATH`, and AO
+  resolved `codex` to the 0.160.0 binary.
+- A **chat** session then provisioned successfully: worktree created, the prompt
+  answered ("READY"), provider events
+  (`turn.started` → `message.delta` → `message.completed` → `usage` →
+  `turn.completed`), and a clean stop that removed the worktree.
+- The agent's traffic is Codex's own service (agent provider); no AO telemetry.
+- AO's separate Codex **account store** reported `account_storage_unsafe` in the
+  lab data dir (a secure-file permission guard); it did not block the session.
+
 ### Host classification
 
 | Host | Port | Classification |
@@ -238,19 +318,99 @@ supersedes the run above for evidence purposes.
 | `github.com` / `api.github.com` | 443 | Functional (GitHub auth/PR) |
 | `opencode.ai` | 443 | Agent service (OpenCode) |
 | `*.googleapis.com` / `*.gstatic.com` / `*.gvt1.com` (Chromium network service) | 443 | Chromium/OS (component updates, safe browsing); not AO |
+| `2800:e0:c79::d` (Chromium network service) | 443 | **Unidentified by socket inspection alone; the NetLog re-run resolved it to `rr2.sn-0ox-jubl.gvt1.com` / `redirector.gvt1.com` (Google `gvt1.com` CDN).** It did not match known PostHog/Sentry destinations and produced no canary request |
 | daemon loopback, agent local APIs, Vite dev server | various | Loopback / local |
 | **`us.i.posthog.com` / `*.ingest.sentry.io`** | — | **None observed** |
+
+### Functional connections review
+
+- `raw.githubusercontent.com` — the pricing catalog (`internal/pricing/fetch.go`,
+  `RemoteManifestURL`). It currently points at **upstream**
+  `Untrivial-ai/agent-orchestrator`. It is a read-only GET of a public manifest
+  with no user data. **Recommendation:** consider repointing it at the fork (or a
+  build-time override) to remove the operational dependency on upstream.
+  **Impact:** low privacy impact, moderate operational impact; it is a separate
+  change and was **not** made here.
+- `registry.npmjs.org` — installed-harness version checks
+  (`systeminstall/manager_versions.go`); disabled with `AO_HARNESS_UPDATE_CHECKS=off`.
+- `chatgpt.com` — Codex install-plan URL (`systeminstall/agentplans.go`).
+- `github.com` / `api.github.com` — GitHub auth/PR client (functional).
+- `opencode.ai` and Codex's `chatgpt.com` — agent-provider traffic (out of scope).
+- Chromium services (`gvt1.com`, `googleapis.com`, Google DNS, Tailscale DNS) —
+  browser/OS, not AO.
+- **Documentary/UI links (not telemetry):** the Home page "Star Us" link points at
+  upstream (`HomePage.tsx`), and the `.deb` `Homepage` metadata is
+  `https://github.com/aoagents/agent-orchestrator`. Both are static links, not
+  requests. **Recommendation:** repoint them at the fork in a separate task.
 
 ### Limits (re-run)
 
 - Still no full packet capture (no `tcpdump`/`strace`/root): the method is
   destination canary + socket inspection + CONNECT-proxy naming.
-- One Chromium network-service peer IPv6 (`2800:e0:c79::d`) was not resolved to a
-  name; it is not a known observability endpoint and produced no canary hit.
+- One Chromium network-service peer IPv6 (`2800:e0:c79::d`) was not resolvable by
+  reverse DNS or socket inspection; the NetLog re-run resolved it to
+  `rr2.sn-0ox-jubl.gvt1.com` / `redirector.gvt1.com` (Google `gvt1.com` CDN). It is
+  not a known PostHog/Sentry destination and produced no canary request.
 - **Signing, notarization, install and the effective updater download were not
   performed** (no root for `dpkg -i`, no published release, macOS unavailable).
-- **rpm/AppImage and all macOS artifacts were not built** (missing tooling).
-- **`agent-ci run --all` was not run** (Docker absent). **Mobile runtime was not
-  run** (no simulator/device; Expo deps absent) — mobile evidence remains the
-  code constants and the automated tests. **Codex chat mode** is blocked by the
-  installed Codex version (< AO's minimum); Codex TUI was exercised instead.
+- **rpm/AppImage and all macOS/Windows artifacts were not built** (missing
+  tooling / other platforms).
+- **`agent-ci run --all` was not run**: no Docker, Podman, rootless runtime or
+  Docker socket is present.
+- **Mobile runtime was not run**: no simulator/device, and Expo **web** is blocked
+  because the package lacks `react-dom`/`react-native-web` (`expo export
+  --platform web` refuses without them). Mobile evidence remains the code
+  constants and the full mobile test suite (1912 pass / 1 pre-existing locale
+  failure, reproduced on base).
+- **Codex chat** now runs (a compatible 0.160.0 was already on the machine); the
+  separate Codex account-store feature reports `account_storage_unsafe` in the
+  lab data dir.
+
+### Platform matrix (for future CI / release jobs)
+
+| Platform / artifact | Status here | Official command / job |
+| --- | --- | --- |
+| Linux `.deb` (unsigned) | Built, extracted, run | `npm run make` (`build-artifacts.yml`) |
+| Linux AppImage | **Blocked** (no `appimagetool`/`mksquashfs`) | `npm run make` |
+| Linux rpm | **Blocked** (no `rpmbuild`) | `npm run make` |
+| macOS `.zip` + `.dmg` | **Not run** (Linux only) | `npm run make` on macOS; verify with `frontend/scripts/verify-mac-artifact.sh` |
+| macOS sign / notarize / staple | **Not run** | release workflow (`build-artifacts.yml`) |
+| Windows installer (NSIS) | **Not run** | `npm run make` on Windows |
+| Android / iOS | **Blocked** (no device/emulator; Expo web needs web deps) | `npm run android` / `npm run ios` |
+| `agent-ci run --all` | **Blocked** (no container runtime) | `npx @redwoodjs/agent-ci run --all` |
+| Full privileged capture | **Blocked** (no `tcpdump`/`strace`/root) | n/a |
+
+### CI and full test suites
+
+`agent-ci run --all` cannot run here (no Docker/Podman/rootless runtime and no
+Docker socket). The reproducible workflow commands were run directly:
+
+- **Go** (`go.yml`): `gofmt` clean; `go build ./...` and `go vet ./...` pass;
+  `go test -race -count=1 -timeout=20m ./...` → 192 packages pass, **9 fail
+  identically on the base `7dceb0ec7`** (reproduced in an isolated base worktree),
+  so they are pre-existing/environment-sensitive, not branch regressions:
+  `internal/adapters/agent/{fake,modelcatalog,opencode,opencodev2}`,
+  `internal/adapters/reviewer/opencodev2`,
+  `internal/adapters/workspace/gitworktree`, `internal/integration`,
+  `internal/service/agent` (the Codex secure-credential/account-store tests), and
+  `internal/storage/sqlite` (exceeds the `-race` timeout in this container — it
+  timed out at 24m on **both** the branch and the base; the same package passes
+  **without** `-race` in ~52s for all 107 tests, and the individual test passes
+  under `-race`).
+- **Frontend** (`frontend.yml`): `npm run typecheck` passes; `node --test
+  scripts/*.node-test.mjs` pass; `vitest run` → **8056 pass / 6 fail** across 4
+  files (`ChatWorkspace`, `ContextMeter`, `AgentModelCombobox`, `BillingSection`),
+  all **reproduced identically on the base** (locale/`Intl` formatting).
+  (`browser-profile-import.test.ts` fails only when the packaging step has rebuilt
+  `better-sqlite3` for the bundled Node 20 ABI; with the Node 24 binary restored
+  it passes 47/47 — a lab artifact, not a regression.)
+- **Mobile** (`mobile.yml`): `npm run typecheck` passes; `vitest run` → 1912 pass
+  / 1 fail (`conversationChrome`, locale), reproduced on base.
+- **e2e-gate-tests**: `node --test scripts/ao-e2e-pod-gate.test.mjs` → 17/17.
+- **version-floor-guard**: JSON structure valid; `downloadUrl` → the fork.
+- **pricing-catalog-validate**: `go test ./cmd/pricingcatalog
+  ./internal/pricing/catalogsync` passes; `go run ./cmd/pricingcatalog validate
+  -root ..` → `valid`.
+- **privacy-guard.yml**: `privacy-guard.sh` incl. `CI=true` passes; the CI-bypass
+  env vars (`PRIVACY_GUARD_SKIP_GO`, `PRIVACY_GUARD_STATIC_ONLY`) are rejected
+  (exit 2).
