@@ -33,7 +33,7 @@ what was and was not observed, and about the limits of the method.
 > unchanged by those commits, and the Go change made the Sentry DSN path strictly
 > tighter (always blank instead of a branch), so it cannot widen the surface.
 > **This historical run is superseded for evidence purposes by the re-run on the
-> final HEAD recorded in [Re-run on the final HEAD](#re-run-on-the-final-head-c0aa7f660)
+> final code tree recorded in [Re-run on the final code tree](#re-run-on-the-final-code-tree-9a962153b)
 > below.** The method described here is the reproducible procedure.
 
 ## Verdict
@@ -142,10 +142,13 @@ Three layers, because no single one is a full capture:
 - **This run predates the current HEAD**; it observed the binary built from
   `6bfdccd2d`. See the scope note at the top.
 
-## Re-run on the final HEAD (`c0aa7f660`)
+## Re-run on the final code tree (`9a962153b`)
 
-**Date:** 2026-10-16. **HEAD:** `c0aa7f660` (docs) / `9a962153b` (last code
-commit). This is the dynamic re-run the historical scope note called for; it
+**Date:** 2026-10-16. **Code tree:** `9a962153b` (last code commit; the worktree
+was at `c0aa7f660`, whose only change over `9a962153b` is documentation). Every
+commit after `9a962153b` (`1536c97d1`, `aa27ba666`, and this document's follow-up)
+is **documentation-only**, so the dynamic evidence below applies to the code tree
+that ships. This is the dynamic re-run the historical scope note called for; it
 supersedes the run above for evidence purposes.
 
 ### Environment
@@ -157,10 +160,29 @@ supersedes the run above for evidence purposes.
   **Not** available: `tcpdump`, `strace`, `ltrace`, `tshark`, `mitmproxy`,
   `Xvfb`, Docker; no root (`sudo` needs a password).
 - Codex and OpenCode CLIs present; `gh` authenticated as the fork owner.
-- **Isolation:** a detached worktree at `/home/master-chief/ao-privacy-lab`, lab
-  `AO_DATA_DIR`/`AO_DEV_ELECTRON_DIR`, a synthetic git repo plus a local bare
-  origin, and a temporary `HOME` for the packaged app (whose `~/.ao/electron` is
-  deliberately not overridable). The real `~/.ao` was never read or written.
+- **Isolation and `~/.ao`:** the primary daemon/Electron runs used a temporary
+  `AO_DATA_DIR`, `AO_DEV_ELECTRON_DIR` and (for the packaged app) `HOME`. The
+  real `~/.ao` was **not** left untouched: two paths were created under it and
+  later removed.
+  - `~/.ao/dev/` — created by the **NetLog Electron dev** run. That run set
+    `AO_DATA_DIR` and `AO_DEV_ELECTRON_DIR` but **not** `AO_RUN_FILE`, so the dev
+    defaults applied: `runFilePath()` (`frontend/src/main.ts`) returns
+    `~/.ao/dev/running.json` in dev when `AO_RUN_FILE` is unset, and the app
+    writes `app-state.json` (`src/main/app-state.ts`) and `update-settings.json`
+    (`src/main/update-settings.ts`) beside it. It contained `app-state.json`
+    (298 B) and `update-settings.json` (123 B). **Cause:** a harness deficiency —
+    the prescribed dev command omits `AO_RUN_FILE` — **not** a production defect:
+    production honors `AO_RUN_FILE`/`AO_DATA_DIR`, and `~/.ao/...` is the
+    documented default.
+  - `~/.ao/repair-installer-tests/` (empty) — created by
+    `frontend/scripts/build-mac-repair-installer.node-test.mjs`, whose `fixture()`
+    base is `process.env.AO_DATA_DIR || path.join(homedir(), '.ao')`; it was run
+    without `AO_DATA_DIR`, so it defaulted to the real home. **Cause:** running a
+    test helper without a lab `AO_DATA_DIR`, **not** a production defect.
+  - Both paths were **removed afterwards**, restoring `~/.ao` to the empty state
+    an earlier listing had shown. Whether they pre-existed is therefore an
+    inference from that listing, not an independent proof.
+  - No production code ignores `AO_DATA_DIR`/`AO_RUN_FILE`.
 
 ### Method
 

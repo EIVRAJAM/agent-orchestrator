@@ -675,7 +675,7 @@ comparative** evidence for those paths.
 **Dynamic execution evidence on the current HEAD:** the controlled daemon,
 Electron and packaged-artifact runs were repeated on the final HEAD and are
 recorded in
-[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md#re-run-on-the-final-head-c0aa7f660).
+[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md#re-run-on-the-final-code-tree-9a962153b).
 They observed **zero** PostHog/Sentry requests with the export enabled by
 environment, the daemon's external destinations named as functional
 (`raw.githubusercontent.com`, `registry.npmjs.org`, `chatgpt.com`, `github.com`),
@@ -692,8 +692,15 @@ HEAD (no `tcpdump`/`strace`/root).
   `dpkg -i`; macOS unavailable), and the **effective updater download** from the
   fork feed (no published release to fetch).
 - **rpm/AppImage and all macOS artifacts** (missing `rpmbuild`/`appimagetool`).
-- **Codex chat mode** (installed Codex version is below AO's tested minimum);
-  Codex TUI was exercised.
+- **Codex chat** is **no longer a blocker**: a compatible **0.160.0** was already
+  present under NVM (the normal daemon had resolved `~/.local/bin/codex` 0.144.5,
+  below AO's tested minimum 0.146.0). A lab daemon with 0.160.0 first on `PATH`
+  ran a real chat session — worktree created, prompt answered `READY`, turn
+  events (`turn.started` → `message.delta` → `message.completed` → `usage` →
+  `turn.completed`), then a clean stop that removed the worktree — without
+  installing or replacing the global Codex. The separate Codex **account store**
+  still reports `account_storage_unsafe` in the lab data dir (independent
+  limitation).
 - GitHub **PR/CI** flows end-to-end and `agent-ci run --all` (Docker absent); the
   GitHub client was verified only for loading/auth and local git operations.
 - Mobile app runtime (code-level disable only; no Expo build, no simulator).
@@ -712,7 +719,7 @@ passes.
 Statuses: **I** implemented · **VS** verified statically · **VT** verified by the
 automated tests · **VD** verified dynamically from the current HEAD · **P**
 pending (environment limitation). Rows marked **VD** come from the re-run in
-[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md#re-run-on-the-final-head-c0aa7f660),
+[privacy-fork-traffic-report.md](privacy-fork-traffic-report.md#re-run-on-the-final-code-tree-9a962153b),
 not from the historical `6bfdccd2d` run.
 
 | Area | Status | Evidence |
@@ -720,7 +727,7 @@ not from the historical `6bfdccd2d` run.
 | Daemon Go (local-only telemetry sink, blank Sentry DSN) | I, VS, VT, VD | `newTelemetrySink`/`newDaemonSentryConfig` + `go test ./internal/daemon/...`, guard; live run hit **zero** canary requests |
 | Electron main + renderer (PostHog/Sentry off) | I, VS, VT, VD | `initTelemetry`/`initMainSentry` + vitest privacy tests; real dev + packaged app, zero canary requests, no install id |
 | Mobile app (PostHog/Sentry off) | I, VS, VT | `fork-privacy.ts` + mobile vitest tests (full mobile suite: 1912 pass / 1 pre-existing locale failure, reproduced on base); **runtime P** (no simulator/Expo) |
-| PostHog — renderer/daemon | I, VS, VT, VD | composition tests + guard; no client built; zero canary requests |
+| PostHog — renderer/daemon | I, VS, VT, VD | composition tests + guard; no client initialized or constructed; zero canary requests |
 | PostHog — mobile | I, VS, VT | `MOBILE_EXTERNAL_TELEMETRY_EXPORT_ALLOWED=false` + mobile tests; **no Expo runtime P** |
 | Sentry — daemon/main/renderer | I, VS, VT, VD | composition tests; `sentryobs.Enabled()` false with a DSN present; zero canary requests |
 | Sentry — mobile | I, VS, VT | `MOBILE_EXTERNAL_DIAGNOSTICS_EXPORT_ALLOWED=false` + mobile tests; **no Expo runtime P** |
@@ -729,7 +736,7 @@ not from the historical `6bfdccd2d` run.
 | Internal events and local logs preserved | I, VS, VT, VD | daemon local SQLite sink test; run recorded `ao.daemon.started` etc.; `change_log`/`conversation_provider_events` |
 | Updater + authorized release target | I, VS, VT, VD | `release-target.ts` tests + guard; packaged `app-update.yml` → `EIVRAJAM/agent-orchestrator`, version floor → fork, upstream/unauthorized/malformed rejected at runtime. **Signing/install/effective download P** |
 | Privacy guard + CI | I, VS, VT, VD | `privacy-guard.test.sh` (236 fixtures), `privacy-guard.sh` incl. `CI=true`; bypasses exit 2. **Remote CI P** |
-| Codex/OpenCode, sessions, worktrees | I, VS, VT, VD (partial) | real `opencode-v2` session + worktree + stop/cleanup + restart/recovery; Codex **TUI** ran (chat blocked by installed version) |
+| Codex/OpenCode, sessions, worktrees | I, VS, VT, VD | real `opencode-v2` session + worktree + stop/cleanup + restart/recovery; real Codex **chat** session with a compatible 0.160.0 already present (worktree, `READY`, turn events, cleanup). **Codex account store `account_storage_unsafe` P** |
 | GitHub / PR / CI flows | I, VS, VT | client loads + `gh` auth verified; local git/worktrees OK. **PR/CI + `agent-ci` P** (Docker absent) |
 | Full system/desktop traffic capture | — | **P** (no `tcpdump`/`strace`/root) |
 | Packaged artifact build/install + updater | I, VS, VT, VD (partial) | local `deb` built and booted under canaries; **signing/notarization/install/updater-download P** (no root, macOS unavailable) |
@@ -762,13 +769,18 @@ go build ./...
 go test ./...
 ```
 
-Desktop (development against lab data — never the real `~/.ao`):
+Desktop (development against lab data; keep the real `~/.ao` out of it by also
+setting `AO_DEV_ELECTRON_DIR` and `AO_RUN_FILE` — without `AO_RUN_FILE` a dev run
+defaults its state to `~/.ao/dev/`):
 
 ```bash
 cd frontend
 npm ci
 npm run build:daemon -- --dev
-AO_DATA_DIR=/tmp/ao-privacy-lab ./node_modules/.bin/electron-forge start
+AO_DATA_DIR=/tmp/ao-privacy-lab \
+AO_DEV_ELECTRON_DIR=/tmp/ao-privacy-electron \
+AO_RUN_FILE=/tmp/ao-privacy-lab/running.json \
+./node_modules/.bin/electron-forge start
 ```
 
 Packaged build:
