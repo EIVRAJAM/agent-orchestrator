@@ -1,0 +1,175 @@
+name: Fork Linux signed candidate
+
+# Public, non-publishing handoff for the EIVRAJAM privacy fork. It consumes a
+# successful, pinned Desktop build artifacts run, verifies its digest handoff,
+# prepares Linux packages and updater metadata, signs their provenance through
+# GitHub's Sigstore-backed artifact attestations, and uploads a short-lived
+# signed candidate for the private conductor. It cannot create releases or
+# tags. macOS and Windows stay out until native signing credentials and platform
+# verification are configured.
+#
+# The Sigstore attestation proves provenance of these exact bytes; it is NOT a
+# native apt/rpm repository signature, Authenticode signature, or Apple
+# Developer ID/notarization. Those require separate external credentials and are
+# out of scope here.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Successful Desktop build artifacts run ID"
+        type: string
+        required: true
+      source_sha:
+        description: "Exact 40-character source commit SHA"
+        type: string
+        required: true
+      version:
+        description: "Fork prerelease version (X.Y.Z-privacy.N)"
+        type: string
+        required: true
+
+concurrency:
+  group: fork-linux-release
+  cancel-in-progress: false
+
+jobs:
+  signed-candidate:
+    if: github.repository == 'EIVRAJAM/agent-orchestrator'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Require the fork owner as candidate operator
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_ACTOR" != "$GITHUB_REPOSITORY_OWNER" ]; then
+            echo "::error::Only the repository owner may prepare a fork candidate." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # Run the candidate assembly code from trusted main. The validation below
+          # requires the requested source SHA to be this exact commit.
+          ref: main
+          persist-credentials: false
+
+      - name: Validate source and build run
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_sha must be an exact lowercase 40-character SHA." >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-privacy\.[0-9]+$ ]]; then
+            echo "::error::version must match X.Y.Z-privacy.N." >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]; then
+            echo "::error::source_sha must be the current main commit." >&2
+            exit 1
+          fi
+
+          checks="$(gh api "repos/$GITHUB_REPOSITORY/commits/$SOURCE_SHA/check-runs?per_page=100")"
+          if ! jq -e '[.check_runs[] | select(.name == "privacy-guard" and .conclusion == "success")] | length > 0' \
+            <<<"$checks" >/dev/null; then
+            echo "::error::The source commit has no successful privacy-guard check." >&2
+            exit 1
+          fi
+
+          run_json="$(gh run view "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --json conclusion,createdAt,event,headSha,status,workflowName)"
+          test "$(jq -r .status <<<"$run_json")" = completed
+          test "$(jq -r .conclusion <<<"$run_json")" = success
+          test "$(jq -r .event <<<"$run_json")" = workflow_dispatch
+          test "$(jq -r .workflowName <<<"$run_json")" = "Desktop build artifacts"
+          test "$(jq -r .headSha <<<"$run_json")" = "$SOURCE_SHA"
+          release_date="$(jq -r .createdAt <<<"$run_json")"
+          echo "release_date=$release_date" >> "$GITHUB_OUTPUT"
+
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release v$VERSION already exists; refusing to mutate it." >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag v$VERSION already exists; refusing to reuse it." >&2
+            exit 1
+          fi
+
+      - name: Download AppImage
+        uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: incoming/linux
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download deb
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-deb
+          path: incoming/linux-deb
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download rpm
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-rpm
+          path: incoming/linux-rpm
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download digest handoff
+        uses: actions/download-artifact@v4
+        with:
+          name: digests
+          path: incoming/digests
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and assemble candidate
+        env:
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          RELEASE_DATE: ${{ steps.build.outputs.release_date }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/prepare-fork-linux-release.mjs \
+            incoming release "$VERSION" "$SOURCE_SHA" "$BUILD_RUN_ID" "$RELEASE_DATE"
+          (cd release && sha256sum --check SHA256SUMS)
+
+      - name: Sign build provenance
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-checksums: release/SHA256SUMS
+
+      - name: Include portable Sigstore bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        shell: bash
+        run: cp "$BUNDLE_PATH" release/provenance.sigstore.json
+
+      - name: Preserve signed candidate as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-linux-${{ inputs.version }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
