@@ -1014,7 +1014,8 @@ SELECT conversation_turns.id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
-       conversation_messages.delivery_content_json
+       conversation_messages.delivery_content_json,
+       conversation_turns.requested_at
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
@@ -1024,6 +1025,56 @@ WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.promotion_started_at IS NULL
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
+
+-- Durable compare-and-set for an explicit queue resume: the exact turn must
+-- still be an unsent, unpromoted, unrolled-back queued row. execrows is the CAS
+-- result: zero means the queue moved (another dispatch, a promotion, a cancel, a
+-- settle or a rollback) and the provider must not be called. Unlike
+-- MarkConversationTurnStarted this is conditional on the row still being queued,
+-- so a resume cannot promote a row another path already claimed.
+-- NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
+-- offset, so a multi-byte character here silently corrupts later queries.
+-- name: ClaimQueuedConversationTurnForResume :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    started_at = COALESCE(started_at, sqlc.arg(now))
+WHERE id = sqlc.arg(id)
+  AND conversation_id = sqlc.arg(conversation_id)
+  AND state = 'queued'
+  AND promotion_started_at IS NULL
+  AND rolled_back_at IS NULL;
+
+-- Aggregate, window-independent facts for the derived observable queue view.
+-- Each subquery is conversation-scoped and served by
+-- idx_conversation_turns_conversation, so a paginated snapshot reports the same
+-- queue as a full one. Every column is COALESCEd to a non-null scalar: a bare
+-- scalar subquery is inferred non-nullable by sqlc but returns NULL at runtime
+-- when it matches no row, which would fail the scan. Terminal states are listed
+-- explicitly rather than using state <> 'queued' AND state <> 'running' so a
+-- future state cannot silently change the meaning of "the last terminal turn".
+-- The head id and its timestamp come from SelectNextQueuedConversationTurn.
+-- NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
+-- offset, so a multi-byte character here silently corrupts later queries.
+-- name: SelectConversationQueueFacts :one
+SELECT
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS q
+        WHERE q.conversation_id = sqlc.arg(conversation_id)
+          AND q.state = 'queued' AND q.promotion_started_at IS NULL AND q.rolled_back_at IS NULL), 0) AS INTEGER) AS pending_count,
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS r
+        WHERE r.conversation_id = sqlc.arg(conversation_id)
+          AND r.state = 'running' AND r.rolled_back_at IS NULL), 0) AS INTEGER) AS running_count,
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS r
+        WHERE r.conversation_id = sqlc.arg(conversation_id)
+          AND r.state = 'running' AND r.rolled_back_at IS NULL AND r.provider_turn_id = ''), 0) AS INTEGER) AS running_unbound_count,
+    CAST(COALESCE((SELECT r.id FROM conversation_turns AS r
+        WHERE r.conversation_id = sqlc.arg(conversation_id)
+          AND r.state = 'running' AND r.rolled_back_at IS NULL
+        ORDER BY r.requested_at, r.rowid LIMIT 1), '') AS TEXT) AS active_turn_id,
+    CAST(COALESCE((SELECT t.state FROM conversation_turns AS t
+        WHERE t.conversation_id = sqlc.arg(conversation_id)
+          AND t.rolled_back_at IS NULL
+          AND t.state IN ('completed','recovered','interrupted','failed','cancelled')
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state;
 
 -- Claim one selected queue item before contacting the provider. execrows is the
 -- compare-and-set result: zero means the turn is absent, settled, or already being

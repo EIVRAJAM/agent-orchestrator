@@ -2030,6 +2030,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sessions/{sessionId}/conversation/queue/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Release exactly one never-sent queued turn after a deliberate hold */
+        post: operations["resumeSessionConversationQueue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/sessions/{sessionId}/conversation/settings": {
         parameters: {
             query?: never;
@@ -4484,6 +4501,19 @@ export interface components {
             prompt: string;
             turnId: string;
         };
+        ConversationQueuePayload: {
+            activeTurn?: string;
+            compactionPending: boolean;
+            controllerAvailable: boolean;
+            controllerGeneration?: string;
+            headTurnId?: string;
+            oldestPendingAt?: null | string;
+            pendingCount: number;
+            /** @enum {string} */
+            queueState: "idle" | "running" | "compacting" | "queued_waiting_for_active_turn" | "held_after_terminal_failure" | "controller_recovery_required" | "handoff_in_progress" | "state_uncertain";
+            /** @enum {string} */
+            resumeSafety: "resumed" | "stale_queue_state" | "no_pending_work" | "session_busy" | "compaction_in_progress" | "handoff_in_progress" | "controller_recovery_required" | "state_uncertain" | "session_terminated" | "stale_controller_generation";
+        };
         ConversationRateLimitsPayload: {
             planLabel?: string;
             /** Format: int64 */
@@ -4538,6 +4568,7 @@ export interface components {
             nativeForkAvailableAfterSequence: number;
             /** Format: int64 */
             oldestSequence?: number;
+            queue?: components["schemas"]["ConversationQueuePayload"];
             rateLimits?: components["schemas"]["ConversationRateLimitsPayload"];
             sessionId: string;
             settings: components["schemas"]["ConversationTurnSettingsPayload"];
@@ -5472,6 +5503,15 @@ export interface components {
             resumeMode: "native" | "saved_prompt" | "fresh";
             session: components["schemas"]["ControllersSessionView"];
             sessionId: string;
+        };
+        ResumeConversationQueueRequest: {
+            expectedControllerGeneration?: string;
+            expectedTurnId: string;
+        };
+        ResumeConversationQueueResponse: {
+            /** @enum {string} */
+            outcome: "resumed" | "stale_queue_state" | "no_pending_work" | "session_busy" | "compaction_in_progress" | "handoff_in_progress" | "controller_recovery_required" | "state_uncertain" | "session_terminated" | "stale_controller_generation";
+            turnId?: string;
         };
         RetryTurnResponse: {
             providerTurnId?: string;
@@ -13943,6 +13983,87 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    resumeSessionConversationQueue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session identifier, e.g. project-1. */
+                sessionId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResumeConversationQueueRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResumeConversationQueueResponse"];
+                };
+            };
+            /** @description Accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResumeConversationQueueResponse"];
+                };
             };
             /** @description Bad Request */
             400: {

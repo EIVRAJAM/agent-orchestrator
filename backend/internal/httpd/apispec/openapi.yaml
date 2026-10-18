@@ -5769,6 +5769,69 @@ paths:
       summary: Rewrite the durable queue order for undispatched turns
       tags:
       - conversations
+  /api/v1/sessions/{sessionId}/conversation/queue/resume:
+    post:
+      operationId: resumeSessionConversationQueue
+      parameters:
+      - description: Session identifier, e.g. project-1.
+        in: path
+        name: sessionId
+        required: true
+        schema:
+          description: Session identifier, e.g. project-1.
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResumeConversationQueueRequest'
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResumeConversationQueueResponse'
+          description: OK
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResumeConversationQueueResponse'
+          description: Accepted
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: Release exactly one never-sent queued turn after a deliberate hold
+      tags:
+      - conversations
   /api/v1/sessions/{sessionId}/conversation/settings:
     patch:
       operationId: setSessionConversationTurnSettings
@@ -13247,6 +13310,55 @@ components:
       - turnId
       - prompt
       type: object
+    ConversationQueuePayload:
+      properties:
+        activeTurn:
+          type: string
+        compactionPending:
+          type: boolean
+        controllerAvailable:
+          type: boolean
+        controllerGeneration:
+          type: string
+        headTurnId:
+          type: string
+        oldestPendingAt:
+          type:
+          - "null"
+          - string
+        pendingCount:
+          type: integer
+        queueState:
+          enum:
+          - idle
+          - running
+          - compacting
+          - queued_waiting_for_active_turn
+          - held_after_terminal_failure
+          - controller_recovery_required
+          - handoff_in_progress
+          - state_uncertain
+          type: string
+        resumeSafety:
+          enum:
+          - resumed
+          - stale_queue_state
+          - no_pending_work
+          - session_busy
+          - compaction_in_progress
+          - handoff_in_progress
+          - controller_recovery_required
+          - state_uncertain
+          - session_terminated
+          - stale_controller_generation
+          type: string
+      required:
+      - queueState
+      - pendingCount
+      - controllerAvailable
+      - compactionPending
+      - resumeSafety
+      type: object
     ConversationRateLimitsPayload:
       properties:
         planLabel:
@@ -13377,6 +13489,8 @@ components:
         oldestSequence:
           format: int64
           type: integer
+        queue:
+          $ref: '#/components/schemas/ConversationQueuePayload'
         rateLimits:
           $ref: '#/components/schemas/ConversationRateLimitsPayload'
         sessionId:
@@ -15837,6 +15951,35 @@ components:
       - sessionId
       - resumeMode
       - session
+      type: object
+    ResumeConversationQueueRequest:
+      properties:
+        expectedControllerGeneration:
+          type: string
+        expectedTurnId:
+          type: string
+      required:
+      - expectedTurnId
+      type: object
+    ResumeConversationQueueResponse:
+      properties:
+        outcome:
+          enum:
+          - resumed
+          - stale_queue_state
+          - no_pending_work
+          - session_busy
+          - compaction_in_progress
+          - handoff_in_progress
+          - controller_recovery_required
+          - state_uncertain
+          - session_terminated
+          - stale_controller_generation
+          type: string
+        turnId:
+          type: string
+      required:
+      - outcome
       type: object
     RetryTurnResponse:
       properties:

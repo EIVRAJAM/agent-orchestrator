@@ -93,6 +93,8 @@ type Store interface {
 	RecordRateLimits(ctx context.Context, conversationID string, limits domain.ConversationRateLimits) error
 
 	NextQueuedTurn(ctx context.Context, conversationID string) (domain.QueuedTurn, error)
+	ConversationQueueFacts(ctx context.Context, conversationID string) (domain.ConversationQueueFacts, error)
+	ClaimQueuedTurnForResume(ctx context.Context, conversationID, turnID string, now time.Time) (bool, error)
 	ReserveQueuedTurnForPromotion(ctx context.Context, conversationID, turnID string, now time.Time) (domain.QueuedTurn, error)
 	ReleaseQueuedTurnPromotion(ctx context.Context, conversationID, turnID string) error
 	CompleteQueuedTurnPromotion(ctx context.Context, conversationID, sourceTurnID, providerTurnID string, activity domain.ConversationActivity, now time.Time) error
@@ -248,6 +250,12 @@ type Controller struct {
 	sendingTurnID string
 	// A compact request can be accepted before its provider turn starts.
 	compactionPending bool
+	// resumeHold is the one-shot explicit queue resume in flight: the exact turn
+	// a manual resume dispatched, so its terminal event holds the queue instead
+	// of releasing the next turn. Bound to the AO turn id and the controller
+	// generation it was resumed under, never a bare boolean; nil when nothing is
+	// armed. Guarded by mu.
+	resumeHold *resumeHold
 	// Provider calls keep automatic hibernation out without blocking explicit Kill.
 	operations int
 	// ackedTurnID is the turn the PROVIDER has confirmed it started, which lags
@@ -1794,12 +1802,39 @@ func (c *Controller) busy() bool {
 	return c.pendingTurnID != "" || c.compactionPending
 }
 
+// Compacting reports whether a compaction the provider accepted is still in
+// flight. It is part of busy(), but surfaced separately so a client can tell a
+// compaction from a running turn.
+func (c *Controller) Compacting() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.compactionPending
+}
+
+// Busy reports whether a provider turn or compaction is in flight.
+func (c *Controller) Busy() bool { return c.busy() }
+
 // dispatch hands a recorded turn to the provider. Callers must hold sendMu.
 func (c *Controller) dispatch(
 	ctx context.Context,
 	turnID string,
 	msg ports.ChatUserMessage,
 	requestedAt time.Time,
+) (domain.ConversationTurn, error) {
+	return c.dispatchTurn(ctx, turnID, msg, requestedAt, false)
+}
+
+// dispatchTurn is dispatch with an explicit claim precondition. preClaimed means
+// the caller already moved the row queued -> running with a durable
+// compare-and-set (the explicit-resume path), so the row must not be marked
+// dispatching again. Every other caller leaves it false and keeps the existing
+// behavior. Callers must hold sendMu.
+func (c *Controller) dispatchTurn(
+	ctx context.Context,
+	turnID string,
+	msg ports.ChatUserMessage,
+	requestedAt time.Time,
+	preClaimed bool,
 ) (domain.ConversationTurn, error) {
 	// Every dispatch carries the conversation's choices, including one AO makes on
 	// the user's behalf: a queued message draining, or a relay from `ao send`. A
@@ -1811,7 +1846,9 @@ func (c *Controller) dispatch(
 	// Move it out of the durable queue before crossing that boundary, or a live
 	// reconnect can drain the same prompt after the provider completes it. ACP's
 	// deferred start crosses the provider boundary only after binding succeeds.
-	if !hasDeferredStart {
+	// A pre-claimed turn (explicit resume) already made that move with a
+	// conditional compare-and-set, so it is not marked again here.
+	if !hasDeferredStart && !preClaimed {
 		if err := c.store.MarkTurnDispatching(ctx, turnID); err != nil {
 			return domain.ConversationTurn{}, fmt.Errorf("mark turn dispatching: %w", err)
 		}
@@ -1954,6 +1991,17 @@ func (c *Controller) drain(ctx context.Context) error {
 // allowDispatch gates sending the next queued turn. A pending Stop cutoff forces
 // it true so messages typed after Stop still send.
 func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error {
+	return c.drainLockedFor(ctx, allowDispatch, "", false)
+}
+
+// drainLockedFor is drainLocked with an explicit-resume precondition. When
+// expectedTurnID is set the caller intends to release exactly that queue head:
+// the loop refuses with errResumeNoPendingWork when the queue is empty and with
+// errResumeStaleQueueState when the head is a different turn. When claim is set
+// the row is moved queued -> running with a durable compare-and-set before the
+// provider is contacted, so a row another path already claimed is never sent.
+// Callers must hold sendMu.
+func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, expectedTurnID string, claim bool) error {
 	c.mu.Lock()
 	cutoff := c.cancelQueuedAt
 	c.cancelQueuedAt = time.Time{}
@@ -1985,11 +2033,31 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 	for {
 		queued, err := c.store.NextQueuedTurn(ctx, c.conversation.ID)
 		if errors.Is(err, domain.ErrNoQueuedTurn) {
+			if expectedTurnID != "" {
+				return errResumeNoPendingWork
+			}
 			return nil
 		}
 		if err != nil {
 			c.log.Error("failed to read queued turn", "session", c.sessionID, "error", err)
 			return err
+		}
+		if expectedTurnID != "" && queued.TurnID != expectedTurnID {
+			// Another path moved the head (dispatch, promotion, cancel or
+			// settle) between the client's snapshot and this call. Never release
+			// a different turn than the one named.
+			return errResumeStaleQueueState
+		}
+		if claim {
+			claimed, claimErr := c.store.ClaimQueuedTurnForResume(ctx, c.conversation.ID, queued.TurnID, c.now())
+			if claimErr != nil {
+				return claimErr
+			}
+			if !claimed {
+				// The row is no longer an unsent, unpromoted, unrolled-back
+				// queue item; the durable compare-and-set refused it.
+				return errResumeStaleQueueState
+			}
 		}
 
 		var content []ports.ChatContent
@@ -2034,7 +2102,7 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 				return err
 			}
 		}
-		if _, err := c.dispatch(ctx, queued.TurnID, queuedMessage, c.now()); err != nil {
+		if _, err := c.dispatchTurn(ctx, queued.TurnID, queuedMessage, c.now(), claim); err != nil {
 			// dispatch already settled this turn as failed. Stopping here rather than
 			// walking the rest of the queue: whatever broke the send is likely to break
 			// the next one too, and failing them all on one bad provider state would
@@ -2071,6 +2139,8 @@ func (c *Controller) ArmHandoff(
 	}
 
 	c.mu.Lock()
+	// A handoff closes source intake; a one-shot resume must not survive it.
+	c.resumeHold = nil
 	if c.handoff == want {
 		c.mu.Unlock()
 		return nil
@@ -2397,6 +2467,9 @@ func (c *Controller) interruptForHandoff(ctx context.Context) error {
 func (c *Controller) Interrupt(ctx context.Context) error {
 	c.mu.Lock()
 	c.interrupts++
+	// An explicit stop retires any one-shot resume: the user is no longer asking
+	// for the next turn to be released.
+	c.resumeHold = nil
 	if c.forkCancel != nil {
 		c.forkCancel()
 	}
@@ -2652,6 +2725,7 @@ func (c *Controller) Rollback(ctx context.Context, turnID string) (int, error) {
 // their historical process-close behavior. The persistent host replays detached
 // output and unresolved provider requests to the replacement controller.
 func (c *Controller) Close(ctx context.Context) error {
+	c.clearResumeHold()
 	c.once.Do(func() {
 		if preserver, ok := c.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {
 			c.mu.Lock()
@@ -2676,6 +2750,7 @@ func (c *Controller) Close(ctx context.Context) error {
 // and controller replacement use Terminate.
 func (c *Controller) Terminate(ctx context.Context) error {
 	c.mu.Lock()
+	c.resumeHold = nil
 	if c.forkCancel != nil {
 		c.forkCancel()
 	}
@@ -3402,7 +3477,16 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 		c.reportActivity(ctx, activityState, activityEvent, now)
 		// Only a completed turn releases queued work; a failed or recovered one holds
 		// the queue so it cannot cascade through the same outage (issue #4861).
-		_ = c.drainLocked(ctx, settledTurnState(event) == domain.TurnStateCompleted) // drain logs failures.
+		//
+		// A one-shot explicit resume holds even after a completed turn: the manual
+		// transition releases exactly the turn it named, never the next one. The
+		// hold is consumed only when this terminal event is that exact turn's, so an
+		// ordinary completed turn still drains the queue as before.
+		allow := settledTurnState(event) == domain.TurnStateCompleted
+		if c.consumeResumeHold(event.ProviderTurnID) {
+			allow = false
+		}
+		_ = c.drainLocked(ctx, allow) // drain logs failures.
 	case ports.ChatEventApprovalRequested:
 		c.reportActivity(ctx, domain.ActivityWaitingInput, "chat.approval.requested", now)
 	case ports.ChatEventApprovalResolved:
@@ -3797,6 +3881,9 @@ func (c *Controller) handoffActive() bool {
 	defer c.mu.Unlock()
 	return c.handoff != controllerHandoffNone
 }
+
+// HandoffActive reports whether a controller handoff has closed source intake.
+func (c *Controller) HandoffActive() bool { return c.handoffActive() }
 
 // planItemID keys a turn's plan activity. The provider sends no item id with a plan
 // update — a plan is not an item — so the key is synthesized from the turn, which

@@ -533,6 +533,39 @@ func (q *Queries) CancelQueuedConversationTurns(ctx context.Context, arg CancelQ
 	return err
 }
 
+const claimQueuedConversationTurnForResume = `-- name: ClaimQueuedConversationTurnForResume :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    started_at = COALESCE(started_at, ?1)
+WHERE id = ?2
+  AND conversation_id = ?3
+  AND state = 'queued'
+  AND promotion_started_at IS NULL
+  AND rolled_back_at IS NULL
+`
+
+type ClaimQueuedConversationTurnForResumeParams struct {
+	Now            sql.NullTime
+	ID             string
+	ConversationID string
+}
+
+// Durable compare-and-set for an explicit queue resume: the exact turn must
+// still be an unsent, unpromoted, unrolled-back queued row. execrows is the CAS
+// result: zero means the queue moved (another dispatch, a promotion, a cancel, a
+// settle or a rollback) and the provider must not be called. Unlike
+// MarkConversationTurnStarted this is conditional on the row still being queued,
+// so a resume cannot promote a row another path already claimed.
+// NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
+// offset, so a multi-byte character here silently corrupts later queries.
+func (q *Queries) ClaimQueuedConversationTurnForResume(ctx context.Context, arg ClaimQueuedConversationTurnForResumeParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimQueuedConversationTurnForResume, arg.Now, arg.ID, arg.ConversationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const completeQueuedConversationTurnPromotion = `-- name: CompleteQueuedConversationTurnPromotion :execrows
 UPDATE conversation_turns
 SET state = 'completed',
@@ -3052,6 +3085,60 @@ func (q *Queries) SelectConversationProviderEvents(ctx context.Context, arg Sele
 	return items, nil
 }
 
+const selectConversationQueueFacts = `-- name: SelectConversationQueueFacts :one
+SELECT
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS q
+        WHERE q.conversation_id = ?1
+          AND q.state = 'queued' AND q.promotion_started_at IS NULL AND q.rolled_back_at IS NULL), 0) AS INTEGER) AS pending_count,
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS r
+        WHERE r.conversation_id = ?1
+          AND r.state = 'running' AND r.rolled_back_at IS NULL), 0) AS INTEGER) AS running_count,
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS r
+        WHERE r.conversation_id = ?1
+          AND r.state = 'running' AND r.rolled_back_at IS NULL AND r.provider_turn_id = ''), 0) AS INTEGER) AS running_unbound_count,
+    CAST(COALESCE((SELECT r.id FROM conversation_turns AS r
+        WHERE r.conversation_id = ?1
+          AND r.state = 'running' AND r.rolled_back_at IS NULL
+        ORDER BY r.requested_at, r.rowid LIMIT 1), '') AS TEXT) AS active_turn_id,
+    CAST(COALESCE((SELECT t.state FROM conversation_turns AS t
+        WHERE t.conversation_id = ?1
+          AND t.rolled_back_at IS NULL
+          AND t.state IN ('completed','recovered','interrupted','failed','cancelled')
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state
+`
+
+type SelectConversationQueueFactsRow struct {
+	PendingCount        int64
+	RunningCount        int64
+	RunningUnboundCount int64
+	ActiveTurnID        string
+	LatestTerminalState string
+}
+
+// Aggregate, window-independent facts for the derived observable queue view.
+// Each subquery is conversation-scoped and served by
+// idx_conversation_turns_conversation, so a paginated snapshot reports the same
+// queue as a full one. Every column is COALESCEd to a non-null scalar: a bare
+// scalar subquery is inferred non-nullable by sqlc but returns NULL at runtime
+// when it matches no row, which would fail the scan. Terminal states are listed
+// explicitly rather than using state <> 'queued' AND state <> 'running' so a
+// future state cannot silently change the meaning of "the last terminal turn".
+// The head id and its timestamp come from SelectNextQueuedConversationTurn.
+// NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
+// offset, so a multi-byte character here silently corrupts later queries.
+func (q *Queries) SelectConversationQueueFacts(ctx context.Context, conversationID string) (SelectConversationQueueFactsRow, error) {
+	row := q.db.QueryRowContext(ctx, selectConversationQueueFacts, conversationID)
+	var i SelectConversationQueueFactsRow
+	err := row.Scan(
+		&i.PendingCount,
+		&i.RunningCount,
+		&i.RunningUnboundCount,
+		&i.ActiveTurnID,
+		&i.LatestTerminalState,
+	)
+	return i, err
+}
+
 const selectConversationQueuedEditDelivery = `-- name: SelectConversationQueuedEditDelivery :one
 SELECT request_hash FROM conversation_queued_edit_deliveries
 WHERE conversation_id = ? AND client_message_id = ?
@@ -3543,7 +3630,8 @@ SELECT conversation_turns.id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
-       conversation_messages.delivery_content_json
+       conversation_messages.delivery_content_json,
+       conversation_turns.requested_at
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
@@ -3561,6 +3649,7 @@ type SelectNextQueuedConversationTurnRow struct {
 	ClientMessageID     string
 	Origin              domain.MessageOrigin
 	DeliveryContentJson string
+	RequestedAt         time.Time
 }
 
 // The head of the send queue: the oldest message recorded while the agent was
@@ -3578,6 +3667,7 @@ func (q *Queries) SelectNextQueuedConversationTurn(ctx context.Context, conversa
 		&i.ClientMessageID,
 		&i.Origin,
 		&i.DeliveryContentJson,
+		&i.RequestedAt,
 	)
 	return i, err
 }

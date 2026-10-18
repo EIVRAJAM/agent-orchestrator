@@ -3214,7 +3214,7 @@ func newHarnessWithConversationAndStoreForHarness(
 		Store:      chatStore,
 		Reader:     fullSnapshotReader(st),
 		PageReader: boundedSnapshotReader(st),
-		Sessions:   st,
+		Sessions:   harnessSessionReader(st),
 		StopProviderHost: func(context.Context, domain.SessionID) error {
 			h.hostStops.Add(1)
 			return nil

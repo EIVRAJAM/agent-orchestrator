@@ -3025,6 +3025,56 @@ type ConversationSnapshotResponse struct {
 	// unstarted session's abilities are not yet known — and a client must treat
 	// absent as "do not offer yet" rather than as "cannot".
 	Capabilities []string `json:"capabilities,omitempty"`
+	// Queue is the derived send-queue and controller view. It is never persisted;
+	// it lets a client tell a deliberately held queue from an idle session and
+	// decide whether an explicit resume is worth offering. Absent on a
+	// reviewer-owned snapshot, which is a separate surface.
+	Queue *ConversationQueuePayload `json:"queue,omitempty"`
+}
+
+// ConversationQueuePayload is the derived, non-persisted queue view.
+type ConversationQueuePayload struct {
+	// QueueState distinguishes an idle session from a held queue. A long-running
+	// or merely idle session is never reported as blocked.
+	QueueState string `json:"queueState" enum:"idle,running,compacting,queued_waiting_for_active_turn,held_after_terminal_failure,controller_recovery_required,handoff_in_progress,state_uncertain"`
+	// PendingCount is the number of never-sent (queued) turns.
+	PendingCount int `json:"pendingCount"`
+	// OldestPendingAt is when the oldest never-sent turn was recorded.
+	OldestPendingAt *string `json:"oldestPendingAt,omitempty"`
+	// HeadTurnID is the queue head a resume must name, empty when none.
+	HeadTurnID string `json:"headTurnId,omitempty"`
+	// ControllerGeneration is the durable generation of the live controller. A
+	// client echoes it back as expectedControllerGeneration; the server is still
+	// the authority.
+	ControllerGeneration string `json:"controllerGeneration,omitempty"`
+	// ControllerAvailable reports whether a live controller owns the session.
+	ControllerAvailable bool `json:"controllerAvailable"`
+	// ActiveTurn is the running turn AO currently owns, empty when none.
+	ActiveTurn string `json:"activeTurn,omitempty"`
+	// CompactionPending reports a compaction the provider accepted and has not
+	// finished.
+	CompactionPending bool `json:"compactionPending"`
+	// ResumeSafety is the outcome an explicit resume would return right now.
+	ResumeSafety string `json:"resumeSafety" enum:"resumed,stale_queue_state,no_pending_work,session_busy,compaction_in_progress,handoff_in_progress,controller_recovery_required,state_uncertain,session_terminated,stale_controller_generation"`
+}
+
+// ResumeConversationQueueRequest names the exact never-sent turn to release.
+//
+// expectedTurnId is mandatory: it is the compare-and-set that makes the resume
+// idempotent, so a second concurrent request cannot release the next turn.
+// expectedControllerGeneration is an optional optimistic check; the server always
+// compares the selected controller against the durable generation itself.
+type ResumeConversationQueueRequest struct {
+	ExpectedTurnID               string `json:"expectedTurnId"`
+	ExpectedControllerGeneration string `json:"expectedControllerGeneration,omitempty"`
+}
+
+// ResumeConversationQueueResponse reports the released turn. It deliberately
+// omits a provider turn id: ACP/OpenCode ids are AO-generated and do not prove
+// the provider accepted the instruction.
+type ResumeConversationQueueResponse struct {
+	Outcome string `json:"outcome" enum:"resumed,stale_queue_state,no_pending_work,session_busy,compaction_in_progress,handoff_in_progress,controller_recovery_required,state_uncertain,session_terminated,stale_controller_generation"`
+	TurnID  string `json:"turnId,omitempty"`
 }
 
 // ConversationBranchMaterializationResponse describes the fidelity of the

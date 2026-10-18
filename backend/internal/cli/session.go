@@ -21,6 +21,14 @@ type sessionOptions struct {
 	json    bool
 }
 
+// sessionQueueOptions names the exact never-sent turn to release and, optionally,
+// the controller generation the caller last saw.
+type sessionQueueOptions struct {
+	sessionOptions
+	turn       string
+	generation string
+}
+
 type sessionListOptions struct {
 	sessionOptions
 	all               bool
@@ -123,6 +131,29 @@ type resumeAgentResponse struct {
 	Session    sessionDTO `json:"session"`
 }
 
+// sessionQueueResumeResponse mirrors the daemon's queue-resume response. It
+// deliberately carries no provider turn id.
+type sessionQueueResumeResponse struct {
+	Outcome string `json:"outcome"`
+	TurnID  string `json:"turnId,omitempty"`
+}
+
+// conversationQueueSnapshot reads only the derived queue field of the
+// conversation snapshot, so `ao session queue` does not need the whole model.
+type conversationQueueSnapshot struct {
+	Queue struct {
+		State                string `json:"queueState"`
+		PendingCount         int    `json:"pendingCount"`
+		OldestPendingAt      string `json:"oldestPendingAt,omitempty"`
+		HeadTurnID           string `json:"headTurnId,omitempty"`
+		ControllerGeneration string `json:"controllerGeneration,omitempty"`
+		ControllerAvailable  bool   `json:"controllerAvailable"`
+		ActiveTurnID         string `json:"activeTurn,omitempty"`
+		CompactionPending    bool   `json:"compactionPending"`
+		ResumeSafety         string `json:"resumeSafety"`
+	} `json:"queue"`
+}
+
 type renameSessionResponse struct {
 	SessionID   string `json:"sessionId"`
 	DisplayName string `json:"displayName"`
@@ -207,6 +238,8 @@ func newSessionCommand(ctx *commandContext) *cobra.Command {
 	cmd.AddCommand(newSessionRestoreCommand(ctx))
 	cmd.AddCommand(newSessionExitAgentCommand(ctx))
 	cmd.AddCommand(newSessionResumeAgentCommand(ctx))
+	cmd.AddCommand(newSessionQueueCommand(ctx))
+	cmd.AddCommand(newSessionResumeQueueCommand(ctx))
 	cmd.AddCommand(newSessionRenameCommand(ctx))
 	cmd.AddCommand(newSessionCleanupCommand(ctx))
 	cmd.AddCommand(newSessionClaimPRCommand(ctx))
@@ -324,6 +357,53 @@ func newSessionResumeAgentCommand(ctx *commandContext) *cobra.Command {
 		},
 	}
 	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
+	return cmd
+}
+
+func newSessionQueueCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionOptions
+	cmd := &cobra.Command{
+		Use:   "queue <id>",
+		Short: "Show a chat session's queue and whether it can be resumed",
+		Args:  oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			return ctx.showSessionQueue(cmd.Context(), cmd, id, opts)
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
+	return cmd
+}
+
+func newSessionResumeQueueCommand(ctx *commandContext) *cobra.Command {
+	var opts sessionQueueOptions
+	cmd := &cobra.Command{
+		Use:   "resume-queue <id>",
+		Short: "Release one never-sent queued message after a deliberate hold",
+		Long: "Release exactly one never-sent queued message for a chat session whose queue was\n" +
+			"held after a failed or recovered turn.\n\n" +
+			"The command reads the session's observable queue state first and sends that\n" +
+			"state's head turn id and controller generation as the compare-and-set\n" +
+			"preconditions. --turn and --generation override the observed values.\n\n" +
+			"This works only while the session's controller is live: after a daemon restart the\n" +
+			"queued messages are already closed and cannot be resumed.",
+		Args: oneSessionIDArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := normalizeSessionID(args[0])
+			if err != nil {
+				return err
+			}
+			return ctx.resumeSessionQueue(cmd.Context(), cmd, id, opts)
+		},
+	}
+	addSessionProjectFlag(cmd.Flags(), &opts.project, "Project id to scope the lookup")
+	cmd.Flags().StringVar(&opts.turn, "turn", "", "Queue head turn id to release (defaults to the observed head)")
+	cmd.Flags().StringVar(&opts.generation, "generation", "", "Expected controller generation (defaults to the observed generation)")
 	cmd.Flags().BoolVar(&opts.json, "json", false, "Output as JSON")
 	return cmd
 }
@@ -698,6 +778,101 @@ func (c *commandContext) resumeSessionAgent(ctx context.Context, cmd *cobra.Comm
 		return err
 	}
 	return nil
+}
+
+// showSessionQueue prints the derived queue view. It never labels a merely idle
+// or long-running session as blocked.
+func (c *commandContext) showSessionQueue(ctx context.Context, cmd *cobra.Command, id string, opts sessionOptions) error {
+	if opts.project != "" {
+		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
+			return err
+		}
+	}
+	var snap conversationQueueSnapshot
+	if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id)+"/conversation", &snap); err != nil {
+		return err
+	}
+	if opts.json {
+		return writeJSON(cmd.OutOrStdout(), snap.Queue)
+	}
+	w := cmd.OutOrStdout()
+	lines := []string{
+		fmt.Sprintf("state: %s", snap.Queue.State),
+		fmt.Sprintf("pending: %d", snap.Queue.PendingCount),
+	}
+	if snap.Queue.OldestPendingAt != "" {
+		lines = append(lines, fmt.Sprintf("oldest pending: %s", snap.Queue.OldestPendingAt))
+	}
+	if snap.Queue.HeadTurnID != "" {
+		lines = append(lines, fmt.Sprintf("head: %s", snap.Queue.HeadTurnID))
+	}
+	lines = append(lines,
+		fmt.Sprintf("controller available: %t", snap.Queue.ControllerAvailable),
+		fmt.Sprintf("resume safety: %s", snap.Queue.ResumeSafety),
+	)
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			return err
+		}
+	}
+	if snap.Queue.State == "held_after_terminal_failure" && snap.Queue.HeadTurnID != "" {
+		_, err := fmt.Fprintf(w, "resume with: ao session resume-queue %s --turn %s\n", id, snap.Queue.HeadTurnID)
+		return err
+	}
+	return nil
+}
+
+// resumeSessionQueue releases exactly one never-sent queued message. It reads
+// the observable queue state first and echoes that state's head turn id and
+// controller generation as the compare-and-set preconditions; --turn and
+// --generation are optional overrides for a caller that already holds a
+// specific snapshot.
+func (c *commandContext) resumeSessionQueue(ctx context.Context, cmd *cobra.Command, id string, opts sessionQueueOptions) error {
+	if opts.project != "" {
+		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
+			return err
+		}
+	}
+	var snap conversationQueueSnapshot
+	if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id)+"/conversation", &snap); err != nil {
+		return err
+	}
+	turnID := strings.TrimSpace(opts.turn)
+	if turnID == "" {
+		turnID = snap.Queue.HeadTurnID
+	}
+	generation := strings.TrimSpace(opts.generation)
+	if generation == "" {
+		generation = snap.Queue.ControllerGeneration
+	}
+	if turnID == "" {
+		// Nothing to release: report the observable state rather than sending a
+		// request the server would reject for a missing turn id.
+		if opts.json {
+			return writeJSON(cmd.OutOrStdout(), snap.Queue)
+		}
+		_, err := fmt.Fprintf(cmd.OutOrStdout(),
+			"no queued message to resume (state: %s, resume safety: %s)\n",
+			snap.Queue.State, snap.Queue.ResumeSafety)
+		return err
+	}
+	body := map[string]string{"expectedTurnId": turnID}
+	if generation != "" {
+		body["expectedControllerGeneration"] = generation
+	}
+	var res sessionQueueResumeResponse
+	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/conversation/queue/resume", body, &res); err != nil {
+		return err
+	}
+	if opts.json {
+		return writeJSON(cmd.OutOrStdout(), res)
+	}
+	if res.TurnID != "" {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "released queued message %s for session %s\n", res.TurnID, id)
+		return err
+	}
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "queue resume: %s\n", res.Outcome)
+	return err
 }
 
 func (c *commandContext) renameSession(ctx context.Context, cmd *cobra.Command, id, displayName string, opts sessionOptions) error {
