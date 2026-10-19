@@ -27,6 +27,11 @@ func harnessSessionReader(reader chatsvc.SessionReader) chatsvc.SessionReader {
 	return reader
 }
 
+// currentGeneration is the live controller's generation, the value a client
+// echoes back as expectedControllerGeneration. Tests that prove a refusal for a
+// stale snapshot pass a different value instead.
+func currentGeneration(h *harness) string { return h.ctrl.Generation() }
+
 func withSessionReader(t *testing.T, wrap func(chatsvc.SessionReader) chatsvc.SessionReader) {
 	t.Helper()
 	previous := harnessSessionReaderOverride
@@ -114,7 +119,7 @@ func TestSecondResumeReleasesTheNextTurn(t *testing.T) {
 	ctx := context.Background()
 	first, second := queueWhileRunningTwice(t, h)
 
-	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, ""); err != nil {
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); err != nil {
 		t.Fatalf("first resume: %v", err)
 	}
 	h.conv.emit(ports.ChatEvent{
@@ -126,7 +131,7 @@ func TestSecondResumeReleasesTheNextTurn(t *testing.T) {
 	})
 	assertTurnStaysQueued(t, h, "automation2")
 
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("second resume: %v", err)
 	}
@@ -146,7 +151,7 @@ func TestResumeAfterImmediateCompletionDoesNotAdvance(t *testing.T) {
 	ctx := context.Background()
 	first, _ := queueWhileRunningTwice(t, h)
 
-	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, ""); err != nil {
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); err != nil {
 		t.Fatalf("first resume: %v", err)
 	}
 	// The resumed turn completes before the second request is issued.
@@ -158,7 +163,7 @@ func TestResumeAfterImmediateCompletionDoesNotAdvance(t *testing.T) {
 		return turnStateByText(t, s)["automation"] == domain.TurnStateCompleted
 	})
 
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("second resume: %v", err)
 	}
@@ -200,7 +205,7 @@ func TestResumeHeldQueueReplacedControllerRefused(t *testing.T) {
 	// The controller is replaced after the queue was held and before the resume.
 	drift.arm()
 
-	_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, "")
+	_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
 	if !errors.Is(err, chatsvc.ErrStaleControllerGeneration) {
 		t.Fatalf("err = %v, want ErrStaleControllerGeneration for a replaced controller", err)
 	}
@@ -217,7 +222,7 @@ func TestResumeHeldQueueHandoffRefused(t *testing.T) {
 		t.Fatalf("ArmHandoff: %v", err)
 	}
 
-	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, "")
+	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -265,7 +270,7 @@ func TestResumeHeldQueueCompactionRefused(t *testing.T) {
 		t.Fatalf("Compact: %v", err)
 	}
 
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -288,7 +293,7 @@ func TestResumeHeldQueueControllerAbsentRequiresRecovery(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -311,7 +316,7 @@ func TestResumeHeldQueueTerminatedRefused(t *testing.T) {
 	// The session is terminated after the queue was held and before the resume.
 	terminated.arm()
 
-	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, "")
+	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
@@ -335,7 +340,7 @@ func TestResumeDispatchFailureKeepsQueuedRows(t *testing.T) {
 	h.conv.sendErr = errors.New("provider disconnected")
 	h.conv.mu.Unlock()
 
-	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, ""); !errors.Is(err, chatsvc.ErrQueueDispatchFailed) {
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); !errors.Is(err, chatsvc.ErrQueueDispatchFailed) {
 		t.Fatalf("err = %v, want ErrQueueDispatchFailed", err)
 	}
 	assertTurnStaysQueued(t, h, "automation2")
@@ -362,7 +367,7 @@ func TestRateLimitEventDoesNotDispatchQueuedWork(t *testing.T) {
 	}})
 	assertTurnStaysQueued(t, h, "automation")
 
-	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, ""); err != nil {
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); err != nil {
 		t.Fatalf("resume: %v", err)
 	}
 	// The released turn ends rate-limited; the next turn must stay held.

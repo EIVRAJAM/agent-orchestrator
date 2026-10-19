@@ -3060,13 +3060,16 @@ type ConversationQueuePayload struct {
 
 // ResumeConversationQueueRequest names the exact never-sent turn to release.
 //
-// expectedTurnId is mandatory: it is the compare-and-set that makes the resume
-// idempotent, so a second concurrent request cannot release the next turn.
-// expectedControllerGeneration is an optional optimistic check; the server always
-// compares the selected controller against the durable generation itself.
+// Both fields are mandatory. expectedTurnId is the compare-and-set that makes the
+// resume idempotent, so a second concurrent request cannot release the next turn.
+// expectedControllerGeneration names the controller epoch the caller observed;
+// an empty value is rejected rather than treated as "use the current one", so a
+// client acting on a stale snapshot cannot silently resume against a replacement
+// controller. The server re-reads the durable session row and the row's own
+// generation inside the claim.
 type ResumeConversationQueueRequest struct {
 	ExpectedTurnID               string `json:"expectedTurnId"`
-	ExpectedControllerGeneration string `json:"expectedControllerGeneration,omitempty"`
+	ExpectedControllerGeneration string `json:"expectedControllerGeneration"`
 }
 
 // ResumeConversationQueueResponse reports the released turn. It deliberately

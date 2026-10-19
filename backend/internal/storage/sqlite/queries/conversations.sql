@@ -1027,22 +1027,40 @@ ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
 
 -- Durable compare-and-set for an explicit queue resume: the exact turn must
--- still be an unsent, unpromoted, unrolled-back queued row. execrows is the CAS
+-- still be an unsent, unpromoted, unrolled-back queued row AND it must still
+-- belong to the controller generation the caller named. execrows is the CAS
 -- result: zero means the queue moved (another dispatch, a promotion, a cancel, a
--- settle or a rollback) and the provider must not be called. Unlike
--- MarkConversationTurnStarted this is conditional on the row still being queued,
--- so a resume cannot promote a row another path already claimed.
+-- settle or a rollback) or the session owner changed, and the provider must not
+-- be called. Unlike MarkConversationTurnStarted this is conditional on the row
+-- still being queued, so a resume cannot promote a row another path already
+-- claimed.
+--
+-- The generation is checked inside the same statement that claims the row, so
+-- the ownership decision is atomic with the claim: there is no window between a
+-- Go-side generation read and this write. Two facts must both hold:
+--   * conversation_turns.controller_generation = the named generation, i.e. the
+--     row itself belongs to that controller epoch (never a newer one), and
+--   * the handling session's live sessions.controller_generation = the named
+--     generation, i.e. that epoch is still the durable owner.
+-- handled_by_session_id is the durable conversation -> session link for a chat
+-- turn; a reviewer owner never reaches this path (requireChatSession gates it).
 -- NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
 -- offset, so a multi-byte character here silently corrupts later queries.
 -- name: ClaimQueuedConversationTurnForResume :execrows
 UPDATE conversation_turns
 SET state = 'running',
     started_at = COALESCE(started_at, sqlc.arg(now))
-WHERE id = sqlc.arg(id)
-  AND conversation_id = sqlc.arg(conversation_id)
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
-  AND rolled_back_at IS NULL;
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = sqlc.arg(expected_controller_generation)
+  AND EXISTS (
+      SELECT 1 FROM sessions AS s
+      WHERE s.id = conversation_turns.handled_by_session_id
+        AND s.controller_generation = sqlc.arg(expected_controller_generation)
+  );
 
 -- Aggregate, window-independent facts for the derived observable queue view.
 -- Each subquery is conversation-scoped and served by

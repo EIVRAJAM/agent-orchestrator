@@ -5505,7 +5505,7 @@ export interface components {
             sessionId: string;
         };
         ResumeConversationQueueRequest: {
-            expectedControllerGeneration?: string;
+            expectedControllerGeneration: string;
             expectedTurnId: string;
         };
         ResumeConversationQueueResponse: {

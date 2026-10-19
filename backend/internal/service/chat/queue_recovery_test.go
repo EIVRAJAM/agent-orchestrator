@@ -59,7 +59,7 @@ func TestResumeHeldQueueReleasesExactlyOneTurn(t *testing.T) {
 	failRootTurn(t, h)
 	assertTurnStaysQueued(t, h, "automation")
 
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("ResumeHeldQueue: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestResumeHeldQueueReHoldsAfterTheResumedTurnCompletes(t *testing.T) {
 	failRootTurn(t, h)
 	assertTurnStaysQueued(t, h, "automation")
 
-	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, ""); err != nil {
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, currentGeneration(h)); err != nil {
 		t.Fatalf("ResumeHeldQueue: %v", err)
 	}
 	// The resumed turn is the fake's second provider turn.
@@ -143,7 +143,7 @@ func TestConcurrentResumeDispatchesAtMostOneTurn(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, "")
+			res, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, currentGeneration(h))
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -176,7 +176,7 @@ func TestResumeHeldQueueStaleHeadIsRefused(t *testing.T) {
 	queueWhileRunning(t, h, "c1", "automation", "c2")
 	failRootTurn(t, h)
 
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, "not-the-head", "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, "not-the-head", currentGeneration(h))
 	if err != nil {
 		t.Fatalf("ResumeHeldQueue: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestResumeHeldQueueStaleHeadIsRefused(t *testing.T) {
 
 func TestResumeHeldQueueNoPendingWork(t *testing.T) {
 	h := newHarness(t)
-	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, "any-turn", "")
+	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, "any-turn", currentGeneration(h))
 	if err != nil {
 		t.Fatalf("ResumeHeldQueue: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestResumeHeldQueueBusyIsRefused(t *testing.T) {
 	ctx := context.Background()
 	queued := queueWhileRunning(t, h, "c1", "automation", "c2")
 	// The root turn is still running.
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, currentGeneration(h))
 	if err != nil {
 		t.Fatalf("ResumeHeldQueue: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestResumeHeldQueueBusyIsRefused(t *testing.T) {
 
 func TestResumeHeldQueueRequiresExpectedTurnID(t *testing.T) {
 	h := newHarness(t)
-	_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, "  ", "")
+	_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, "  ", currentGeneration(h))
 	if !errors.Is(err, chatsvc.ErrResumeTurnIDRequired) {
 		t.Fatalf("err = %v, want ErrResumeTurnIDRequired", err)
 	}
@@ -240,7 +240,7 @@ func TestResumeHeldQueueRefusesUnconfirmedRunningTurn(t *testing.T) {
 	if err := h.st.MarkTurnDispatching(ctx, "unbound-turn"); err != nil {
 		t.Fatalf("MarkTurnDispatching: %v", err)
 	}
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, "unbound-turn", "")
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, "unbound-turn", currentGeneration(h))
 	if err != nil {
 		t.Fatalf("ResumeHeldQueue: %v", err)
 	}

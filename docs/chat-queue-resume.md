@@ -46,10 +46,13 @@ Request:
 { "expectedTurnId": "turn-id", "expectedControllerGeneration": "generation-id" }
 ```
 
-`expectedTurnId` is **mandatory**: it is the compare-and-set that makes the
-operation idempotent. `expectedControllerGeneration` is optional and is only an
-optimistic check; the server always compares the selected controller against the
-durable generation itself.
+Both `expectedTurnId` and `expectedControllerGeneration` are **mandatory**. They
+are the compare-and-set that makes the operation idempotent and generation-safe:
+an empty generation is rejected with `400
+CHAT_QUEUE_RESUME_GENERATION_REQUIRED`, never read as "use the current
+generation". The server independently re-reads the durable session row and the
+row's own generation inside the claim, so the fields are a client's assertion, not
+the authority.
 
 Response (`202` when a turn was released, `200` for `no_pending_work`):
 
@@ -76,9 +79,10 @@ does not prove the provider accepted anything.
 | `stale_controller_generation` | 409 | `CHAT_QUEUE_STALE_CONTROLLER` | yes (re-read) | no |
 
 Additional errors: `400 CHAT_QUEUE_RESUME_TURN_REQUIRED` (missing
-`expectedTurnId`), `409 CHAT_QUEUE_DISPATCH_FAILED` (the provider refused the
-released turn; that turn was settled `failed` and the rest of the queue is
-untouched), `404 SESSION_NOT_FOUND`, `409 SESSION_MODE_MISMATCH`.
+`expectedTurnId`), `400 CHAT_QUEUE_RESUME_GENERATION_REQUIRED` (missing
+`expectedControllerGeneration`), `409 CHAT_QUEUE_DISPATCH_FAILED` (the provider
+refused the released turn; that turn was settled `failed` and the rest of the
+queue is untouched), `404 SESSION_NOT_FOUND`, `409 SESSION_MODE_MISMATCH`.
 
 ## CLI
 
@@ -95,10 +99,12 @@ whether a resume is safe, and (when the queue is held) the exact
 `ao session resume-queue` reads the observable queue state first and sends that
 state's `headTurnId` and `controllerGeneration` as `expectedTurnId` and
 `expectedControllerGeneration`; `--turn` and `--generation` override the observed
-values. When there is no head it reports the state instead of sending a request
-the server would reject. Both commands are read/act against the daemon HTTP API;
-neither touches storage directly. Misuse exits 2; a daemon refusal or fault exits
-1 and preserves the error envelope.
+values. Both are always sent: a missing generation is a usage error rather than an
+implicit "current generation", and an explicitly empty `--turn`/`--generation` is
+also a usage error. When there is no head it reports the state instead of sending
+a request the server would reject. Both commands are read/act against the daemon
+HTTP API; neither touches storage directly. Misuse exits 2; a daemon refusal or
+fault exits 1 and preserves the error envelope.
 
 ## Observable state
 
@@ -124,30 +130,62 @@ a non-completed terminal turn is `held_after_terminal_failure`.
 
 ## Synchronization
 
-Everything below is evaluated while the controller's `sendMu` is held, so the
-check and the dispatch share one boundary.
+The whole resume — admission, validation, the durable claim, and the provider
+boundary — runs while the per-owner `controllerGate` is held, and the claim and
+dispatch additionally run under `sendMu`. The only writer of
+`sessions.controller_generation` is `Service.Start`, which holds that same gate
+while it claims the generation and installs the controller. So a replacement
+cannot interleave between validation and the provider boundary: it would have to
+take the gate, which the resume is holding.
 
-1. **Controller admission.** `Service.workingController` takes the per-owner
-   `controllerGate`, re-reads the session, and releases the gate before the
-   dispatch lock (so `Kill` can still interrupt provider work).
-2. **Re-validation under `sendMu`.** The resume then re-proves, inside the
-   dispatch lock, that the selected controller is still the registered one
-   (`Service.controllers[id] == controller`) and that the durable
-   `sessions.controller_generation` equals `controller.Generation()`. This is the
-   server-side generation authority; `expectedControllerGeneration` is only an
-   extra optimistic check.
+1. **Admission.** `Service.workingController` takes the gate, re-reads the
+   session, and returns the controller. The resume then re-takes the gate and
+   keeps it for the rest of the operation. Re-taking it (rather than keeping the
+   one `workingController` used) matches `lockCurrentSide`; the re-validation
+   below closes the small window in between.
+2. **Re-validation under the gate and `sendMu`.** The resume re-proves that the
+   selected controller is still the registered one (`Service.controllers[id] ==
+   controller`), that the durable `sessions.controller_generation` equals
+   `controller.Generation()`, and that the caller's
+   `expectedControllerGeneration` equals it too. The controller itself refuses
+   any generation other than its own before touching the queue.
 3. **Preconditions under `sendMu`.** Handoff armed; a durable `running` turn
    (`session_busy`, or `state_uncertain` when a running row has no
    `provider_turn_id`); `compactionPending`; and the in-memory busy gate.
-4. **Durable compare-and-set.** The exact `expectedTurnId` must still be the
-   queue head, and the store performs
-   `ClaimQueuedConversationTurnForResume` — an `UPDATE ... WHERE id=? AND
+4. **Durable compare-and-set.** The store runs
+   `ClaimQueuedConversationTurnForResume`, an `UPDATE ... WHERE id=? AND
    conversation_id=? AND state='queued' AND promotion_started_at IS NULL AND
-   rolled_back_at IS NULL` returning rows-affected. A pre-check followed by an
-   unconditional update is not enough; the CAS is the linearization point that
-   moves the row `queued -> running` before the provider call.
-5. **Dispatch.** `dispatchTurn(..., preClaimed=true)` hands the claimed row to the
-   provider without marking it dispatching again.
+   rolled_back_at IS NULL AND controller_generation=? AND EXISTS (SELECT 1 FROM
+   sessions s WHERE s.id = conversation_turns.handled_by_session_id AND
+   s.controller_generation=?)` returning rows-affected. The claim therefore
+   checks, in one statement, both that the row belongs to the named epoch and
+   that the handling session's live generation is still that epoch. A Go-side
+   pre-check followed by an unconditional update would be a TOCTOU; this is the
+   linearization point. Because the check is atomic with the claim, even a
+   generation change that bypassed the gate (a direct store write, or a stale
+   caller) yields zero rows and no provider call.
+5. **Dispatch.** `dispatchTurn(..., preClaimed=true)` hands the claimed row to
+   the provider without marking it dispatching again.
+
+### The window after the claim
+
+Between the claim and the provider boundary the row is already `running` and
+bound to the old generation, so:
+
+- no other path can claim it — the drain, a second resume, and the replacement
+  controller all select only `state='queued'` rows — so there is no re-delivery;
+- the old controller can never dispatch a turn of the new generation, because the
+  claim requires `conversation_turns.controller_generation` to equal the old
+  controller's own generation;
+- the turn is not lost: it is owned by the epoch that claimed it and is settled
+  normally by that controller's stream.
+
+A `Start` that replaces the controller terminates the old controller
+(`Controller.Terminate`/`Close`), which closes the provider conversation and
+cancels any not-yet-crossed provider work, so the claimed turn is settled rather
+than duplicated. For ACP/OpenCode the real `session/prompt` runs in a goroutine
+started by `StartDeferredTurn`; by the time it runs the row is claimed and bound,
+so it cannot be re-claimed either.
 
 Two concurrent requests that name the same `expectedTurnId`: the first claims and
 dispatches it; the second finds the head moved (or a live turn) and returns
@@ -159,26 +197,43 @@ next turn.
 A resume releases **exactly one** turn. When that turn terminates — even as
 `completed` — the queue is held again instead of continuing automatically. This
 is an in-memory one-shot on the controller, bound to the AO turn id **and** the
-controller generation (never a bare boolean):
+controller generation (never a bare boolean).
 
-- it is armed **before** the dispatch and its provider turn id is filled once the
-  row is bound;
-- `afterProject` suppresses the automatic drain **only** when the terminal event
-  matches that provider turn id; an ordinary completed turn still drains the
-  queue exactly as before;
-- it is cleared on completion (consumed), on dispatch failure, on interrupt, on
-  handoff, and on controller close/termination. A replacement controller starts
-  with no hold and the queue held by the normal rule.
+Exact cycle:
+
+1. `armResumeHold(expectedTurnID)` records `{turnID, generation, providerTurnID:
+   ""}` before the dispatch, under `sendMu`.
+2. The claim moves the row `queued -> running`.
+3. `SendTurn` crosses the provider boundary and returns a provider turn id.
+4. `BindTurnToProvider` records that id on the row, and `dispatchTurn` binds it
+   onto the hold in the same `c.mu` critical section that publishes
+   `pendingTurnID` — still under `sendMu`.
+5. `project()` consumes the terminal event with `sendMu` held (lifecycle events
+   take it), so `consumeResumeHold(providerTurnID)` cannot run before step 4 has
+   finished. A driver that completes the turn synchronously from `SendTurn` (or
+   from `StartDeferredTurn`) therefore cannot be mistaken for an ordinary
+   completion.
+6. `consumeResumeHold` clears the hold and suppresses the automatic drain only
+   when the event's provider turn id matches the hold's **and** the generation is
+   still current. An ordinary completed turn is unaffected.
+7. The hold is cleared on dispatch failure, on interrupt, on handoff, and on
+   controller close/termination. A replacement controller starts with no hold and
+   the queue held by the normal rule.
 
 ### Lock order
 
-`controllerGate` (admission only, released before `sendMu`) → `sendMu` →
-`{ Service.mu (registry read), store.writeMu }`. Nothing takes `sendMu` while
-holding `Service.mu`, and the store never calls back into the service, so there
-is no cycle.
+`controllerGate` → `sendMu` → `{ c.mu, Service.mu (registry read),
+store.writeMu }`. This is the order `lockCurrentSide` already uses. `Start` and
+`Stop` take the gate first and never take `sendMu` while holding it; the event
+loop takes `sendMu` for lifecycle events and never takes the gate; the store never
+calls back into the service. So there is no cycle and no inversion.
 
 ## Tests
 
+- `backend/internal/storage/sqlite/store/conversation_queue_claim_test.go`: the
+  CAS claims exactly the named turn; refuses a stale row generation; refuses a
+  changed live session generation; refuses a wrong named generation; never claims
+  another turn or re-claims the same one; the row stays `queued` on every refusal.
 - `backend/internal/service/chat/queue_recovery_test.go`: one-turn release; re-hold
   after the resumed turn completes; ordinary completed turn still drains;
   concurrent resume dispatches at most one; stale head refused; no pending work;
@@ -191,12 +246,24 @@ is no cycle.
   absent asks for recovery; terminated session refused; a provider disconnect
   during the released dispatch keeps the still-queued rows queued; a rate-limit
   report never dispatches and a rate-limited turn re-holds the queue.
+- `backend/internal/service/chat/queue_recovery_race_test.go`: a generation change
+  after validation but before the claim is refused by the CAS with zero provider
+  sends (a pausing session reader opens the window deterministically); a driver
+  that completes the resumed turn synchronously from `SendTurn` still holds the
+  queue (eager path); the same for the deferred ACP path, where the completion is
+  emitted from `StartDeferredTurn` after the provider id is bound; an empty
+  generation is refused.
+- `backend/internal/service/chat/queue_state_derivation_test.go`: a fresh queue, a
+  completed terminal turn, a compaction, a handoff, and an absent controller are
+  not labelled `held_after_terminal_failure`; the priority order between
+  concurrent states (handoff beats a running turn).
 - `backend/internal/service/chat/controller_hold_queue_test.go`: the #4861 hold
   tests, unchanged.
 - `backend/internal/httpd/controllers/conversation_queue_resume_test.go`: route
-  statuses and stable codes.
+  statuses and stable codes, including missing turn and missing generation.
 - `backend/internal/cli/session_queue_test.go`: the CLI reads the observable state
-  and sends its head and generation; no-work path; stale CAS and daemon faults
+  and sends its head and generation; no-work path; flag overrides; missing and
+  explicitly empty generation are usage errors; stale CAS and daemon faults
   surface as exit 1; misuse exits 2.
 
 ## Out of scope

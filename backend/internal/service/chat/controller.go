@@ -94,7 +94,7 @@ type Store interface {
 
 	NextQueuedTurn(ctx context.Context, conversationID string) (domain.QueuedTurn, error)
 	ConversationQueueFacts(ctx context.Context, conversationID string) (domain.ConversationQueueFacts, error)
-	ClaimQueuedTurnForResume(ctx context.Context, conversationID, turnID string, now time.Time) (bool, error)
+	ClaimQueuedTurnForResume(ctx context.Context, conversationID, turnID, expectedControllerGeneration string, now time.Time) (bool, error)
 	ReserveQueuedTurnForPromotion(ctx context.Context, conversationID, turnID string, now time.Time) (domain.QueuedTurn, error)
 	ReleaseQueuedTurnPromotion(ctx context.Context, conversationID, turnID string) error
 	CompleteQueuedTurnPromotion(ctx context.Context, conversationID, sourceTurnID, providerTurnID string, activity domain.ConversationActivity, now time.Time) error
@@ -1906,6 +1906,14 @@ func (c *Controller) dispatchTurn(
 	// Dispatched, not yet acknowledged: turn/start returning is AO's fact, and the
 	// provider's own turn-started notification is the one an interrupt needs.
 	c.ackedTurnID = ""
+	// Bind the one-shot resume hold's provider id here, under the same lock that
+	// publishes the provider id, and before sendMu is released. The terminal-event
+	// handler consumes the hold under sendMu, so a completion the driver emits
+	// synchronously from SendTurn cannot be seen as "not this turn's" while the
+	// hold is still unbound.
+	if hold := c.resumeHold; hold != nil && hold.turnID == turnID {
+		hold.providerTurnID = ref.ProviderTurnID
+	}
 	c.mu.Unlock()
 
 	// ACP's session/prompt request stays open until the turn finishes, so an ACP
@@ -1991,7 +1999,7 @@ func (c *Controller) drain(ctx context.Context) error {
 // allowDispatch gates sending the next queued turn. A pending Stop cutoff forces
 // it true so messages typed after Stop still send.
 func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error {
-	return c.drainLockedFor(ctx, allowDispatch, "", false)
+	return c.drainLockedFor(ctx, allowDispatch, "", "", false)
 }
 
 // drainLockedFor is drainLocked with an explicit-resume precondition. When
@@ -2001,7 +2009,7 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 // the row is moved queued -> running with a durable compare-and-set before the
 // provider is contacted, so a row another path already claimed is never sent.
 // Callers must hold sendMu.
-func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, expectedTurnID string, claim bool) error {
+func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, expectedTurnID, expectedGeneration string, claim bool) error {
 	c.mu.Lock()
 	cutoff := c.cancelQueuedAt
 	c.cancelQueuedAt = time.Time{}
@@ -2049,7 +2057,7 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 			return errResumeStaleQueueState
 		}
 		if claim {
-			claimed, claimErr := c.store.ClaimQueuedTurnForResume(ctx, c.conversation.ID, queued.TurnID, c.now())
+			claimed, claimErr := c.store.ClaimQueuedTurnForResume(ctx, c.conversation.ID, queued.TurnID, expectedGeneration, c.now())
 			if claimErr != nil {
 				return claimErr
 			}
@@ -3483,6 +3491,10 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 		// hold is consumed only when this terminal event is that exact turn's, so an
 		// ordinary completed turn still drains the queue as before.
 		allow := settledTurnState(event) == domain.TurnStateCompleted
+		// This runs with sendMu held (project() takes it for lifecycle events), and
+		// dispatchTurn binds the hold's provider id before releasing sendMu, so a
+		// completion the driver emits synchronously from SendTurn cannot be seen as
+		// "not this turn's" while the hold is still unbound.
 		if c.consumeResumeHold(event.ProviderTurnID) {
 			allow = false
 		}

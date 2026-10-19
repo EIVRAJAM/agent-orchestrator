@@ -537,29 +537,54 @@ const claimQueuedConversationTurnForResume = `-- name: ClaimQueuedConversationTu
 UPDATE conversation_turns
 SET state = 'running',
     started_at = COALESCE(started_at, ?1)
-WHERE id = ?2
-  AND conversation_id = ?3
-  AND state = 'queued'
-  AND promotion_started_at IS NULL
-  AND rolled_back_at IS NULL
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = ?4
+  AND EXISTS (
+      SELECT 1 FROM sessions AS s
+      WHERE s.id = conversation_turns.handled_by_session_id
+        AND s.controller_generation = ?4
+  )
 `
 
 type ClaimQueuedConversationTurnForResumeParams struct {
-	Now            sql.NullTime
-	ID             string
-	ConversationID string
+	Now                          sql.NullTime
+	ID                           string
+	ConversationID               string
+	ExpectedControllerGeneration string
 }
 
 // Durable compare-and-set for an explicit queue resume: the exact turn must
-// still be an unsent, unpromoted, unrolled-back queued row. execrows is the CAS
+// still be an unsent, unpromoted, unrolled-back queued row AND it must still
+// belong to the controller generation the caller named. execrows is the CAS
 // result: zero means the queue moved (another dispatch, a promotion, a cancel, a
-// settle or a rollback) and the provider must not be called. Unlike
-// MarkConversationTurnStarted this is conditional on the row still being queued,
-// so a resume cannot promote a row another path already claimed.
+// settle or a rollback) or the session owner changed, and the provider must not
+// be called. Unlike MarkConversationTurnStarted this is conditional on the row
+// still being queued, so a resume cannot promote a row another path already
+// claimed.
+//
+// The generation is checked inside the same statement that claims the row, so
+// the ownership decision is atomic with the claim: there is no window between a
+// Go-side generation read and this write. Two facts must both hold:
+//   - conversation_turns.controller_generation = the named generation, i.e. the
+//     row itself belongs to that controller epoch (never a newer one), and
+//   - the handling session's live sessions.controller_generation = the named
+//     generation, i.e. that epoch is still the durable owner.
+//
+// handled_by_session_id is the durable conversation -> session link for a chat
+// turn; a reviewer owner never reaches this path (requireChatSession gates it).
 // NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
 // offset, so a multi-byte character here silently corrupts later queries.
 func (q *Queries) ClaimQueuedConversationTurnForResume(ctx context.Context, arg ClaimQueuedConversationTurnForResumeParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, claimQueuedConversationTurnForResume, arg.Now, arg.ID, arg.ConversationID)
+	result, err := q.db.ExecContext(ctx, claimQueuedConversationTurnForResume,
+		arg.Now,
+		arg.ID,
+		arg.ConversationID,
+		arg.ExpectedControllerGeneration,
+	)
 	if err != nil {
 		return 0, err
 	}

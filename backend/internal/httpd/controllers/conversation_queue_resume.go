@@ -130,6 +130,10 @@ func writeQueueResumeError(w http.ResponseWriter, r *http.Request, err error) {
 		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
 			"CHAT_QUEUE_RESUME_TURN_REQUIRED",
 			"expectedTurnId is required: re-read the conversation and name its queue head", nil)
+	case errors.Is(err, chatsvc.ErrResumeControllerGenerationRequired):
+		envelope.WriteAPIError(w, r, http.StatusBadRequest, "validation",
+			"CHAT_QUEUE_RESUME_GENERATION_REQUIRED",
+			"expectedControllerGeneration is required: re-read the conversation and name its controller generation", nil)
 	case errors.Is(err, chatsvc.ErrQueueDispatchFailed):
 		// The attempted row was settled failed; the rest of the queue is intact.
 		// A retry releases the next turn, and the failed turn keeps its own retry.

@@ -21,8 +21,11 @@ type sessionOptions struct {
 	json    bool
 }
 
-// sessionQueueOptions names the exact never-sent turn to release and, optionally,
-// the controller generation the caller last saw.
+// sessionQueueOptions names the exact never-sent turn to release and the
+// controller generation the caller last saw. Both are required on the wire; the
+// command derives them from the observable queue state when the flags are not
+// passed, and refuses to send an empty generation rather than letting the server
+// treat it as "use the current one".
 type sessionQueueOptions struct {
 	sessionOptions
 	turn       string
@@ -389,7 +392,8 @@ func newSessionResumeQueueCommand(ctx *commandContext) *cobra.Command {
 			"held after a failed or recovered turn.\n\n" +
 			"The command reads the session's observable queue state first and sends that\n" +
 			"state's head turn id and controller generation as the compare-and-set\n" +
-			"preconditions. --turn and --generation override the observed values.\n\n" +
+			"preconditions. --turn and --generation override the observed values. Both\n" +
+			"preconditions are always sent; a missing generation is a usage error.\n\n" +
 			"This works only while the session's controller is live: after a daemon restart the\n" +
 			"queued messages are already closed and cannot be resumed.",
 		Args: oneSessionIDArg,
@@ -816,7 +820,8 @@ func (c *commandContext) showSessionQueue(ctx context.Context, cmd *cobra.Comman
 		}
 	}
 	if snap.Queue.State == "held_after_terminal_failure" && snap.Queue.HeadTurnID != "" {
-		_, err := fmt.Fprintf(w, "resume with: ao session resume-queue %s --turn %s\n", id, snap.Queue.HeadTurnID)
+		_, err := fmt.Fprintf(w, "resume with: ao session resume-queue %s --turn %s --generation %s\n",
+			id, snap.Queue.HeadTurnID, snap.Queue.ControllerGeneration)
 		return err
 	}
 	return nil
@@ -826,7 +831,8 @@ func (c *commandContext) showSessionQueue(ctx context.Context, cmd *cobra.Comman
 // the observable queue state first and echoes that state's head turn id and
 // controller generation as the compare-and-set preconditions; --turn and
 // --generation are optional overrides for a caller that already holds a
-// specific snapshot.
+// specific snapshot. Both values are always sent, and a missing generation is a
+// usage error rather than an implicit "current generation".
 func (c *commandContext) resumeSessionQueue(ctx context.Context, cmd *cobra.Command, id string, opts sessionQueueOptions) error {
 	if opts.project != "" {
 		if _, err := c.fetchScopedSession(ctx, id, opts.project); err != nil {
@@ -837,12 +843,21 @@ func (c *commandContext) resumeSessionQueue(ctx context.Context, cmd *cobra.Comm
 	if err := c.getJSON(ctx, "sessions/"+url.PathEscape(id)+"/conversation", &snap); err != nil {
 		return err
 	}
+	// A flag that was explicitly passed but is empty is a caller mistake, not an
+	// instruction to fall back to the snapshot: neither precondition may be
+	// inferred from an empty value.
 	turnID := strings.TrimSpace(opts.turn)
-	if turnID == "" {
+	if cmd.Flags().Changed("turn") && turnID == "" {
+		return usageError{errors.New("--turn must not be empty")}
+	}
+	if !cmd.Flags().Changed("turn") {
 		turnID = snap.Queue.HeadTurnID
 	}
 	generation := strings.TrimSpace(opts.generation)
-	if generation == "" {
+	if cmd.Flags().Changed("generation") && generation == "" {
+		return usageError{errors.New("--generation must not be empty")}
+	}
+	if !cmd.Flags().Changed("generation") {
 		generation = snap.Queue.ControllerGeneration
 	}
 	if turnID == "" {
@@ -856,9 +871,15 @@ func (c *commandContext) resumeSessionQueue(ctx context.Context, cmd *cobra.Comm
 			snap.Queue.State, snap.Queue.ResumeSafety)
 		return err
 	}
-	body := map[string]string{"expectedTurnId": turnID}
-	if generation != "" {
-		body["expectedControllerGeneration"] = generation
+	if generation == "" {
+		// Both preconditions are mandatory on the wire. The snapshot should
+		// always carry a generation when a controller exists; a missing one means
+		// the caller is acting without an authoritative observation.
+		return usageError{errors.New("expectedControllerGeneration is required: pass --generation or run `ao session queue` first")}
+	}
+	body := map[string]string{
+		"expectedTurnId":               turnID,
+		"expectedControllerGeneration": generation,
 	}
 	var res sessionQueueResumeResponse
 	if err := c.postJSON(ctx, "sessions/"+url.PathEscape(id)+"/conversation/queue/resume", body, &res); err != nil {

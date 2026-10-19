@@ -145,6 +145,61 @@ func TestSessionResumeQueueRequiresSessionID(t *testing.T) {
 	}
 }
 
+// TestSessionResumeQueueRequiresGeneration proves a snapshot without a
+// controller generation and no --generation flag is a usage error (exit 2),
+// never an implicit "use the current generation".
+func TestSessionResumeQueueRequiresGeneration(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := queueResumeServer(t,
+		`{"queue":{"queueState":"held_after_terminal_failure","pendingCount":1,"headTurnId":"turn-9","controllerAvailable":true,"resumeSafety":"resumed"}}`,
+		http.StatusAccepted, `{"outcome":"resumed","turnId":"turn-9"}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, _, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"session", "resume-queue", "demo-1")
+	if err == nil || ExitCode(err) != 2 {
+		t.Fatalf("err = %v, want a usage error (exit 2)", err)
+	}
+	if capture.get() != nil {
+		t.Fatalf("body = %v, want no resume request", capture.get())
+	}
+}
+
+// TestSessionResumeQueueFlagsOverrideObserved proves the manual flags respect the
+// same mandatory contract and are sent explicitly.
+func TestSessionResumeQueueFlagsOverrideObserved(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := queueResumeServer(t, heldQueueJSON, http.StatusAccepted, `{"outcome":"resumed","turnId":"turn-x"}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"session", "resume-queue", "demo-1", "--turn", "turn-x", "--generation", "gen-x")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	body := capture.get()
+	if body["expectedTurnId"] != "turn-x" || body["expectedControllerGeneration"] != "gen-x" {
+		t.Fatalf("body = %v, want the explicit overrides", body)
+	}
+}
+
+// TestSessionResumeQueueEmptyGenerationFlagIsUsageError proves an explicitly
+// empty generation is refused before the request is sent.
+func TestSessionResumeQueueEmptyGenerationFlagIsUsageError(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv, capture := queueResumeServer(t, heldQueueJSON, http.StatusAccepted, `{"outcome":"resumed","turnId":"turn-9"}`)
+	writeRunFileFor(t, cfg, srv)
+
+	_, _, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"session", "resume-queue", "demo-1", "--generation", "")
+	if err == nil || ExitCode(err) != 2 {
+		t.Fatalf("err = %v, want a usage error (exit 2)", err)
+	}
+	if capture.get() != nil {
+		t.Fatalf("body = %v, want no resume request", capture.get())
+	}
+}
+
 func TestSessionQueuePrintsDerivedState(t *testing.T) {
 	cfg := setConfigEnv(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -157,7 +212,7 @@ func TestSessionQueuePrintsDerivedState(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"queue":{"queueState":"held_after_terminal_failure","pendingCount":2,"headTurnId":"turn-9","controllerAvailable":true,"resumeSafety":"resumed"}}`)
+		_, _ = io.WriteString(w, `{"queue":{"queueState":"held_after_terminal_failure","pendingCount":2,"headTurnId":"turn-9","controllerGeneration":"gen-1","controllerAvailable":true,"resumeSafety":"resumed"}}`)
 	}))
 	t.Cleanup(srv.Close)
 	writeRunFileFor(t, cfg, srv)
@@ -170,7 +225,7 @@ func TestSessionQueuePrintsDerivedState(t *testing.T) {
 	if !strings.Contains(out, "held_after_terminal_failure") || !strings.Contains(out, "turn-9") {
 		t.Fatalf("output = %q, want the derived state and head", out)
 	}
-	if !strings.Contains(out, "ao session resume-queue demo-1 --turn turn-9") {
+	if !strings.Contains(out, "ao session resume-queue demo-1 --turn turn-9 --generation gen-1") {
 		t.Fatalf("output missing the resume hint: %q", out)
 	}
 }

@@ -139,6 +139,36 @@ func TestResumeQueuedTurnRouteMissingTurn(t *testing.T) {
 	}
 }
 
+func TestResumeQueuedTurnRouteMissingGeneration(t *testing.T) {
+	svc := &resumeQueueStub{
+		fakeConversationService: &fakeConversationService{},
+		err:                     chatsvc.ErrResumeControllerGenerationRequired,
+	}
+	status, body := postResumeQueue(t, svc, map[string]any{"expectedTurnId": "turn-1"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	}
+	if body["code"] != "CHAT_QUEUE_RESUME_GENERATION_REQUIRED" {
+		t.Fatalf("code = %v, want CHAT_QUEUE_RESUME_GENERATION_REQUIRED", body["code"])
+	}
+}
+
+func TestResumeQueuedTurnRouteStaleGenerationError(t *testing.T) {
+	svc := &resumeQueueStub{
+		fakeConversationService: &fakeConversationService{},
+		err:                     chatsvc.ErrStaleControllerGeneration,
+	}
+	status, body := postResumeQueue(t, svc, map[string]any{
+		"expectedTurnId": "turn-1", "expectedControllerGeneration": "stale-gen",
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
+	}
+	if body["code"] != "CHAT_QUEUE_STALE_CONTROLLER" {
+		t.Fatalf("code = %v, want CHAT_QUEUE_STALE_CONTROLLER", body["code"])
+	}
+}
+
 func TestResumeQueuedTurnRouteNotImplemented(t *testing.T) {
 	// A service without the optional interface must answer 501, not 500.
 	status, _ := postResumeQueue(t, &fakeConversationService{}, map[string]any{"expectedTurnId": "turn-1"})

@@ -66,6 +66,12 @@ type QueueResumeResult struct {
 // The CAS is the concurrency guard, so the head id is mandatory.
 var ErrResumeTurnIDRequired = errors.New("expectedTurnId is required")
 
+// ErrResumeControllerGenerationRequired reports a resume call that did not name
+// the controller generation. An empty generation is never interpreted as "use
+// the current one": the caller must name the epoch it observed so a stale caller
+// cannot silently resume against a replacement controller.
+var ErrResumeControllerGenerationRequired = errors.New("expectedControllerGeneration is required")
+
 // ErrStaleControllerGeneration reports that the controller selected for a resume
 // is no longer the durable owner of the session. The client should re-read the
 // conversation and retry against the current generation.
@@ -104,15 +110,6 @@ func (c *Controller) armResumeHold(turnID string) {
 	c.mu.Unlock()
 }
 
-// bindResumeHoldProvider fills the provider turn id once dispatch has bound it.
-func (c *Controller) bindResumeHoldProvider(providerTurnID string) {
-	c.mu.Lock()
-	if hold := c.resumeHold; hold != nil {
-		hold.providerTurnID = providerTurnID
-	}
-	c.mu.Unlock()
-}
-
 // clearResumeHold retires the one-shot on failure, interrupt, handoff or close.
 func (c *Controller) clearResumeHold() {
 	c.mu.Lock()
@@ -138,15 +135,25 @@ func (c *Controller) consumeResumeHold(providerTurnID string) bool {
 }
 
 // ResumeQueuedTurn releases exactly one never-sent queued turn named by
-// expectedTurnID. The caller must supply validate, which re-proves — under the
-// dispatch lock — that this controller is still the registered, durable owner of
-// the session. Every precondition is evaluated under sendMu, so nothing can move
-// between the check and the dispatch.
+// expectedTurnID for the controller epoch named by expectedControllerGeneration.
+// The caller must supply validate, which re-proves — under the dispatch lock —
+// that this controller is still the registered, durable owner of the session.
+//
+// The controller itself refuses any generation other than its own before the
+// durable claim, and the claim's compare-and-set re-checks both the row's
+// generation and the handling session's live generation in one statement. So a
+// controller that lost ownership — even one that passed the caller's preliminary
+// validate — cannot claim, and can never claim a turn that belongs to a newer
+// generation.
 func (c *Controller) ResumeQueuedTurn(
 	ctx context.Context,
-	expectedTurnID string,
+	expectedTurnID, expectedControllerGeneration string,
 	validate func() error,
 ) (QueueResumeResult, error) {
+	if expectedControllerGeneration == "" || expectedControllerGeneration != c.generation {
+		return QueueResumeResult{}, ErrStaleControllerGeneration
+	}
+
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
@@ -180,7 +187,7 @@ func (c *Controller) ResumeQueuedTurn(
 	// Arm the one-shot before dispatch so the resumed turn's terminal event holds
 	// the queue instead of releasing the next turn.
 	c.armResumeHold(expectedTurnID)
-	if err := c.drainLockedFor(ctx, true, expectedTurnID, true); err != nil {
+	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true); err != nil {
 		c.clearResumeHold()
 		switch {
 		case errors.Is(err, errResumeNoPendingWork):
@@ -192,9 +199,6 @@ func (c *Controller) ResumeQueuedTurn(
 			// queue is untouched. Surface the provider failure to the caller.
 			return QueueResumeResult{}, errors.Join(ErrQueueDispatchFailed, err)
 		}
-	}
-	if turn, lookupErr := c.store.TurnByID(ctx, expectedTurnID); lookupErr == nil {
-		c.bindResumeHoldProvider(turn.ProviderTurnID)
 	}
 	return QueueResumeResult{Outcome: QueueResumeResumed, TurnID: expectedTurnID}, nil
 }
@@ -217,6 +221,9 @@ func (s *Service) ResumeHeldQueue(
 	if strings.TrimSpace(expectedTurnID) == "" {
 		return QueueResumeResult{}, ErrResumeTurnIDRequired
 	}
+	if strings.TrimSpace(expectedControllerGeneration) == "" {
+		return QueueResumeResult{}, ErrResumeControllerGenerationRequired
+	}
 	record, err := s.requireChatSession(ctx, id)
 	if err != nil {
 		return QueueResumeResult{}, err
@@ -233,6 +240,21 @@ func (s *Service) ResumeHeldQueue(
 		return QueueResumeResult{}, err
 	}
 	defer release()
+
+	// Hold the session's controller gate across the whole resume: validation,
+	// the durable claim, and the provider boundary. Start/Stop/branch-handoff
+	// install and replace controllers under this same gate, and the durable
+	// controller_generation only changes inside Start while it holds the gate.
+	// So while this section runs the epoch cannot change, which is the shared
+	// synchronization boundary between "this controller owns the session" and
+	// "the provider is called". Lock order is gate -> sendMu (inside
+	// ResumeQueuedTurn), matching lockCurrentSide; nothing takes sendMu then the
+	// gate, so there is no inversion.
+	gate := s.controllerGate(domain.SessionConversationOwner(id))
+	if err := gate.lock(ctx); err != nil {
+		return QueueResumeResult{}, err
+	}
+	defer gate.unlock()
 
 	generation := controller.Generation()
 	validate := func() error {
@@ -256,12 +278,12 @@ func (s *Service) ResumeHeldQueue(
 		if durable.Metadata.ControllerGeneration != generation {
 			return ErrStaleControllerGeneration
 		}
-		if expectedControllerGeneration != "" && expectedControllerGeneration != generation {
+		if expectedControllerGeneration != generation {
 			return ErrStaleControllerGeneration
 		}
 		return nil
 	}
-	return controller.ResumeQueuedTurn(ctx, expectedTurnID, validate)
+	return controller.ResumeQueuedTurn(ctx, expectedTurnID, expectedControllerGeneration, validate)
 }
 
 // QueueState is the derived, never-persisted view of a conversation's send queue
@@ -343,8 +365,14 @@ func deriveQueueState(
 
 	runningBound := facts.RunningCount-facts.RunningUnboundCount > 0
 	runningUnbound := facts.RunningUnboundCount > 0
+	// A queue is held only when a terminal turn that actually withholds the queue
+	// left work behind. A completed turn drains; a cancelled turn was withdrawn
+	// before dispatch and does not hold anything. A session with no terminal turn
+	// yet is a fresh queue that has not had its chance to dispatch, not a hold.
 	heldAfterFailure := facts.PendingCount > 0 && facts.RunningCount == 0 &&
-		facts.LatestTerminalState != "" && facts.LatestTerminalState != domain.TurnStateCompleted
+		(facts.LatestTerminalState == domain.TurnStateFailed ||
+			facts.LatestTerminalState == domain.TurnStateRecovered ||
+			facts.LatestTerminalState == domain.TurnStateInterrupted)
 
 	switch {
 	case record.IsTerminated:

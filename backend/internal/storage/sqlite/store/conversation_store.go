@@ -2281,19 +2281,25 @@ func (s *Store) ConversationQueueFacts(ctx context.Context, conversationID strin
 // for an explicit queue resume. It is the durable compare-and-set the resume
 // requires: a pre-check followed by an unconditional update would let a row that
 // another path already dispatched, promoted, cancelled or rolled back cross the
-// provider boundary. Returns false when the row is no longer a claimable queue
-// item, in which case the caller must not call the provider.
+// provider boundary. It also requires the row's generation and the handling
+// session's live generation to equal expectedControllerGeneration, inside the
+// same statement, so a controller that lost ownership cannot claim even if it
+// passed a preliminary Go-side check. Returns false when the row is no longer a
+// claimable queue item or the epoch changed, in which case the caller must not
+// call the provider.
 func (s *Store) ClaimQueuedTurnForResume(
 	ctx context.Context,
-	conversationID, turnID string,
+	conversationID, turnID, expectedControllerGeneration string,
 	now time.Time,
 ) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	rows, err := s.qw.ClaimQueuedConversationTurnForResume(ctx,
 		gen.ClaimQueuedConversationTurnForResumeParams{
-			Now: sql.NullTime{Time: now, Valid: true},
-			ID:  turnID, ConversationID: conversationID,
+			Now:                          sql.NullTime{Time: now, Valid: true},
+			ID:                           turnID,
+			ConversationID:               conversationID,
+			ExpectedControllerGeneration: expectedControllerGeneration,
 		})
 	if err != nil {
 		return false, fmt.Errorf("claim queued turn %s for resume: %w", turnID, err)

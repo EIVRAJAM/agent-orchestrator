@@ -15960,6 +15960,7 @@ components:
           type: string
       required:
       - expectedTurnId
+      - expectedControllerGeneration
       type: object
     ResumeConversationQueueResponse:
       properties:
