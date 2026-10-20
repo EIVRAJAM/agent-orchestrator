@@ -64,6 +64,26 @@ func waitResumeHoldCleared(t *testing.T, h *harness) {
 	t.Fatalf("one-shot marker was not consumed: still armed for %q", h.ctrl.ResumeHoldTurnIDForTest())
 }
 
+// waitTurnState waits until a turn reaches a durable terminal state, so a test
+// does not race the projector after a terminal event.
+func waitTurnState(t *testing.T, h *harness, id string, want domain.TurnState) domain.ConversationTurn {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last domain.ConversationTurn
+	for time.Now().Before(deadline) {
+		turn, err := h.st.TurnByID(context.Background(), id)
+		if err == nil {
+			last = turn
+			if turn.State == want {
+				return turn
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("turn %s state = %q, want %q", id, last.State, want)
+	return domain.ConversationTurn{}
+}
+
 // TestResumeHeldQueueGenerationChangeAfterValidationRefused proves the durable
 // generation is checked inside the claim, not only in the Go-side validation.
 //

@@ -83,6 +83,7 @@ type Store interface {
 	CleanupOwnedControllerWork(ctx context.Context, session domain.SessionID, conversationID, generation string, now time.Time) (bool, error)
 	CleanupOwnedReviewControllerWork(ctx context.Context, reviewID, conversationID, generation string, now time.Time) (bool, error)
 	ListVisibleRunningTurnProviderIDs(ctx context.Context, conversationID string) ([]string, error)
+	ListActiveRunningTurnProviderIDs(ctx context.Context, conversationID string, session domain.SessionID, generation string) ([]string, error)
 
 	SetConversationSettings(ctx context.Context, conversationID string, settings domain.ConversationSettings, now time.Time) error
 
@@ -1925,7 +1926,7 @@ func (c *Controller) dispatchTurn(
 		c.mu.Lock()
 		c.pendingTurnID = ref.ProviderTurnID
 		c.mu.Unlock()
-		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainEagerDelivery, err)
+		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, err)
 	}
 
 	c.mu.Lock()
@@ -1952,14 +1953,23 @@ func (c *Controller) dispatchTurn(
 	// projected. Eager drivers do not implement this optional interface.
 	if hasDeferredStart {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
-			c.mu.Lock()
-			c.pendingTurnID = ""
-			c.mu.Unlock()
-			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
-				c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
+			if errors.Is(err, ports.ErrDeferredTurnNotStarted) {
+				// The driver proved the provider boundary was not crossed: the
+				// prompt cannot have reached the provider. Settle it failed and let
+				// the caller clear the one-shot.
+				c.mu.Lock()
+				c.pendingTurnID = ""
+				c.mu.Unlock()
+				if settleErr := c.store.SettleTurnByID(
+					ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+					c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
+				}
+				return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
 			}
-			return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
+			// Ambiguous: the request may already have been written to the provider.
+			// Keep the durable binding, the in-memory pending turn and the one-shot,
+			// and do not settle, retry or drain. A late terminal settles it.
+			return domain.ConversationTurn{}, fmt.Errorf("%w: start turn: %w", errUncertainDelivery, err)
 		}
 	}
 
@@ -2073,7 +2083,7 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 	// an eager send whose provider id could not be recorded leaves exactly this
 	// state, and that delivery is uncertain. Recovery settles the orphan; the
 	// queue must not advance first.
-	if running, err := c.store.ListVisibleRunningTurnProviderIDs(ctx, c.conversation.ID); err != nil {
+	if running, err := c.store.ListActiveRunningTurnProviderIDs(ctx, c.conversation.ID, c.sessionID, c.generation); err != nil {
 		return err
 	} else if len(running) > 0 {
 		return nil
@@ -3536,8 +3546,20 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 		// dispatchTurn binds the hold's provider id before releasing sendMu, so a
 		// completion the driver emits synchronously from SendTurn cannot be seen as
 		// "not this turn's" while the hold is still unbound.
-		if c.consumeResumeHold(event.ProviderTurnID) {
+		if hold, consumed := c.consumeResumeHold(event.ProviderTurnID); consumed {
 			allow = false
+			// An eager send whose provider id could not be recorded leaves the row
+			// running/unbound. The terminal still names the provider id the marker
+			// captured, so settle the known AO turn by id; consuming the marker alone
+			// would leave the row running forever.
+			message := ""
+			if event.Err != nil {
+				message = event.Err.Error()
+			}
+			if err := c.settleResumeHoldTerminal(ctx, hold, settledTurnState(event), message, now); err != nil {
+				c.log.Error("failed to settle one-shot turn after a late terminal",
+					"session", c.sessionID, "turn", hold.turnID, "error", err)
+			}
 		}
 		_ = c.drainLocked(ctx, allow) // drain logs failures.
 	case ports.ChatEventApprovalRequested:

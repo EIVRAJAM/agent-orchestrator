@@ -3,6 +3,8 @@ package chat_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"reflect"
 	"sync"
 	"testing"
@@ -398,16 +400,19 @@ func durableGeneration(t *testing.T, h *harness) string {
 	return rec.Metadata.ControllerGeneration
 }
 
-// TestResumeDeferredStartFailureSettlesTurnAndClearsHold proves a deferred
-// StartDeferredTurn failure settles the claimed row failed, keeps the rest of the
-// queue, and retires the marker.
-func TestResumeDeferredStartFailureSettlesTurnAndClearsHold(t *testing.T) {
+// TestResumeDeferredStartNotStartedSettlesTurnAndClearsHold proves a deferred
+// StartDeferredTurn error that the driver proves is before the provider boundary
+// settles the claimed row failed, keeps the rest of the queue, and retires the
+// marker.
+func TestResumeDeferredStartNotStartedSettlesTurnAndClearsHold(t *testing.T) {
 	conv := &deferredConversation{fakeConversation: newFakeConversation()}
 	conv.start = func(string) error { return nil }
 	h := newHarnessWithConversation(t, conv)
 	first, second := queueTwoBehindFailingRoot(t, h, conv.emit)
 
-	conv.start = func(string) error { return errors.New("provider rejected the deferred prompt") }
+	conv.start = func(string) error {
+		return fmt.Errorf("%w: prepared turn missing", ports.ErrDeferredTurnNotStarted)
+	}
 
 	_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
 	if !errors.Is(err, chatsvc.ErrQueueDispatchFailed) {
@@ -417,10 +422,10 @@ func TestResumeDeferredStartFailureSettlesTurnAndClearsHold(t *testing.T) {
 		t.Fatalf("turn state = %q, want failed", state)
 	}
 	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != "" {
-		t.Fatalf("one-shot marker survived a deferred start failure: armed for %q", armed)
+		t.Fatalf("one-shot marker survived a deferred not-started error: armed for %q", armed)
 	}
 	// SendTurn prepared the turn (the fake records the preparation) and
-	// StartDeferredTurn refused the boundary; the durable outcome is failed.
+	// StartDeferredTurn proved the provider boundary was not crossed.
 	if got := conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
 		t.Fatalf("prepared sends = %v, want the refused deferred turn prepared once", got)
 	}
@@ -428,6 +433,72 @@ func TestResumeDeferredStartFailureSettlesTurnAndClearsHold(t *testing.T) {
 	if second.ID == "" {
 		t.Fatalf("second queued turn has no id")
 	}
+
+	// Because the provider never received it, the failed turn does not block a
+	// later resume of the next head.
+	conv.start = func(string) error { return nil }
+	result, err := h.svc.ResumeHeldQueue(context.Background(), testSession, second.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeResumed || result.TurnID != second.ID {
+		t.Fatalf("second resume = %+v, want resumed %s", result, second.ID)
+	}
+}
+
+// TestResumeDeferredAmbiguousStartStaysUncertainUntilLateTerminal proves an
+// ambiguous deferred StartDeferredTurn error (EOF, timeout, disconnect) is not
+// treated as "not delivered": the bound row stays running, the marker stays
+// armed, further resumes send nothing, and a late terminal settles it.
+func TestResumeDeferredAmbiguousStartStaysUncertainUntilLateTerminal(t *testing.T) {
+	conv := &deferredConversation{fakeConversation: newFakeConversation()}
+	conv.start = func(string) error { return nil }
+	h := newHarnessWithConversation(t, conv)
+	first, _ := queueTwoBehindFailingRoot(t, h, conv.emit)
+	ctx := context.Background()
+
+	conv.start = func(string) error { return io.EOF }
+
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeStateUncertain {
+		t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
+	}
+	turn, err := h.st.TurnByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID == "" {
+		t.Fatalf("turn = state %q provider id %q, want running with a durable binding", turn.State, turn.ProviderTurnID)
+	}
+	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
+		t.Fatalf("one-shot marker = %q, want %s while delivery is uncertain", armed, first.ID)
+	}
+
+	// While uncertain, a further resume is refused and sends nothing.
+	again, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if again.Outcome == chatsvc.QueueResumeResumed {
+		t.Fatalf("second outcome = %q, want a refusal", again.Outcome)
+	}
+	if got := conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want zero additional sends", got)
+	}
+
+	// The late terminal settles the bound row and consumes the marker.
+	conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
+		TurnState: domain.TurnStateCompleted,
+	})
+	waitResumeHoldCleared(t, h)
+	if state := turnStateByID(t, h, first.ID); state != domain.TurnStateCompleted {
+		t.Fatalf("turn state = %q, want completed", state)
+	}
+	assertTurnStaysQueued(t, h, "automation2")
 }
 
 // TestResumeDeferredSendFailureSettlesTurnAndClearsHold proves a deferred
@@ -511,63 +582,118 @@ func (s *bindStepStore) setFail(fail bool) {
 // SendTurn that succeeds but cannot record its provider id is an uncertain
 // delivery: the provider may have accepted the turn, so the row stays
 // running/unbound, the one-shot stays armed, and a later terminal for that
-// provider id is still recognized and cannot drain the queue.
+// provider id is still recognized, settles the known AO turn by id, and cannot
+// drain the queue. Covers completed, failed and interrupted terminals.
 func TestResumeEagerBindFailureIsUncertainUntilLateTerminal(t *testing.T) {
-	bind := &bindStepStore{}
-	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
-		bind.Store = st
-		return bind
-	})
-	first, _ := queueTwoBehindFailingRoot(t, h, h.conv.emit)
-	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		eventState domain.TurnState
+		wantState  domain.TurnState
+		wantError  string
+		wantQueue  chatsvc.QueueStateValue
+	}{
+		{"completed", domain.TurnStateCompleted, domain.TurnStateCompleted, "", chatsvc.QueueStateWaitingForActiveTurn},
+		{"failed", domain.TurnStateFailed, domain.TurnStateFailed, "provider failed", chatsvc.QueueStateHeldAfterFailure},
+		{"interrupted", domain.TurnStateInterrupted, domain.TurnStateInterrupted, "", chatsvc.QueueStateHeldAfterFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bind := &bindStepStore{}
+			h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+				bind.Store = st
+				return bind
+			})
+			first, second := queueTwoBehindFailingRoot(t, h, h.conv.emit)
+			ctx := context.Background()
 
-	bind.setFail(true)
-	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
-	if err != nil {
-		t.Fatalf("resume: %v", err)
-	}
-	if result.Outcome != chatsvc.QueueResumeStateUncertain {
-		t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
-	}
-	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
-		t.Fatalf("provider received %v, want the uncertain send exactly once", got)
-	}
-	turn, err := h.st.TurnByID(ctx, first.ID)
-	if err != nil {
-		t.Fatalf("TurnByID: %v", err)
-	}
-	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" {
-		t.Fatalf("turn = state %q provider id %q, want running/unbound", turn.State, turn.ProviderTurnID)
-	}
-	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
-		t.Fatalf("one-shot marker = %q, want %s while delivery is uncertain", armed, first.ID)
-	}
-	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateUncertain {
-		t.Fatalf("snapshot state = %q, want state_uncertain", queue.State)
-	}
+			bind.setFail(true)
+			result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if result.Outcome != chatsvc.QueueResumeStateUncertain {
+				t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
+			}
+			if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+				t.Fatalf("provider received %v, want the uncertain send exactly once", got)
+			}
+			turn, err := h.st.TurnByID(ctx, first.ID)
+			if err != nil {
+				t.Fatalf("TurnByID: %v", err)
+			}
+			if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" {
+				t.Fatalf("turn = state %q provider id %q, want running/unbound", turn.State, turn.ProviderTurnID)
+			}
+			if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
+				t.Fatalf("one-shot marker = %q, want %s while delivery is uncertain", armed, first.ID)
+			}
+			if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateUncertain {
+				t.Fatalf("snapshot state = %q, want state_uncertain", queue.State)
+			}
 
-	// A second resume before the terminal is rejected and sends nothing.
-	again, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
-	if err != nil {
-		t.Fatalf("second resume: %v", err)
-	}
-	if again.Outcome != chatsvc.QueueResumeStateUncertain {
-		t.Fatalf("second outcome = %q, want state_uncertain", again.Outcome)
-	}
-	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
-		t.Fatalf("provider received %v, want zero additional sends", got)
-	}
+			// A second resume before the terminal is rejected and sends nothing.
+			again, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+			if err != nil {
+				t.Fatalf("second resume: %v", err)
+			}
+			if again.Outcome != chatsvc.QueueResumeStateUncertain {
+				t.Fatalf("second outcome = %q, want state_uncertain", again.Outcome)
+			}
+			if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+				t.Fatalf("provider received %v, want zero additional sends", got)
+			}
 
-	// The late terminal for that provider id is recognized and consumed.
-	h.conv.emit(ports.ChatEvent{
-		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
-		TurnState: domain.TurnStateCompleted,
-	})
-	waitResumeHoldCleared(t, h)
-	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
-		t.Fatalf("provider received %v, want no second send after the late terminal", got)
+			// The late terminal is correlated by the marker and settles the row by
+			// AO id, without pretending the provider binding was persisted.
+			event := ports.ChatEvent{
+				Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
+				TurnState: tc.eventState,
+			}
+			if tc.wantError != "" {
+				event.Err = errors.New(tc.wantError)
+			}
+			h.conv.emit(event)
+			turn = waitTurnState(t, h, first.ID, tc.wantState)
+			waitResumeHoldCleared(t, h)
+
+			if turn.CompletedAt == nil {
+				t.Fatalf("completed_at is nil after a terminal")
+			}
+			if turn.ErrorMessage != tc.wantError {
+				t.Fatalf("error_message = %q, want %q", turn.ErrorMessage, tc.wantError)
+			}
+			running, err := h.st.ListActiveRunningTurnProviderIDs(
+				ctx, h.ctrl.ConversationID(), testSession, currentGeneration(h))
+			if err != nil {
+				t.Fatalf("ListActiveRunningTurnProviderIDs: %v", err)
+			}
+			if len(running) != 0 {
+				t.Fatalf("still has running turns %v after the late terminal", running)
+			}
+			if queue := snapshotQueue(t, h); queue.State != tc.wantQueue {
+				t.Fatalf("snapshot state = %q, want %q", queue.State, tc.wantQueue)
+			}
+			if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != "" {
+				t.Fatalf("one-shot marker = %q, want empty after the terminal", armed)
+			}
+			assertTurnStaysQueued(t, h, "automation2")
+			if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+				t.Fatalf("provider received %v, want no second send after the late terminal", got)
+			}
+
+			// A new explicit resume of the next head still works.
+			bind.setFail(false)
+			next, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, currentGeneration(h))
+			if err != nil {
+				t.Fatalf("next resume: %v", err)
+			}
+			if next.Outcome != chatsvc.QueueResumeResumed || next.TurnID != second.ID {
+				t.Fatalf("next resume = %+v, want resumed %s", next, second.ID)
+			}
+			if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation", "automation2"}) {
+				t.Fatalf("provider received %v, want the next head sent once", got)
+			}
+		})
 	}
-	assertTurnStaysQueued(t, h, "automation2")
 }
 
 // TestResumeEagerBindFailureWithoutTerminalStaysUncertain proves no terminal is
@@ -718,5 +844,98 @@ func TestResumeHoldsGateAcrossClaimAndStop(t *testing.T) {
 	}
 	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
 		t.Fatalf("provider received %v, want no next-turn dispatch", got)
+	}
+}
+
+// TestResumeIgnoresObsoleteGenerationRunningTurn proves the running guard is
+// scoped to the live generation: a residual running/unbound row from an obsolete
+// controller generation does not block a resume of current-generation work. That
+// row follows recovery/settlement; it is not this controller's in-flight turn.
+func TestResumeIgnoresObsoleteGenerationRunningTurn(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	convID := h.ctrl.ConversationID()
+	generation := currentGeneration(h)
+
+	if created, err := h.st.AppendUserMessage(ctx, convID, testSession, "obsolete-generation",
+		domain.ConversationMessage{
+			ID: "message-obsolete", Origin: domain.MessageOriginAutomation, Text: "obsolete", ClientMessageID: "client-obsolete",
+		}, "turn-obsolete", h.now()); err != nil || !created {
+		t.Fatalf("AppendUserMessage obsolete: created=%v err=%v", created, err)
+	}
+	if err := h.st.MarkTurnDispatching(ctx, "turn-obsolete"); err != nil {
+		t.Fatalf("mark obsolete dispatching: %v", err)
+	}
+	if created, err := h.st.AppendUserMessage(ctx, convID, testSession, generation,
+		domain.ConversationMessage{
+			ID: "message-current", Origin: domain.MessageOriginAutomation, Text: "resume-me", ClientMessageID: "client-current",
+		}, "turn-current", h.now()); err != nil || !created {
+		t.Fatalf("AppendUserMessage current: created=%v err=%v", created, err)
+	}
+
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, "turn-current", generation)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeResumed || result.TurnID != "turn-current" {
+		t.Fatalf("resume = %+v, want resumed turn-current", result)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"resume-me"}) {
+		t.Fatalf("provider received %v, want only the current-generation turn", got)
+	}
+	if state := turnStateByID(t, h, "turn-obsolete"); state != domain.TurnStateRunning {
+		t.Fatalf("obsolete turn state = %q, want left running for recovery", state)
+	}
+}
+
+// TestResumeDeferredAmbiguousStartErrorsStayUncertain proves every ambiguous
+// deferred StartDeferredTurn error (EOF, timeout, cancellation) is treated as a
+// possible acceptance: the bound row stays running, the marker stays armed, and
+// a further resume sends nothing.
+func TestResumeDeferredAmbiguousStartErrorsStayUncertain(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"eof", io.EOF},
+		{"timeout", context.DeadlineExceeded},
+		{"cancelled", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conv := &deferredConversation{fakeConversation: newFakeConversation()}
+			conv.start = func(string) error { return nil }
+			h := newHarnessWithConversation(t, conv)
+			first, _ := queueTwoBehindFailingRoot(t, h, conv.emit)
+			ctx := context.Background()
+
+			conv.start = func(string) error { return tc.err }
+			result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+			if err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			if result.Outcome != chatsvc.QueueResumeStateUncertain {
+				t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
+			}
+			turn, err := h.st.TurnByID(ctx, first.ID)
+			if err != nil {
+				t.Fatalf("TurnByID: %v", err)
+			}
+			if turn.State != domain.TurnStateRunning || turn.ProviderTurnID == "" {
+				t.Fatalf("turn = state %q provider id %q, want running with a durable binding", turn.State, turn.ProviderTurnID)
+			}
+			if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
+				t.Fatalf("one-shot marker = %q, want %s", armed, first.ID)
+			}
+			again, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+			if err != nil {
+				t.Fatalf("second resume: %v", err)
+			}
+			if again.Outcome == chatsvc.QueueResumeResumed {
+				t.Fatalf("second outcome = %q, want a refusal", again.Outcome)
+			}
+			if got := conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+				t.Fatalf("provider received %v, want zero additional sends", got)
+			}
+		})
 	}
 }

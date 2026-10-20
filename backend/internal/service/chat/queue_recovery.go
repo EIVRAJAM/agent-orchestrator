@@ -85,11 +85,12 @@ var ErrSessionTerminated = errors.New("session is terminated")
 // is untouched.
 var ErrQueueDispatchFailed = errors.New("the released turn was not accepted by the provider")
 
-// errUncertainEagerDelivery reports an eager SendTurn whose provider turn id
-// could not be written. The provider may already have accepted and run the turn,
-// so this is an uncertain delivery — not an undispatched turn. The row stays
-// running/unbound, the one-shot hold stays armed, and no automatic drain follows.
-var errUncertainEagerDelivery = errors.New("provider accepted the turn but its id could not be recorded")
+// errUncertainDelivery reports a dispatch that may have crossed the provider
+// boundary without a durable result: an eager SendTurn whose provider id could
+// not be recorded, or a deferred StartDeferredTurn that returned an ambiguous
+// error. The provider may have accepted and run the turn, so the one-shot stays
+// armed, the row stays running, and no automatic drain follows.
+var errUncertainDelivery = errors.New("the provider may have accepted the turn but AO could not confirm it")
 
 // errResumeNoPendingWork and errResumeStaleQueueState are the internal signals
 // drainLockedFor returns for the explicit-resume path only.
@@ -125,19 +126,43 @@ func (c *Controller) clearResumeHold() {
 
 // consumeResumeHold clears and reports whether a primary terminal event belongs
 // to the one-shot resumed turn. Only a matching event suppresses the automatic
-// drain; an ordinary completed turn is unaffected.
-func (c *Controller) consumeResumeHold(providerTurnID string) bool {
+// drain; an ordinary completed turn is unaffected. It returns the hold so the
+// caller can settle a turn whose provider id never reached the durable row.
+func (c *Controller) consumeResumeHold(providerTurnID string) (resumeHold, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	hold := c.resumeHold
 	if hold == nil || hold.generation != c.generation {
-		return false
+		return resumeHold{}, false
 	}
 	if hold.providerTurnID == "" || hold.providerTurnID != providerTurnID {
-		return false
+		return resumeHold{}, false
 	}
 	c.resumeHold = nil
-	return true
+	return *hold, true
+}
+
+// settleResumeHoldTerminal settles the one-shot turn by AO id when its provider
+// id never reached the durable row. The marker is the correlation: it was bound
+// to this provider id in the controller's memory before the durable write
+// failed, so the terminal is safely attributable to this turn without pretending
+// the binding persisted. A turn that already has a provider id (or is already
+// terminal) was handled by the normal settle path.
+func (c *Controller) settleResumeHoldTerminal(
+	ctx context.Context,
+	hold resumeHold,
+	state domain.TurnState,
+	message string,
+	now time.Time,
+) error {
+	turn, err := c.store.TurnByID(ctx, hold.turnID)
+	if err != nil {
+		return err
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" {
+		return nil
+	}
+	return c.store.SettleTurnByID(ctx, hold.turnID, state, message, now)
 }
 
 // ResumeQueuedTurn releases exactly one never-sent queued turn named by
@@ -169,7 +194,7 @@ func (c *Controller) ResumeQueuedTurn(
 	if c.HandoffActive() {
 		return QueueResumeResult{Outcome: QueueResumeHandoffInProgress}, nil
 	}
-	running, err := c.store.ListVisibleRunningTurnProviderIDs(ctx, c.conversation.ID)
+	running, err := c.store.ListActiveRunningTurnProviderIDs(ctx, c.conversation.ID, c.sessionID, c.generation)
 	if err != nil {
 		return QueueResumeResult{}, err
 	}
@@ -194,7 +219,7 @@ func (c *Controller) ResumeQueuedTurn(
 	// the queue instead of releasing the next turn.
 	c.armResumeHold(expectedTurnID)
 	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true); err != nil {
-		if errors.Is(err, errUncertainEagerDelivery) {
+		if errors.Is(err, errUncertainDelivery) {
 			// The eager provider boundary was crossed but AO could not record the
 			// provider id. Keep the one-shot armed so a late terminal for this
 			// provider id still holds the queue instead of releasing the next turn.

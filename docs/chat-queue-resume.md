@@ -194,17 +194,24 @@ next turn.
 
 ### Delivery certainty and bind failures
 
-The provider boundary and the durable binding are not the same step, and the two
-drivers order them differently:
+The provider boundary and the durable binding are not the same step, and each
+adapter orders them differently. Do not claim "rejected" from a local error.
 
-- **Eager** (for example Codex app-server): `SendTurn` is the provider boundary.
-  It returns once the provider acknowledges. `BindTurnToProvider` then records the
-  provider turn id.
-- **Deferred** (ACP/OpenCode): `SendTurn` only prepares the request.
-  `BindTurnToProvider` runs first and `StartDeferredTurn` is the provider
-  boundary.
+| Adapter | Provider boundary | Durable binding | Acceptance evidence | Definitive-before-send errors | Ambiguous after-boundary errors |
+| --- | --- | --- | --- | --- | --- |
+| Eager (Codex app-server, `ChatConversation.SendTurn`) | `SendTurn` — it sends `turn/start` and waits for the provider acknowledgement | `BindTurnToProvider`, after `SendTurn` returns the provider id | the provider turn id returned by `SendTurn` | local validation before the request (settings, busy conversation, closed conversation) | a transport error, EOF, timeout or cancel after the request may have been written |
+| Deferred (ACP/OpenCode/OpenCode v2, `ChatDeferredTurnStarter`) | `StartDeferredTurn` — ACP `session/prompt` | `BindTurnToProvider`, **before** `StartDeferredTurn` | none synchronously; the turn's events arrive on the stream | `ports.ErrDeferredTurnNotStarted`: the adapter proves the prompt was never issued (conversation closed, prepared turn missing) | any other `StartDeferredTurn` error, and any later transport error/EOF/timeout/cancel that arrives as a turn event |
 
-So a `BindTurnToProvider` failure means different things:
+`StartDeferredTurn` in ACP never performs the RPC itself:
+`adapters/chatdriver/acp/conversation.go` validates local state and then starts
+`runTurn` in a goroutine. `runTurn` calls `conn.Prompt`, and a prompt error is
+reported as a terminal turn event. So an ACP `StartDeferredTurn` error is
+definitively before the provider boundary, and it is wrapped with
+`ports.ErrDeferredTurnNotStarted`. Any error the adapter cannot prove is
+pre-send must not be wrapped: the controller then treats it conservatively as an
+uncertain delivery.
+
+A `BindTurnToProvider` failure means different things:
 
 | Driver | Bind failure means | Row | One-shot | Outcome |
 | --- | --- | --- | --- | --- |
@@ -214,26 +221,43 @@ So a `BindTurnToProvider` failure means different things:
 For an eager bind failure the resume never reports `resumed`, never requeues the
 row, never retries the send, and never dispatches the next turn. The hold is bound
 to the provider id **before** the durable write, so a late terminal for that id is
-still recognized as the resumed turn's own and suppresses the automatic drain.
-The row stays `running`/unbound, so the snapshot reports `state_uncertain`, every
-later resume is refused with zero sends, and the controller stays busy until
-recovery settles the orphan. The drain also refuses while any durable running turn
-exists, so an unrelated later event cannot advance the queue either.
+still recognized as the resumed turn's own. The row stays `running`/unbound, so
+the snapshot reports `state_uncertain`, every later resume is refused with zero
+sends, and the controller stays busy until recovery settles the orphan. If the
+late terminal does arrive, the marker is the safe correlation: the controller
+settles that known AO turn by id (it does not pretend the provider binding was
+persisted), so the row does not stay `running` forever.
 
 For a deferred bind failure the prepared turn is discarded and the row is settled
 `failed`; because the provider boundary was never crossed, the next turn may be
 resumed normally.
+
+An ambiguous deferred `StartDeferredTurn` error keeps the durable binding and the
+one-shot, leaves the row `running`, reports `state_uncertain`, and settles only
+when a terminal arrives. A later resume is refused with zero sends.
+
+The durable dispatch guard and the explicit-resume pre-check use
+`ListActiveRunningTurnsForController`, scoped to:
+
+- `conversation_id` (another conversation never blocks);
+- `handled_by_session_id` and `controller_generation` (a residual row from an
+  obsolete controller epoch follows recovery/settlement instead of blocking a
+  replacement forever);
+- `state = 'running'`, `rolled_back_at IS NULL`, `promoted_to_turn_id IS NULL`
+  (terminal, rolled-back and promoted rows never block);
+- the same active-branch lineage the snapshot exposes.
 
 ### Failure classes
 
 | When the failure happens | Turn row | One-shot | Outcome | Provider may have it | Another resume | Who settles |
 | --- | --- | --- | --- | --- | --- | --- |
 | before the CAS (head moved, decode/excerpt, store error) | `queued` or already terminal | cleared | `stale_queue_state` / `no_pending_work` / error | no | yes (re-read) | no one; the row never left the queue |
-| after the CAS, before the provider (eager) | `failed` (settled by dispatch) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
-| after the provider may have accepted (eager `SendTurn` ok, bind failed) | `running`, unbound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | the controller's stream or recovery (`SettleOrphanedConversationTurns`) |
-| after the durable binding, `StartDeferredTurn` fails | `failed` | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | request issued, rejected | yes | `dispatchTurn` settles it |
+| after the CAS, before the provider (eager `SendTurn` fails) | `failed` (settled by dispatch) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
+| after the provider may have accepted (eager `SendTurn` ok, bind failed) | `running`, unbound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | the late terminal by AO id, or recovery |
+| deferred `StartDeferredTurn` proves not started | `failed` (binding persisted, provider never received) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
+| deferred `StartDeferredTurn` ambiguous (EOF/timeout/disconnect) | `running`, bound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | the late terminal |
 | deferred bind fails before `StartDeferredTurn` | `failed` | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
-| dispatch/claim later fails after a durable binding | terminal per the store | cleared by the error path | mapped by outcome | yes | only after the terminal | the terminal / recovery |
+| terminal event arrives after an uncertain delivery | terminal per the event | consumed | — | yes | only after the terminal | the event handler |
 
 No failure after a possible acceptance can requeue the row, replay the send, or
 let the queue drain automatically.
@@ -288,6 +312,10 @@ calls back into the service. So there is no cycle and no inversion.
   CAS claims exactly the named turn; refuses a stale row generation; refuses a
   changed live session generation; refuses a wrong named generation; never claims
   another turn or re-claims the same one; the row stays `queued` on every refusal.
+- `backend/internal/storage/sqlite/store/conversation_active_running_test.go`: the
+  running guard is scoped to the live controller epoch: active bound and unbound
+  rows count; terminal, rolled-back, promoted, other-conversation and obsolete
+  generation rows do not.
 - `backend/internal/service/chat/queue_recovery_test.go`: one-turn release; re-hold
   after the resumed turn completes; ordinary completed turn still drains;
   concurrent resume dispatches at most one; stale head refused; no pending work;
@@ -315,9 +343,13 @@ calls back into the service. So there is no cycle and no inversion.
   after the single send; a real replacement that wins the gate first makes the
   resume revalidate and refuse; deferred `SendTurn` and `StartDeferredTurn`
   failures settle the claimed row and clear the marker; the deferred provider id
-  is bound before `StartDeferredTurn`; an eager bind failure after `SendTurn`
-  stays `state_uncertain` with the marker armed, a late terminal is consumed, and
-  a second resume sends nothing (with and without the late terminal).
+  is bound before `StartDeferredTurn`; a deferred `ErrDeferredTurnNotStarted`
+  settles failed while an ambiguous EOF stays `state_uncertain` until its late
+  terminal; an eager bind failure after `SendTurn` stays `state_uncertain` with
+  the marker armed, and a late completed/failed/interrupted terminal settles the
+  row by AO id, clears the marker, leaves the next turn queued, and allows the
+  next explicit resume; an obsolete-generation running row does not block a
+  current-generation resume.
 - `backend/internal/service/chat/queue_state_derivation_test.go`: a fresh queue, a
   completed terminal turn, a compaction, a handoff, and an absent controller are
   not labelled `held_after_terminal_failure`; the priority order between

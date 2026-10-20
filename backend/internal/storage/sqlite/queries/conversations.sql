@@ -776,6 +776,47 @@ WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
   ))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
 
+-- Running turns that belong to one controller epoch. The durable dispatch guard
+-- and the explicit resume use this instead of every visible running row: a
+-- replacement controller must not be blocked forever by a row recovery will
+-- settle for an obsolete generation or session, and a rolled-back or promoted
+-- row is not running work. The visible-branch lineage matches
+-- ListVisibleRunningTurnsForConversation.
+-- name: ListActiveRunningTurnsForController :many
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
+    FROM conversations
+    WHERE conversations.id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE
+               WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+               WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+               ELSE path.max_sequence
+           END
+    FROM active_path AS path
+    JOIN conversation_branches AS branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+)
+SELECT conversation_turns.provider_turn_id FROM conversation_turns
+JOIN active_path AS path ON path.branch_id = conversation_turns.branch_id
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(session_id)
+  AND conversation_turns.controller_generation = sqlc.arg(generation)
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.promoted_to_turn_id IS NULL
+  AND (path.max_sequence IS NULL OR EXISTS (
+      SELECT 1 FROM conversation_messages AS lineage_message
+      WHERE lineage_message.turn_id = conversation_turns.id
+        AND lineage_message.sequence <= path.max_sequence
+      UNION ALL
+      SELECT 1 FROM conversation_activities AS lineage_activity
+      WHERE lineage_activity.turn_id = conversation_turns.id
+        AND lineage_activity.sequence <= path.max_sequence
+  ))
+ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
+
 -- Overwrite the turn's changed-file summary. The provider re-sends the whole diff
 -- on every update, so the latest payload is the complete answer and there is
 -- nothing to merge with what was there before.

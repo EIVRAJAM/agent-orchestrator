@@ -1802,6 +1802,29 @@ func (s *Store) ListVisibleRunningTurnProviderIDs(
 	return providerTurnIDs, nil
 }
 
+// ListActiveRunningTurnProviderIDs returns the active-branch running turns for one
+// controller epoch only. It excludes rolled-back and promoted rows and ignores
+// work owned by an obsolete session or generation, which recovery settles. The
+// dispatch guard and the explicit resume use it so a replacement controller is
+// neither blocked forever by an old row nor allowed to dispatch behind an
+// uncertain turn of its own generation.
+func (s *Store) ListActiveRunningTurnProviderIDs(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	generation string,
+) ([]string, error) {
+	providerTurnIDs, err := s.qr.ListActiveRunningTurnsForController(ctx, gen.ListActiveRunningTurnsForControllerParams{
+		ConversationID: conversationID,
+		SessionID:      session,
+		Generation:     generation,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list active running turns for %s: %w", conversationID, err)
+	}
+	return providerTurnIDs, nil
+}
+
 // SetConversationSettings records the provider choices for the next turn.
 //
 // An empty field is stored as NULL rather than as an empty string, so "the user
