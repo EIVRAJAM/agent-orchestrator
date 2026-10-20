@@ -199,11 +199,11 @@ func TestResumeHoldClearedWhenClaimStoreFails(t *testing.T) {
 	}
 }
 
-// TestResumeHoldsGateAcrossClaimAndSend proves the production synchronization,
+// TestResumeHoldsGateAgainstConcurrentStart proves the production synchronization,
 // not a simulated store write: the resume holds controllerGate from validation
 // through the provider boundary, so a real Start replacement blocks on it and
 // cannot change controller_generation until the send has happened exactly once.
-func TestResumeHoldsGateAcrossClaimAndSend(t *testing.T) {
+func TestResumeHoldsGateAgainstConcurrentStart(t *testing.T) {
 	claim := &claimStepStore{}
 	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
 		claim.Store = st
@@ -480,5 +480,243 @@ func TestResumeDeferredBindsBeforeProviderBoundary(t *testing.T) {
 	}
 	if state := turnStateByID(t, h, first.ID); state != domain.TurnStateRunning {
 		t.Fatalf("turn state = %q, want running", state)
+	}
+}
+
+// bindStepStore fails BindTurnToProvider on demand, after setup, to exercise the
+// uncertain-delivery paths deterministically.
+type bindStepStore struct {
+	chatsvc.Store
+	mu   sync.Mutex
+	fail bool
+}
+
+func (s *bindStepStore) BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return errors.New("bind unavailable")
+	}
+	return s.Store.BindTurnToProvider(ctx, turnID, providerTurnID, now)
+}
+
+func (s *bindStepStore) setFail(fail bool) {
+	s.mu.Lock()
+	s.fail = fail
+	s.mu.Unlock()
+}
+
+// TestResumeEagerBindFailureIsUncertainUntilLateTerminal proves an eager
+// SendTurn that succeeds but cannot record its provider id is an uncertain
+// delivery: the provider may have accepted the turn, so the row stays
+// running/unbound, the one-shot stays armed, and a later terminal for that
+// provider id is still recognized and cannot drain the queue.
+func TestResumeEagerBindFailureIsUncertainUntilLateTerminal(t *testing.T) {
+	bind := &bindStepStore{}
+	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+		bind.Store = st
+		return bind
+	})
+	first, _ := queueTwoBehindFailingRoot(t, h, h.conv.emit)
+	ctx := context.Background()
+
+	bind.setFail(true)
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeStateUncertain {
+		t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want the uncertain send exactly once", got)
+	}
+	turn, err := h.st.TurnByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" {
+		t.Fatalf("turn = state %q provider id %q, want running/unbound", turn.State, turn.ProviderTurnID)
+	}
+	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
+		t.Fatalf("one-shot marker = %q, want %s while delivery is uncertain", armed, first.ID)
+	}
+	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateUncertain {
+		t.Fatalf("snapshot state = %q, want state_uncertain", queue.State)
+	}
+
+	// A second resume before the terminal is rejected and sends nothing.
+	again, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if again.Outcome != chatsvc.QueueResumeStateUncertain {
+		t.Fatalf("second outcome = %q, want state_uncertain", again.Outcome)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want zero additional sends", got)
+	}
+
+	// The late terminal for that provider id is recognized and consumed.
+	h.conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
+		TurnState: domain.TurnStateCompleted,
+	})
+	waitResumeHoldCleared(t, h)
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want no second send after the late terminal", got)
+	}
+	assertTurnStaysQueued(t, h, "automation2")
+}
+
+// TestResumeEagerBindFailureWithoutTerminalStaysUncertain proves no terminal is
+// needed for the queue to stay blocked: the running/unbound row keeps the
+// snapshot uncertain and every later resume refused.
+func TestResumeEagerBindFailureWithoutTerminalStaysUncertain(t *testing.T) {
+	bind := &bindStepStore{}
+	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+		bind.Store = st
+		return bind
+	})
+	first, _ := queueTwoBehindFailingRoot(t, h, h.conv.emit)
+	ctx := context.Background()
+
+	bind.setFail(true)
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeStateUncertain {
+		t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
+	}
+	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
+		t.Fatalf("one-shot marker = %q, want %s", armed, first.ID)
+	}
+	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateUncertain {
+		t.Fatalf("snapshot state = %q, want state_uncertain", queue.State)
+	}
+
+	again, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if again.Outcome != chatsvc.QueueResumeStateUncertain {
+		t.Fatalf("second outcome = %q, want state_uncertain", again.Outcome)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want zero additional sends", got)
+	}
+}
+
+// TestResumeDeferredBindFailureNeverReachesBoundary proves the deferred binding
+// happens before StartDeferredTurn: on failure the provider boundary is never
+// crossed, the row is settled failed, the marker is retired, and a later resume
+// of the next head works.
+func TestResumeDeferredBindFailureNeverReachesBoundary(t *testing.T) {
+	bind := &bindStepStore{}
+	conv := &deferredConversation{fakeConversation: newFakeConversation()}
+	startCalls := 0
+	conv.start = func(string) error { startCalls++; return nil }
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		bind.Store = st
+		return bind
+	})
+	first, second := queueTwoBehindFailingRoot(t, h, conv.emit)
+	ctx := context.Background()
+	// The root send prepared one deferred turn during setup; count only the resume.
+	startCalls = 0
+
+	bind.setFail(true)
+	_, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if !errors.Is(err, chatsvc.ErrQueueDispatchFailed) {
+		t.Fatalf("err = %v, want ErrQueueDispatchFailed", err)
+	}
+	if startCalls != 0 {
+		t.Fatalf("StartDeferredTurn called %d times, want 0 before the durable binding", startCalls)
+	}
+	if state := turnStateByID(t, h, first.ID); state != domain.TurnStateFailed {
+		t.Fatalf("turn state = %q, want failed", state)
+	}
+	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != "" {
+		t.Fatalf("one-shot marker survived a deferred bind failure: armed for %q", armed)
+	}
+	if state := turnStateByID(t, h, second.ID); state != domain.TurnStateQueued {
+		t.Fatalf("next turn state = %q, want queued", state)
+	}
+
+	bind.setFail(false)
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeResumed || result.TurnID != second.ID {
+		t.Fatalf("second resume = %+v, want resumed %s", result, second.ID)
+	}
+}
+
+// TestResumeHoldsGateAcrossClaimAndStop proves a real competitor that needs the
+// gate and performs a transition — Stop — cannot run between the claim and the
+// provider boundary. Only after the resume crosses SendTurn once and releases
+// the gate does Stop terminate the controller and settle the running turn.
+func TestResumeHoldsGateAcrossClaimAndStop(t *testing.T) {
+	claim := &claimStepStore{}
+	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+		claim.Store = st
+		return claim
+	})
+	first, _ := queueTwoBehindFailingRoot(t, h, h.conv.emit)
+	ctx := context.Background()
+
+	claimed := make(chan struct{})
+	release := make(chan struct{})
+	claim.setHooks(nil, func() {
+		close(claimed)
+		<-release
+	})
+
+	resumeDone := make(chan error, 1)
+	go func() {
+		_, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+		resumeDone <- err
+	}()
+	select {
+	case <-claimed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("resume never reached the post-claim window")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- h.svc.Stop(ctx, testSession) }()
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop finished while the resume held controllerGate: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-resumeDone; err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want the resumed turn sent exactly once", got)
+	}
+
+	// Only now Stop acquires the gate and performs its real transition.
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop after the resume released the gate: %v", err)
+	}
+	if _, err := h.svc.Controller(testSession); err == nil {
+		t.Fatalf("controller is still live after Stop")
+	}
+	turn, err := h.st.TurnByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State == domain.TurnStateRunning || turn.State == domain.TurnStateQueued {
+		t.Fatalf("resumed turn state = %q, want settled by Stop", turn.State)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
+		t.Fatalf("provider received %v, want no next-turn dispatch", got)
 	}
 }

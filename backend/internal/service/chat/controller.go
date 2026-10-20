@@ -1886,16 +1886,46 @@ func (c *Controller) dispatchTurn(
 		}, fmt.Errorf("send turn: %w", err)
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
+	// Eager drivers cross the provider boundary inside SendTurn. Record the
+	// provider id on the one-shot hold before any durable write that can fail, so
+	// a later bind failure cannot let a late terminal look like an ordinary
+	// completion and drain the queue.
+	if !hasDeferredStart {
 		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
+		if hold := c.resumeHold; hold != nil && hold.turnID == turnID {
+			hold.providerTurnID = ref.ProviderTurnID
 		}
 		c.mu.Unlock()
+	}
+
+	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
 		if hasDeferredStart {
+			// Deferred: the provider never received the prompt, so no boundary was
+			// crossed. Discard the prepared turn and settle the row failed; the
+			// caller clears the one-shot because there is nothing in flight.
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			if settleErr := c.store.SettleTurnByID(
+				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+				c.log.Error("failed to settle deferred turn after bind error", "error", settleErr)
+			}
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
+			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
 		}
-		return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+		// Eager: SendTurn already crossed the provider boundary, so the provider
+		// may have accepted and run the instruction even though AO could not record
+		// its id. The delivery is uncertain, not undispatched: never requeue or
+		// retry, and keep the controller busy so no later event can drain the
+		// queue. The row stays running/unbound (the snapshot reports state_uncertain)
+		// and the hold stays bound to this provider id so a late terminal still
+		// consumes it. Recovery settles the orphan.
+		c.mu.Lock()
+		c.pendingTurnID = ref.ProviderTurnID
+		c.mu.Unlock()
+		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainEagerDelivery, err)
 	}
 
 	c.mu.Lock()
@@ -2035,6 +2065,17 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 		return nil
 	}
 	if !allowDispatch {
+		return nil
+	}
+
+	// A durable running turn means the provider may still own work. Do not
+	// dispatch behind it even when the in-memory ownership was already cleared:
+	// an eager send whose provider id could not be recorded leaves exactly this
+	// state, and that delivery is uncertain. Recovery settles the orphan; the
+	// queue must not advance first.
+	if running, err := c.store.ListVisibleRunningTurnProviderIDs(ctx, c.conversation.ID); err != nil {
+		return err
+	} else if len(running) > 0 {
 		return nil
 	}
 

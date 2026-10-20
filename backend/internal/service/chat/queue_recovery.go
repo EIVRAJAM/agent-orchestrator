@@ -85,6 +85,12 @@ var ErrSessionTerminated = errors.New("session is terminated")
 // is untouched.
 var ErrQueueDispatchFailed = errors.New("the released turn was not accepted by the provider")
 
+// errUncertainEagerDelivery reports an eager SendTurn whose provider turn id
+// could not be written. The provider may already have accepted and run the turn,
+// so this is an uncertain delivery — not an undispatched turn. The row stays
+// running/unbound, the one-shot hold stays armed, and no automatic drain follows.
+var errUncertainEagerDelivery = errors.New("provider accepted the turn but its id could not be recorded")
+
 // errResumeNoPendingWork and errResumeStaleQueueState are the internal signals
 // drainLockedFor returns for the explicit-resume path only.
 var (
@@ -188,6 +194,13 @@ func (c *Controller) ResumeQueuedTurn(
 	// the queue instead of releasing the next turn.
 	c.armResumeHold(expectedTurnID)
 	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true); err != nil {
+		if errors.Is(err, errUncertainEagerDelivery) {
+			// The eager provider boundary was crossed but AO could not record the
+			// provider id. Keep the one-shot armed so a late terminal for this
+			// provider id still holds the queue instead of releasing the next turn.
+			// The durable running row keeps the snapshot at state_uncertain.
+			return QueueResumeResult{Outcome: QueueResumeStateUncertain}, nil
+		}
 		c.clearResumeHold()
 		switch {
 		case errors.Is(err, errResumeNoPendingWork):

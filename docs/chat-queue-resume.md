@@ -192,6 +192,52 @@ dispatches it; the second finds the head moved (or a live turn) and returns
 `stale_queue_state`, `session_busy`, or `no_pending_work`. It never releases the
 next turn.
 
+### Delivery certainty and bind failures
+
+The provider boundary and the durable binding are not the same step, and the two
+drivers order them differently:
+
+- **Eager** (for example Codex app-server): `SendTurn` is the provider boundary.
+  It returns once the provider acknowledges. `BindTurnToProvider` then records the
+  provider turn id.
+- **Deferred** (ACP/OpenCode): `SendTurn` only prepares the request.
+  `BindTurnToProvider` runs first and `StartDeferredTurn` is the provider
+  boundary.
+
+So a `BindTurnToProvider` failure means different things:
+
+| Driver | Bind failure means | Row | One-shot | Outcome |
+| --- | --- | --- | --- | --- |
+| Eager | `SendTurn` already succeeded, so the provider may have accepted and run the turn | stays `running`, **no** provider id | **stays armed**, bound to the returned provider id | `state_uncertain` (409) |
+| Deferred | the provider never received the prompt | settled `failed` | cleared | `CHAT_QUEUE_DISPATCH_FAILED` (409) |
+
+For an eager bind failure the resume never reports `resumed`, never requeues the
+row, never retries the send, and never dispatches the next turn. The hold is bound
+to the provider id **before** the durable write, so a late terminal for that id is
+still recognized as the resumed turn's own and suppresses the automatic drain.
+The row stays `running`/unbound, so the snapshot reports `state_uncertain`, every
+later resume is refused with zero sends, and the controller stays busy until
+recovery settles the orphan. The drain also refuses while any durable running turn
+exists, so an unrelated later event cannot advance the queue either.
+
+For a deferred bind failure the prepared turn is discarded and the row is settled
+`failed`; because the provider boundary was never crossed, the next turn may be
+resumed normally.
+
+### Failure classes
+
+| When the failure happens | Turn row | One-shot | Outcome | Provider may have it | Another resume | Who settles |
+| --- | --- | --- | --- | --- | --- | --- |
+| before the CAS (head moved, decode/excerpt, store error) | `queued` or already terminal | cleared | `stale_queue_state` / `no_pending_work` / error | no | yes (re-read) | no one; the row never left the queue |
+| after the CAS, before the provider (eager) | `failed` (settled by dispatch) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
+| after the provider may have accepted (eager `SendTurn` ok, bind failed) | `running`, unbound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | the controller's stream or recovery (`SettleOrphanedConversationTurns`) |
+| after the durable binding, `StartDeferredTurn` fails | `failed` | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | request issued, rejected | yes | `dispatchTurn` settles it |
+| deferred bind fails before `StartDeferredTurn` | `failed` | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
+| dispatch/claim later fails after a durable binding | terminal per the store | cleared by the error path | mapped by outcome | yes | only after the terminal | the terminal / recovery |
+
+No failure after a possible acceptance can requeue the row, replay the send, or
+let the queue drain automatically.
+
 ### One-shot semantics
 
 A resume releases **exactly one** turn. When that turn terminates — even as
@@ -264,11 +310,14 @@ calls back into the service. So there is no cycle and no inversion.
 - `backend/internal/service/chat/queue_recovery_exits_test.go`: the marker is
   cleared on every non-dispatch exit (a lost CAS, a claim store error), the
   follow-up valid resume of the new head works, and an unrelated terminal event
-  does nothing; a real `Start` blocks on `controllerGate` while the resume holds
-  it across the claim and the provider boundary; a real replacement that wins the
-  gate first makes the resume revalidate and refuse; deferred `SendTurn` and
-  `StartDeferredTurn` failures settle the claimed row and clear the marker; the
-  deferred provider id is bound before `StartDeferredTurn`.
+  does nothing; a concurrent `Start` is excluded by `controllerGate` and a real
+  `Stop` waits on it, then terminates the controller and settles the running turn
+  after the single send; a real replacement that wins the gate first makes the
+  resume revalidate and refuse; deferred `SendTurn` and `StartDeferredTurn`
+  failures settle the claimed row and clear the marker; the deferred provider id
+  is bound before `StartDeferredTurn`; an eager bind failure after `SendTurn`
+  stays `state_uncertain` with the marker armed, a late terminal is consumed, and
+  a second resume sends nothing (with and without the late terminal).
 - `backend/internal/service/chat/queue_state_derivation_test.go`: a fresh queue, a
   completed terminal turn, a compaction, a handoff, and an absent controller are
   not labelled `held_after_terminal_failure`; the priority order between
