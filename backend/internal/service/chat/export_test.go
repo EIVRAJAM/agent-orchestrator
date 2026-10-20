@@ -31,3 +31,14 @@ func (c *Controller) ResumeHoldTurnIDForTest() string {
 	}
 	return c.resumeHold.turnID
 }
+
+// RetainedQueueTurnIDForTest reports the turn id that produced the manual-resume
+// retention, or "" when the queue is not retained.
+func (c *Controller) RetainedQueueTurnIDForTest() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.retainedQueue == nil {
+		return ""
+	}
+	return c.retainedQueue.turnID
+}

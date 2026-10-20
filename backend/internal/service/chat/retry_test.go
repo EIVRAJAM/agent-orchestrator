@@ -665,16 +665,20 @@ func TestRetryTurnRefusesUnconfirmedDispatch(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Send with a failing provider = nil error, want the dispatch failure")
 	}
-	if turn.ID == "" || turn.State != domain.TurnStateFailed {
-		t.Fatalf("undispatched turn = %+v, want a failed turn with an AO id", turn)
+	if turn.ID == "" || turn.State != domain.TurnStateRunning {
+		t.Fatalf("uncertain turn = %+v, want a running turn with an AO id", turn)
 	}
-	snapshot := failedTurnSnapshot(t, h, turn.ID)
+	snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatalf("LoadConversationSnapshot: %v", err)
+	}
 	if settled, ok := turnByID(snapshot, turn.ID); !ok || settled.ProviderTurnID != "" {
-		t.Fatalf("failed turn provider id = %q, want empty (never accepted)", settled.ProviderTurnID)
+		t.Fatalf("uncertain turn provider id = %q, want empty (never confirmed)", settled.ProviderTurnID)
 	}
 
-	if _, err := h.svc.RetryTurn(ctx, testSession, turn.ID); !errors.Is(err, chatsvc.ErrRetryDeliveryUncertain) {
-		t.Fatalf("RetryTurn on unconfirmed dispatch = %v, want ErrRetryDeliveryUncertain", err)
+	// A running/uncertain turn is not retryable, so the prompt cannot be resent.
+	if _, err := h.svc.RetryTurn(ctx, testSession, turn.ID); !errors.Is(err, chatsvc.ErrTurnNotRetryable) {
+		t.Fatalf("RetryTurn on unconfirmed dispatch = %v, want ErrTurnNotRetryable", err)
 	}
 	if sent := h.conv.sentTexts(); len(sent) != 0 {
 		t.Fatalf("provider received %d sends after refused retry, want 0: %v", len(sent), sent)

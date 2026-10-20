@@ -13335,6 +13335,8 @@ components:
           - compacting
           - queued_waiting_for_active_turn
           - held_after_terminal_failure
+          - held_after_manual_resume
+          - session_terminated
           - controller_recovery_required
           - handoff_in_progress
           - state_uncertain

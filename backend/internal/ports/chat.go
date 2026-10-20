@@ -808,6 +808,16 @@ type ChatTurnRef struct {
 	ProviderTurnID string
 }
 
+// ErrTurnNotDelivered reports that a turn SendTurn error is definitively before
+// the provider boundary: the adapter can prove no request was written, so the
+// provider cannot have received the turn.
+var ErrTurnNotDelivered = errors.New("turn was not delivered to the provider")
+
+// ErrTurnRejected reports that the provider explicitly rejected the turn. The
+// provider answered with an error and did not accept the work. Adapters wrap
+// this only when they have that explicit response.
+var ErrTurnRejected = errors.New("provider rejected the turn")
+
 // ChatDeferredTurnStarter is implemented by protocols whose prompt call is the
 // whole lifetime of a turn rather than a quick "accepted" request. SendTurn
 // prepares such a turn and returns its id; the controller calls StartDeferredTurn

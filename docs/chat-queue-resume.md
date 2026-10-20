@@ -114,7 +114,7 @@ the live controller; nothing is persisted.
 
 | Field | Meaning |
 | --- | --- |
-| `queueState` | `idle`, `running`, `compacting`, `queued_waiting_for_active_turn`, `held_after_terminal_failure`, `controller_recovery_required`, `handoff_in_progress`, `state_uncertain` |
+| `queueState` | `idle`, `running`, `compacting`, `queued_waiting_for_active_turn`, `held_after_terminal_failure`, `held_after_manual_resume`, `session_terminated`, `controller_recovery_required`, `handoff_in_progress`, `state_uncertain` |
 | `pendingCount` | never-sent (`queued`) turns |
 | `oldestPendingAt` | when the queue head was recorded |
 | `headTurnId` | the queue head a resume must name |
@@ -125,8 +125,34 @@ the live controller; nothing is persisted.
 | `resumeSafety` | the outcome a resume would return right now |
 
 A merely idle or long-running session is never reported as blocked: `queueState`
-is `idle`/`running`/`queued_waiting_for_active_turn`, and only a queue held behind
-a non-completed terminal turn is `held_after_terminal_failure`.
+is `idle`/`running`/`queued_waiting_for_active_turn`, and a queue held behind a
+non-completed terminal turn is `held_after_terminal_failure`.
+
+`held_after_manual_resume` means an explicit resume released one turn, that turn
+**ended**, queued work remains, and the automatic drain is deliberately held until
+another explicit resume. It is not `queued_waiting_for_active_turn`: there is no
+active turn. The retention lives only in the controller, is tied to its
+generation, records the turn that produced it, is cleared by the next explicit
+resume, and is cleared on handoff, close, terminate or replacement. It is never
+persisted and does not change the cold-start policy.
+
+`session_terminated` is the strongest state; a terminated session is never
+reported as a recoverable queue.
+
+Priority, strongest first:
+
+1. `session_terminated`
+2. `handoff_in_progress`
+3. `state_uncertain` (a running turn with no durable provider id)
+4. `running` / `queued_waiting_for_active_turn` (an active turn)
+5. `compacting`
+6. `controller_recovery_required` (pending work, no live controller)
+7. `held_after_terminal_failure`
+8. `held_after_manual_resume`
+9. `queued_waiting_for_active_turn` (a normal pending queue)
+10. `idle`
+
+An uncertain turn or a handoff is never hidden behind a retention.
 
 ## Synchronization
 
@@ -197,10 +223,23 @@ next turn.
 The provider boundary and the durable binding are not the same step, and each
 adapter orders them differently. Do not claim "rejected" from a local error.
 
-| Adapter | Provider boundary | Durable binding | Acceptance evidence | Definitive-before-send errors | Ambiguous after-boundary errors |
+| Adapter | Provider boundary | Durable binding | Acceptance evidence | Definitive errors | Ambiguous after-boundary errors |
 | --- | --- | --- | --- | --- | --- |
-| Eager (Codex app-server, `ChatConversation.SendTurn`) | `SendTurn` — it sends `turn/start` and waits for the provider acknowledgement | `BindTurnToProvider`, after `SendTurn` returns the provider id | the provider turn id returned by `SendTurn` | local validation before the request (settings, busy conversation, closed conversation) | a transport error, EOF, timeout or cancel after the request may have been written |
+| Eager (Codex app-server, `ChatConversation.SendTurn`) | `SendTurn` — it writes `turn/start` and waits for the response | `BindTurnToProvider`, after `SendTurn` returns the provider id | the provider turn id returned by `SendTurn` | `ports.ErrTurnNotDelivered` (local validation, or the connection was closed before any write) and `ports.ErrTurnRejected` (the provider answered with an RPC error) | a write failure, EOF, close, timeout, cancellation after the write, or an undecodable response: the request may have reached the provider |
 | Deferred (ACP/OpenCode/OpenCode v2, `ChatDeferredTurnStarter`) | `StartDeferredTurn` — ACP `session/prompt` | `BindTurnToProvider`, **before** `StartDeferredTurn` | none synchronously; the turn's events arrive on the stream | `ports.ErrDeferredTurnNotStarted`: the adapter proves the prompt was never issued (conversation closed, prepared turn missing) | any other `StartDeferredTurn` error, and any later transport error/EOF/timeout/cancel that arrives as a turn event |
+
+The eager adapter classifies in `classifySendTurnError`
+(`adapters/chatdriver/codexappserver/conversation.go`): a `*rpcError` becomes
+`ErrTurnRejected`; `errConnClosedBeforeWrite` becomes `ErrTurnNotDelivered`; every
+other error keeps its plain chain so the controller treats the delivery as
+uncertain. It does not classify by text. Any adapter that cannot prove the error
+was before the write must leave it ambiguous.
+
+An uncertain eager `SendTurn` leaves the row `running`/unbound, keeps
+`dispatchingTurnID` so a late `TurnStarted` can persist the binding, returns
+`state_uncertain`, and never settles `failed`, requeues, retries, or dispatches
+the next turn. If no event ever arrives, the normal controller cleanup/recovery
+settles the orphan.
 
 `StartDeferredTurn` in ACP never performs the RPC itself:
 `adapters/chatdriver/acp/conversation.go` validates local state and then starts
@@ -252,7 +291,8 @@ The durable dispatch guard and the explicit-resume pre-check use
 | When the failure happens | Turn row | One-shot | Outcome | Provider may have it | Another resume | Who settles |
 | --- | --- | --- | --- | --- | --- | --- |
 | before the CAS (head moved, decode/excerpt, store error) | `queued` or already terminal | cleared | `stale_queue_state` / `no_pending_work` / error | no | yes (re-read) | no one; the row never left the queue |
-| after the CAS, before the provider (eager `SendTurn` fails) | `failed` (settled by dispatch) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
+| eager `SendTurn` proves local/not-written or an RPC rejection | `failed` (settled by dispatch) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
+| eager `SendTurn` ambiguous (EOF/timeout/cancel/undecodable) | `running`, unbound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | a late `TurnStarted`+terminal, or recovery |
 | after the provider may have accepted (eager `SendTurn` ok, bind failed) | `running`, unbound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | the late terminal by AO id, or recovery |
 | deferred `StartDeferredTurn` proves not started | `failed` (binding persisted, provider never received) | cleared | `CHAT_QUEUE_DISPATCH_FAILED` | no | yes | `dispatchTurn` settles it |
 | deferred `StartDeferredTurn` ambiguous (EOF/timeout/disconnect) | `running`, bound | **armed** | `state_uncertain` (409) | **possibly yes** | **no** | the late terminal |
@@ -297,6 +337,24 @@ Exact cycle:
    CAS, a store error, a stale head, a decode/excerpt failure, a `SendTurn` error,
    a `BindTurnToProvider` error and a `StartDeferredTurn` error all take the
    error path, which clears the marker unconditionally.
+
+### Retained queue reason
+
+When the one-shot turn's terminal is consumed, the controller records a
+**retained queue reason** distinct from the active hold: `{turnID, generation}`.
+It means "a one-shot completed and the rest of the queue is waiting for another
+explicit resume". The snapshot derives `held_after_manual_resume` from it only
+while queued work exists and the latest terminal is `completed`; a
+failed/interrupted one-shot keeps `held_after_terminal_failure`.
+
+- The automatic drain refuses to dispatch while the reason is active; only an
+  explicit resume (`claim=true`) bypasses it.
+- A successful explicit resume clears it before claiming the next turn.
+- Handoff, close, terminate and controller replacement clear it; the next
+  generation never inherits it.
+- It is not persisted and is not a display status: the snapshot derives the
+  observable state from durable rows plus the live controller.
+- Cold start is unchanged; the reason only exists on a live controller.
 
 ### Lock order
 
@@ -350,18 +408,33 @@ calls back into the service. So there is no cycle and no inversion.
   row by AO id, clears the marker, leaves the next turn queued, and allows the
   next explicit resume; an obsolete-generation running row does not block a
   current-generation resume.
+- `backend/internal/service/chat/queue_recovery_eager_errors_test.go`: the eager
+  `SendTurn` error split — `ErrTurnNotDelivered`/`ErrTurnRejected` settle failed,
+  while EOF/timeout/cancellation/undecodable leaves the row running/unbound with
+  `state_uncertain` and zero further sends; a late `TurnStarted` persists the
+  binding and its terminal settles the exact row; no events fall to recovery
+  without a replay.
 - `backend/internal/service/chat/queue_state_derivation_test.go`: a fresh queue, a
   completed terminal turn, a compaction, a handoff, and an absent controller are
-  not labelled `held_after_terminal_failure`; the priority order between
-  concurrent states (handoff beats a running turn).
+  not labelled `held_after_terminal_failure`; a completed one-shot with queued
+  work is `held_after_manual_resume` (no active turn), clears on the next resume,
+  reappears after the next completion, and ends `idle`; a failed/interrupted
+  one-shot stays `held_after_terminal_failure`; a normal completion never retains;
+  handoff/close clear the retention and a replacement does not inherit it.
 - `backend/internal/service/chat/controller_hold_queue_test.go`: the #4861 hold
   tests, unchanged.
 - `backend/internal/httpd/controllers/conversation_queue_resume_test.go`: route
-  statuses and stable codes, including missing turn and missing generation.
+  statuses and stable codes, including missing turn and missing generation; the
+  snapshot carries `held_after_manual_resume` with no active turn.
 - `backend/internal/cli/session_queue_test.go`: the CLI reads the observable state
   and sends its head and generation; no-work path; flag overrides; missing and
   explicitly empty generation are usage errors; stale CAS and daemon faults
-  surface as exit 1; misuse exits 2.
+  surface as exit 1; misuse exits 2; `held_after_manual_resume` is printed with
+  the explicit resume hint.
+- `backend/internal/adapters/chatdriver/codexappserver/send_classification_test.go`:
+  `classifySendTurnError` maps an RPC error to `ErrTurnRejected`, a closed-before-
+  write to `ErrTurnNotDelivered`, and leaves EOF/close-after-write/timeout/
+  cancellation/undecodable ambiguous; empty text is a local definitive error.
 
 ## Out of scope
 

@@ -176,3 +176,31 @@ func TestResumeQueuedTurnRouteNotImplemented(t *testing.T) {
 		t.Fatalf("status = %d, want %d", status, http.StatusNotImplemented)
 	}
 }
+
+func TestConversationSnapshotCarriesHeldAfterManualResumeState(t *testing.T) {
+	body := conversationSnapshotBody(t, chatsvc.Snapshot{
+		Conversation: domain.ConversationRecord{ID: "conversation-1"},
+		SessionID:    domain.SessionID("p1-1"),
+		Queue: &chatsvc.QueueState{
+			State:                chatsvc.QueueStateHeldAfterManualResume,
+			PendingCount:         1,
+			HeadTurnID:           "turn-head",
+			ControllerGeneration: "gen-1",
+			ControllerAvailable:  true,
+			ResumeSafety:         chatsvc.QueueResumeResumed,
+		},
+	})
+	queue, ok := body["queue"].(map[string]any)
+	if !ok {
+		t.Fatalf("queue missing from snapshot: %v", body)
+	}
+	if queue["queueState"] != "held_after_manual_resume" {
+		t.Fatalf("queueState = %v, want held_after_manual_resume", queue["queueState"])
+	}
+	if queue["resumeSafety"] != "resumed" {
+		t.Fatalf("resumeSafety = %v, want resumed", queue["resumeSafety"])
+	}
+	if _, present := queue["activeTurn"]; present {
+		t.Fatalf("held_after_manual_resume must not report an active turn: %v", queue["activeTurn"])
+	}
+}

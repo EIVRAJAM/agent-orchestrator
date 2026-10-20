@@ -68,6 +68,11 @@ type serverRequestHandler func(context.Context, serverRequest) (any, error)
 // ErrConnClosed reports use of a connection whose process has exited.
 var ErrConnClosed = errors.New("app-server connection closed")
 
+// errConnClosedBeforeWrite reports that a request was refused before any bytes
+// were written, so the provider cannot have received it. It is distinct from a
+// connection that closes after a write, which leaves the request's fate unknown.
+var errConnClosedBeforeWrite = errors.New("app-server connection closed before write")
+
 // conn is one live stdio connection to an app-server process.
 //
 // It is transport only: framing, request/response correlation, and fan-out. It
@@ -334,7 +339,7 @@ func (c *conn) request(ctx context.Context, method string, params, out any) erro
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return fmt.Errorf("%s: %w", method, ErrConnClosed)
+		return fmt.Errorf("%s: %w: %w", method, ErrConnClosed, errConnClosedBeforeWrite)
 	}
 	c.pending[id] = ch
 	c.mu.Unlock()

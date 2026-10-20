@@ -109,6 +109,15 @@ type resumeHold struct {
 	providerTurnID string
 }
 
+// retainedQueue is the observable reason a one-shot resume leaves the rest of
+// the queue held after its own turn terminates. It is not the turn in flight and
+// is not persisted; the durable snapshot derives the state from it plus the
+// queued rows.
+type retainedQueue struct {
+	turnID     string
+	generation string
+}
+
 // armResumeHold records the one-shot before dispatch begins. The caller must
 // hold sendMu so the terminal event cannot be projected until the hold is armed.
 func (c *Controller) armResumeHold(turnID string) {
@@ -122,6 +131,29 @@ func (c *Controller) clearResumeHold() {
 	c.mu.Lock()
 	c.resumeHold = nil
 	c.mu.Unlock()
+}
+
+// retainQueueAfterOneShot records that the one-shot turn finished and the rest of
+// the queue is deliberately held until another explicit resume.
+func (c *Controller) retainQueueAfterOneShot(turnID string) {
+	c.mu.Lock()
+	c.retainedQueue = &retainedQueue{turnID: turnID, generation: c.generation}
+	c.mu.Unlock()
+}
+
+// clearRetainedQueue ends the manual-resume retention.
+func (c *Controller) clearRetainedQueue() {
+	c.mu.Lock()
+	c.retainedQueue = nil
+	c.mu.Unlock()
+}
+
+// manualResumeRetained reports whether the current generation is holding the
+// queue because a one-shot resume completed.
+func (c *Controller) manualResumeRetained() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.retainedQueue != nil && c.retainedQueue.generation == c.generation
 }
 
 // consumeResumeHold clears and reports whether a primary terminal event belongs
@@ -255,6 +287,9 @@ func (c *Controller) ResumeQueuedTurn(
 		}
 		return QueueResumeResult{Outcome: QueueResumeSessionBusy}, nil
 	}
+	// A new explicit resume is the action that continues the queue, so it retires
+	// the retained-after-one-shot reason.
+	c.clearRetainedQueue()
 	return QueueResumeResult{Outcome: QueueResumeResumed, TurnID: expectedTurnID}, nil
 }
 
@@ -383,6 +418,12 @@ const (
 	// QueueStateHeldAfterFailure: queued turns are held behind a non-completed
 	// terminal turn and nothing is running.
 	QueueStateHeldAfterFailure QueueStateValue = "held_after_terminal_failure"
+	// QueueStateHeldAfterManualResume: an explicit resume released one turn, that
+	// turn ended, and the remaining queued work is deliberately held until another
+	// explicit resume. There is no active turn.
+	QueueStateHeldAfterManualResume QueueStateValue = "held_after_manual_resume"
+	// QueueStateTerminated: the session is terminated.
+	QueueStateTerminated QueueStateValue = "session_terminated"
 	// QueueStateControllerRecoveryRequired: pending work but no live controller.
 	QueueStateControllerRecoveryRequired QueueStateValue = "controller_recovery_required"
 	// QueueStateHandoffInProgress: a controller handoff is armed.
@@ -428,10 +469,21 @@ func deriveQueueState(
 		(facts.LatestTerminalState == domain.TurnStateFailed ||
 			facts.LatestTerminalState == domain.TurnStateRecovered ||
 			facts.LatestTerminalState == domain.TurnStateInterrupted)
+	// A one-shot resume that completed leaves the rest of the queue held on
+	// purpose. There is no active turn, so this must not read as
+	// queued_waiting_for_active_turn. A failed/interrupted one-shot keeps the
+	// stronger held_after_terminal_failure reason.
+	heldAfterManualResume := facts.PendingCount > 0 && facts.RunningCount == 0 &&
+		facts.LatestTerminalState == domain.TurnStateCompleted &&
+		controller != nil && controller.manualResumeRetained()
 
+	// Priority, strongest first: terminated, handoff, an uncertain running turn,
+	// an active turn, compaction, a missing controller, a failure hold, a
+	// manual-resume hold, a normal queued turn, idle. An uncertain turn or a
+	// handoff is never hidden behind a hold.
 	switch {
 	case record.IsTerminated:
-		state.State = QueueStateControllerRecoveryRequired
+		state.State = QueueStateTerminated
 		state.ResumeSafety = QueueResumeSessionTerminated
 	case handoffInProgress:
 		state.State = QueueStateHandoffInProgress
@@ -449,22 +501,21 @@ func deriveQueueState(
 	case compactionPending:
 		state.State = QueueStateCompacting
 		state.ResumeSafety = QueueResumeCompactionInProgress
-	case facts.PendingCount == 0:
-		state.State = QueueStateIdle
-		state.ResumeSafety = QueueResumeNoPendingWork
 	case !state.ControllerAvailable:
 		state.State = QueueStateControllerRecoveryRequired
 		state.ResumeSafety = QueueResumeControllerRecoveryRequired
 	case heldAfterFailure:
 		state.State = QueueStateHeldAfterFailure
 		state.ResumeSafety = QueueResumeResumed
-	default:
-		// Queued work exists with a live controller and no active turn, but the
-		// last terminal turn completed: the queue is not held by a failure, it is
-		// pending processing (or held by a one-shot resume). Report it as waiting
-		// rather than as a held failure.
+	case heldAfterManualResume:
+		state.State = QueueStateHeldAfterManualResume
+		state.ResumeSafety = QueueResumeResumed
+	case facts.PendingCount > 0:
 		state.State = QueueStateWaitingForActiveTurn
 		state.ResumeSafety = QueueResumeResumed
+	default:
+		state.State = QueueStateIdle
+		state.ResumeSafety = QueueResumeNoPendingWork
 	}
 	return state
 }

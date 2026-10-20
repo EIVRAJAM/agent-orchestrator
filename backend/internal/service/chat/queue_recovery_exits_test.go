@@ -592,7 +592,7 @@ func TestResumeEagerBindFailureIsUncertainUntilLateTerminal(t *testing.T) {
 		wantError  string
 		wantQueue  chatsvc.QueueStateValue
 	}{
-		{"completed", domain.TurnStateCompleted, domain.TurnStateCompleted, "", chatsvc.QueueStateWaitingForActiveTurn},
+		{"completed", domain.TurnStateCompleted, domain.TurnStateCompleted, "", chatsvc.QueueStateHeldAfterManualResume},
 		{"failed", domain.TurnStateFailed, domain.TurnStateFailed, "provider failed", chatsvc.QueueStateHeldAfterFailure},
 		{"interrupted", domain.TurnStateInterrupted, domain.TurnStateInterrupted, "", chatsvc.QueueStateHeldAfterFailure},
 	} {

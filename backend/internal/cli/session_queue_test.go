@@ -229,3 +229,35 @@ func TestSessionQueuePrintsDerivedState(t *testing.T) {
 		t.Fatalf("output missing the resume hint: %q", out)
 	}
 }
+
+// TestSessionQueuePrintsHeldAfterManualResume proves the CLI surfaces the
+// one-shot retention distinctly and offers the explicit resume.
+func TestSessionQueuePrintsHeldAfterManualResume(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/internal/") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/api/v1/sessions/demo-1/conversation" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"queue":{"queueState":"held_after_manual_resume","pendingCount":2,"headTurnId":"turn-10","controllerGeneration":"gen-2","controllerAvailable":true,"resumeSafety":"resumed"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"session", "queue", "demo-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	if !strings.Contains(out, "held_after_manual_resume") || !strings.Contains(out, "turn-10") {
+		t.Fatalf("output = %q, want the manual-resume state and head", out)
+	}
+	if !strings.Contains(out, "ao session resume-queue demo-1 --turn turn-10 --generation gen-2") {
+		t.Fatalf("output missing the resume hint: %q", out)
+	}
+}

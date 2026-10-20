@@ -91,11 +91,17 @@ func classify(err error) error {
 	if err == nil {
 		return nil
 	}
-	var refusal providerRefusal
-	if errors.As(err, &refusal) && refusal.ChatRefusal() {
+	if isProviderRefusal(err) {
 		return fmt.Errorf("%w: %w", ErrProviderRefused, err)
 	}
 	return err
+}
+
+// isProviderRefusal reports a driver error the adapter marked as a definitive
+// provider refusal.
+func isProviderRefusal(err error) bool {
+	var refusal providerRefusal
+	return errors.As(err, &refusal) && refusal.ChatRefusal()
 }
 
 // maxTitleRunes bounds a thread title, matching the automatic-semantic-task-titles

@@ -328,10 +328,11 @@ func TestResumeHeldQueueTerminatedRefused(t *testing.T) {
 	}
 }
 
-// TestResumeDispatchFailureKeepsQueuedRows proves a provider disconnect during
-// the released dispatch settles only that turn and leaves the still-queued rows
-// queued.
-func TestResumeDispatchFailureKeepsQueuedRows(t *testing.T) {
+// TestResumeDispatchFailureIsUncertainKeepsQueue proves an eager dispatch error
+// that may have crossed the provider boundary leaves the released turn
+// running/unbound and the rest of the queue untouched, rather than settling it
+// failed and letting a later event advance the queue.
+func TestResumeDispatchFailureIsUncertainKeepsQueue(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	first, second := queueWhileRunningTwice(t, h)
@@ -340,12 +341,26 @@ func TestResumeDispatchFailureKeepsQueuedRows(t *testing.T) {
 	h.conv.sendErr = errors.New("provider disconnected")
 	h.conv.mu.Unlock()
 
-	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); !errors.Is(err, chatsvc.ErrQueueDispatchFailed) {
-		t.Fatalf("err = %v, want ErrQueueDispatchFailed", err)
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("resume: %v", err)
 	}
-	// The claimed row is settled failed, never returned to queued and re-sent.
-	if state := turnStateByID(t, h, first.ID); state != domain.TurnStateFailed {
-		t.Fatalf("released turn state = %q, want failed", state)
+	if result.Outcome != chatsvc.QueueResumeStateUncertain {
+		t.Fatalf("outcome = %q, want state_uncertain", result.Outcome)
+	}
+	// The row stays running/unbound; the one-shot is still armed.
+	turn, err := h.st.TurnByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" {
+		t.Fatalf("released turn = state %q provider id %q, want running/unbound", turn.State, turn.ProviderTurnID)
+	}
+	if armed := h.ctrl.ResumeHoldTurnIDForTest(); armed != first.ID {
+		t.Fatalf("one-shot marker = %q, want %s", armed, first.ID)
+	}
+	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateUncertain {
+		t.Fatalf("snapshot state = %q, want state_uncertain", queue.State)
 	}
 	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root"}) {
 		t.Fatalf("provider received %v, want the failed send not replayed", got)

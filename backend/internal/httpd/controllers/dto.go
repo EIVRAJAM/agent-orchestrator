@@ -3036,7 +3036,7 @@ type ConversationSnapshotResponse struct {
 type ConversationQueuePayload struct {
 	// QueueState distinguishes an idle session from a held queue. A long-running
 	// or merely idle session is never reported as blocked.
-	QueueState string `json:"queueState" enum:"idle,running,compacting,queued_waiting_for_active_turn,held_after_terminal_failure,controller_recovery_required,handoff_in_progress,state_uncertain"`
+	QueueState string `json:"queueState" enum:"idle,running,compacting,queued_waiting_for_active_turn,held_after_terminal_failure,held_after_manual_resume,session_terminated,controller_recovery_required,handoff_in_progress,state_uncertain"`
 	// PendingCount is the number of never-sent (queued) turns.
 	PendingCount int `json:"pendingCount"`
 	// OldestPendingAt is when the oldest never-sent turn was recorded.

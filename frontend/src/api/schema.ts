@@ -4510,7 +4510,7 @@ export interface components {
             oldestPendingAt?: null | string;
             pendingCount: number;
             /** @enum {string} */
-            queueState: "idle" | "running" | "compacting" | "queued_waiting_for_active_turn" | "held_after_terminal_failure" | "controller_recovery_required" | "handoff_in_progress" | "state_uncertain";
+            queueState: "idle" | "running" | "compacting" | "queued_waiting_for_active_turn" | "held_after_terminal_failure" | "held_after_manual_resume" | "session_terminated" | "controller_recovery_required" | "handoff_in_progress" | "state_uncertain";
             /** @enum {string} */
             resumeSafety: "resumed" | "stale_queue_state" | "no_pending_work" | "session_busy" | "compaction_in_progress" | "handoff_in_progress" | "controller_recovery_required" | "state_uncertain" | "session_terminated" | "stale_controller_generation";
         };

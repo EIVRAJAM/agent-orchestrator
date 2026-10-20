@@ -257,6 +257,11 @@ type Controller struct {
 	// generation it was resumed under, never a bare boolean; nil when nothing is
 	// armed. Guarded by mu.
 	resumeHold *resumeHold
+	// retainedQueue records that a one-shot resume finished and left the rest of
+	// the queue deliberately held. It is distinct from resumeHold (a turn still in
+	// flight), bound to the generation that produced it, and cleared by the next
+	// explicit resume or by handoff/close/terminate. Guarded by mu.
+	retainedQueue *retainedQueue
 	// Provider calls keep automatic hibernation out without blocking explicit Kill.
 	operations int
 	// ackedTurnID is the turn the PROVIDER has confirmed it started, which lags
@@ -1861,16 +1866,37 @@ func (c *Controller) dispatchTurn(
 	c.mu.Unlock()
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
+		// A turn is definitive only when the adapter can prove the provider never
+		// received it, when the provider explicitly rejected it, or when the driver
+		// is deferred and SendTurn is still the prepare step (no boundary crossed).
+		// Anything else on an eager driver may have crossed the boundary: the
+		// provider could be running the instruction, so the turn stays running and
+		// uncertain rather than becoming failed.
+		definitive := hasDeferredStart ||
+			errors.Is(err, ports.ErrTurnNotDelivered) ||
+			errors.Is(err, ports.ErrTurnRejected) ||
+			isProviderRefusal(err)
+		if !definitive {
+			// Keep the dispatching turn id so a late TurnStarted can persist the
+			// provider binding, and keep the row running/unbound. The one-shot stays
+			// armed; the queue cannot advance. Return the AO turn so callers can still
+			// navigate it.
+			return domain.ConversationTurn{
+				ID:                 turnID,
+				ConversationID:     c.conversation.ID,
+				HandledBySessionID: c.sessionID,
+				State:              domain.TurnStateRunning,
+				RequestedAt:        requestedAt,
+			}, fmt.Errorf("%w: send turn: %w", errUncertainDelivery, err)
+		}
 		c.mu.Lock()
 		if c.dispatchingTurnID == turnID {
 			c.dispatchingTurnID = ""
 		}
 		c.mu.Unlock()
-		// The provider may or may not have accepted it. Settle the turn as failed
-		// rather than retrying: a duplicate turn would run the work twice. Settling
-		// by AO's own turn id is required here — an undispatched turn has no
-		// provider id, so looking one up by the empty string would hit whichever
-		// undispatched turn the database returned first.
+		// Definitive: the provider cannot have accepted the turn. Settle it failed
+		// rather than retrying; settling by AO's own turn id avoids looking up an
+		// empty provider id after the error.
 		completedAt := c.now()
 		if settleErr := c.store.SettleTurnByID(
 			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
@@ -2078,6 +2104,12 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 		return nil
 	}
 
+	// A completed one-shot holds the rest of the queue until another explicit
+	// resume. Only that action (claim=true) may bypass the retention.
+	if !claim && c.manualResumeRetained() {
+		return nil
+	}
+
 	// A durable running turn means the provider may still own work. Do not
 	// dispatch behind it even when the in-memory ownership was already cleared:
 	// an eager send whose provider id could not be recorded leaves exactly this
@@ -2200,6 +2232,7 @@ func (c *Controller) ArmHandoff(
 	c.mu.Lock()
 	// A handoff closes source intake; a one-shot resume must not survive it.
 	c.resumeHold = nil
+	c.retainedQueue = nil
 	if c.handoff == want {
 		c.mu.Unlock()
 		return nil
@@ -2529,6 +2562,7 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 	// An explicit stop retires any one-shot resume: the user is no longer asking
 	// for the next turn to be released.
 	c.resumeHold = nil
+	c.retainedQueue = nil
 	if c.forkCancel != nil {
 		c.forkCancel()
 	}
@@ -2785,6 +2819,7 @@ func (c *Controller) Rollback(ctx context.Context, turnID string) (int, error) {
 // output and unresolved provider requests to the replacement controller.
 func (c *Controller) Close(ctx context.Context) error {
 	c.clearResumeHold()
+	c.clearRetainedQueue()
 	c.once.Do(func() {
 		if preserver, ok := c.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {
 			c.mu.Lock()
@@ -2810,6 +2845,7 @@ func (c *Controller) Close(ctx context.Context) error {
 func (c *Controller) Terminate(ctx context.Context) error {
 	c.mu.Lock()
 	c.resumeHold = nil
+	c.retainedQueue = nil
 	if c.forkCancel != nil {
 		c.forkCancel()
 	}
@@ -3116,6 +3152,14 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
 					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
 				}
+				// A late TurnStarted is the only correlation a driver can offer after
+				// an ambiguous eager send. Bind it onto the one-shot too, so a later
+				// terminal is recognized and cannot drain the queue.
+				c.mu.Lock()
+				if hold := c.resumeHold; hold != nil && hold.turnID == dispatchingTurnID {
+					hold.providerTurnID = event.ProviderTurnID
+				}
+				c.mu.Unlock()
 			} else {
 				// A turn AO dispatched already has a row, bound in dispatch. This covers
 				// the turn AO did NOT dispatch: a compaction, or work the provider resumed
@@ -3548,6 +3592,10 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 		// "not this turn's" while the hold is still unbound.
 		if hold, consumed := c.consumeResumeHold(event.ProviderTurnID); consumed {
 			allow = false
+			// The one-shot finished. Record that the rest of the queue is held by the
+			// manual resume until another explicit action, so the snapshot can say
+			// held_after_manual_resume instead of implying a phantom active turn.
+			c.retainQueueAfterOneShot(hold.turnID)
 			// An eager send whose provider id could not be recorded leaves the row
 			// running/unbound. The terminal still names the provider id the marker
 			// captured, so settle the known AO turn by id; consuming the marker alone
