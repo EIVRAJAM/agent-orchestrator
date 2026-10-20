@@ -200,6 +200,23 @@ func (c *Controller) ResumeQueuedTurn(
 			return QueueResumeResult{}, errors.Join(ErrQueueDispatchFailed, err)
 		}
 	}
+	// drainLockedFor can return nil without dispatching: it re-reads the busy and
+	// handoff state under the lock, and a drain that finds either returns early.
+	// A dispatched turn has left the queue (queued -> running), so a row still in
+	// 'queued' proves nothing was released. Retire the one-shot instead of leaving
+	// it armed as if a one-shot turn were in flight.
+	turn, lookupErr := c.store.TurnByID(ctx, expectedTurnID)
+	if lookupErr != nil {
+		c.clearResumeHold()
+		return QueueResumeResult{}, lookupErr
+	}
+	if turn.State == domain.TurnStateQueued {
+		c.clearResumeHold()
+		if c.HandoffActive() {
+			return QueueResumeResult{Outcome: QueueResumeHandoffInProgress}, nil
+		}
+		return QueueResumeResult{Outcome: QueueResumeSessionBusy}, nil
+	}
 	return QueueResumeResult{Outcome: QueueResumeResumed, TurnID: expectedTurnID}, nil
 }
 

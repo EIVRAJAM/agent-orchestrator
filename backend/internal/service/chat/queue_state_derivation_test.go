@@ -188,3 +188,38 @@ func TestSnapshotHandoffBeatsRunningTurn(t *testing.T) {
 		t.Fatalf("state = %q, want handoff_in_progress", queue.State)
 	}
 }
+
+// TestSnapshotHistoricalFailureDoesNotHoldPendingWork proves a failure that has
+// been superseded by a later completion does not keep classifying pending work as
+// held. The queue head is a normal turn waiting for its turn, not a held one.
+func TestSnapshotHistoricalFailureDoesNotHoldPendingWork(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	first, second := queueWhileRunningTwice(t, h)
+
+	// Release and complete the first turn after the historical root failure.
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	h.conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
+		TurnState: domain.TurnStateCompleted,
+	})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return turnStateByText(t, s)["automation"] == domain.TurnStateCompleted
+	})
+
+	queue := snapshotQueue(t, h)
+	if queue.State == chatsvc.QueueStateHeldAfterFailure {
+		t.Fatalf("a superseded failure still labelled pending work as held: %+v", queue)
+	}
+	if queue.State != chatsvc.QueueStateWaitingForActiveTurn {
+		t.Fatalf("state = %q, want queued_waiting_for_active_turn", queue.State)
+	}
+	if queue.HeadTurnID != second.ID {
+		t.Fatalf("head = %q, want %s", queue.HeadTurnID, second.ID)
+	}
+	if queue.ResumeSafety != chatsvc.QueueResumeResumed {
+		t.Fatalf("resume safety = %q, want resumed", queue.ResumeSafety)
+	}
+}

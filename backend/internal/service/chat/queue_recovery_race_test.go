@@ -50,6 +50,20 @@ func (r *pausingSessionReader) pauseAfter(n int) {
 	r.mu.Unlock()
 }
 
+// waitResumeHoldCleared waits until the one-shot marker is retired, which happens
+// when its own terminal event is consumed (or a failure path clears it).
+func waitResumeHoldCleared(t *testing.T, h *harness) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.ctrl.ResumeHoldTurnIDForTest() == "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("one-shot marker was not consumed: still armed for %q", h.ctrl.ResumeHoldTurnIDForTest())
+}
+
 // TestResumeHeldQueueGenerationChangeAfterValidationRefused proves the durable
 // generation is checked inside the claim, not only in the Go-side validation.
 //
@@ -128,6 +142,7 @@ func TestResumeSynchronousCompletionStillHoldsTheQueue(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 	assertTurnStaysQueued(t, h, "automation2")
+	waitResumeHoldCleared(t, h)
 	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
 		t.Fatalf("provider received %v, want no second dispatch", got)
 	}
@@ -166,9 +181,10 @@ func TestResumeDeferredSynchronousCompletionStillHoldsTheQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("queue automation: %v", err)
 	}
-	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+	second, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
 		Text: "automation2", ClientMessageID: "c3", Origin: domain.MessageOriginAutomation,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("queue automation2: %v", err)
 	}
 	conv.emit(ports.ChatEvent{
@@ -192,8 +208,21 @@ func TestResumeDeferredSynchronousCompletionStillHoldsTheQueue(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 	assertTurnStaysQueued(t, h, "automation2")
+	waitResumeHoldCleared(t, h)
 	if got := conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation"}) {
 		t.Fatalf("provider received %v, want no second dispatch", got)
+	}
+
+	// A new explicit resume with the new head dispatches exactly that turn.
+	result, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if result.Outcome != chatsvc.QueueResumeResumed || result.TurnID != second.ID {
+		t.Fatalf("second resume = %+v, want resumed %s", result, second.ID)
+	}
+	if got := conv.sentTexts(); !reflect.DeepEqual(got, []string{"root", "automation", "automation2"}) {
+		t.Fatalf("provider received %v, want the new head sent exactly once", got)
 	}
 }
 

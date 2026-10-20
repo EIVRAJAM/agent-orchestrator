@@ -219,6 +219,14 @@ Exact cycle:
 7. The hold is cleared on dispatch failure, on interrupt, on handoff, and on
    controller close/termination. A replacement controller starts with no hold and
    the queue held by the normal rule.
+8. It is also retired whenever the drain returns without claiming. The drain
+   re-reads the busy and handoff state under the lock and can return early, so
+   `ResumeQueuedTurn` confirms the row actually left `queued` before reporting
+   `resumed`. A row still in `queued` proves nothing was released: the marker is
+   cleared and the call reports `handoff_in_progress` or `session_busy`. A failed
+   CAS, a store error, a stale head, a decode/excerpt failure, a `SendTurn` error,
+   a `BindTurnToProvider` error and a `StartDeferredTurn` error all take the
+   error path, which clears the marker unconditionally.
 
 ### Lock order
 
@@ -253,6 +261,14 @@ calls back into the service. So there is no cycle and no inversion.
   queue (eager path); the same for the deferred ACP path, where the completion is
   emitted from `StartDeferredTurn` after the provider id is bound; an empty
   generation is refused.
+- `backend/internal/service/chat/queue_recovery_exits_test.go`: the marker is
+  cleared on every non-dispatch exit (a lost CAS, a claim store error), the
+  follow-up valid resume of the new head works, and an unrelated terminal event
+  does nothing; a real `Start` blocks on `controllerGate` while the resume holds
+  it across the claim and the provider boundary; a real replacement that wins the
+  gate first makes the resume revalidate and refuse; deferred `SendTurn` and
+  `StartDeferredTurn` failures settle the claimed row and clear the marker; the
+  deferred provider id is bound before `StartDeferredTurn`.
 - `backend/internal/service/chat/queue_state_derivation_test.go`: a fresh queue, a
   completed terminal turn, a compaction, a handoff, and an absent controller are
   not labelled `held_after_terminal_failure`; the priority order between

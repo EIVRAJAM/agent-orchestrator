@@ -343,6 +343,13 @@ func TestResumeDispatchFailureKeepsQueuedRows(t *testing.T) {
 	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); !errors.Is(err, chatsvc.ErrQueueDispatchFailed) {
 		t.Fatalf("err = %v, want ErrQueueDispatchFailed", err)
 	}
+	// The claimed row is settled failed, never returned to queued and re-sent.
+	if state := turnStateByID(t, h, first.ID); state != domain.TurnStateFailed {
+		t.Fatalf("released turn state = %q, want failed", state)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, []string{"root"}) {
+		t.Fatalf("provider received %v, want the failed send not replayed", got)
+	}
 	assertTurnStaysQueued(t, h, "automation2")
 
 	snapshot, err := h.svc.Snapshot(ctx, testSession)
