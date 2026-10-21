@@ -601,7 +601,7 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return fmt.Errorf("%w: %v", ports.ErrDeferredTurnNotStarted, errConversationClosed)
+		return fmt.Errorf("%w: %w", ports.ErrDeferredTurnNotStarted, errConversationClosed)
 	}
 	if c.prepared == nil || c.prepared.id != providerTurnID {
 		c.mu.Unlock()

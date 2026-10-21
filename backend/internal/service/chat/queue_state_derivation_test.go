@@ -501,14 +501,18 @@ func setupRetainedBacklog(t *testing.T, h *harness) (domain.ConversationTurn, do
 	t.Helper()
 	ctx := context.Background()
 	first := queueWhileRunning(t, h, "c1", "automation", "c2")
+	// Distinct timestamps make a later reorder deterministic, and human origins
+	// make the queued rows editable like user prompts.
+	h.advance(time.Second)
 	second, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "automation2", ClientMessageID: "c3", Origin: domain.MessageOriginAutomation,
+		Text: "automation2", ClientMessageID: "c3", Origin: domain.MessageOriginHuman,
 	})
 	if err != nil {
 		t.Fatalf("queue automation2: %v", err)
 	}
+	h.advance(time.Second)
 	third, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "automation3", ClientMessageID: "c4", Origin: domain.MessageOriginAutomation,
+		Text: "automation3", ClientMessageID: "c4", Origin: domain.MessageOriginHuman,
 	})
 	if err != nil {
 		t.Fatalf("queue automation3: %v", err)
@@ -579,7 +583,7 @@ func TestSendDuringRetainedBacklogQueuesBehindHead(t *testing.T) {
 
 	before := h.conv.sentTexts()
 	fourth, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "automation4", ClientMessageID: "c5", Origin: domain.MessageOriginAutomation,
+		Text: "automation4", ClientMessageID: "c5", Origin: domain.MessageOriginHuman,
 	})
 	if err != nil {
 		t.Fatalf("Send during retention: %v", err)

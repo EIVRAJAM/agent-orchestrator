@@ -1474,19 +1474,25 @@ func (c *Controller) sendLocked(
 
 	now := c.now()
 	turnID := c.newID()
-	// A retained backlog is a queue, not an idle controller: a new message must
-	// join it behind the held head instead of jumping ahead. A retention with no
-	// queued work is meaningless, so clear it rather than let a hidden field block
-	// this send.
-	retained := c.manualResumeRetained()
-	if retained {
-		if _, queueErr := c.store.NextQueuedTurn(ctx, c.conversation.ID); errors.Is(queueErr, domain.ErrNoQueuedTurn) {
-			c.clearRetainedQueue()
-			retained = false
-		}
+	// A durable queued head means this message joins the backlog instead of
+	// dispatching in front of it. A manual-resume retention is one reason the
+	// head waits; any other hold or a drain that has not run yet is another. Only
+	// the authorized drain/resume may dispatch the head.
+	retained, retainErr := c.retainedBacklog(ctx)
+	if retainErr != nil {
+		retained = true
+	}
+	backlog, backlogErr := c.hasQueuedBacklog(ctx)
+	if backlogErr != nil {
+		// Conservative: a read error must not let a new turn jump a possible backlog.
+		backlog = true
+	}
+	queueBehind := retained || backlog
+	if queueBehind {
+		queueWhenBusy = true
 	}
 	markedSending := false
-	if !queueWhenBusy || (!c.busy() && !retained) {
+	if !queueWhenBusy || (!c.busy() && !queueBehind) {
 		c.setSendingTurn(turnID)
 		markedSending = true
 	}
@@ -1539,7 +1545,7 @@ func (c *Controller) sendLocked(
 		return domain.ConversationTurn{}, nil
 	}
 
-	if queueWhenBusy && (c.busy() || retained) {
+	if queueWhenBusy && (c.busy() || queueBehind) {
 		// AppendUserMessage wrote it as queued, which is exactly where it belongs
 		// until the running turn ends or the held backlog is resumed. drain picks it
 		// up from there.
@@ -1547,7 +1553,7 @@ func (c *Controller) sendLocked(
 		c.log.Info("chat send queued behind a busy or retained controller",
 			"session", c.sessionID, "clientMessageId", msg.ClientMessageID, "turn", turnID,
 			"pendingTurn", c.pendingTurnID, "compactionPending", c.compactionPending,
-			"retained", retained, "state", c.state)
+			"retained", retained, "backlog", backlog, "state", c.state)
 		c.mu.Unlock()
 		return domain.ConversationTurn{
 			ID:                 turnID,
@@ -1630,6 +1636,16 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 		return domain.ConversationTurn{}, ErrTurnRunning
 	}
 
+	// Determine the existing backlog before inserting the retry turn: the insert
+	// writes the retry as queued and would otherwise look like backlog itself.
+	if _, retainErr := c.retainedBacklog(ctx); retainErr != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("check retained queue before retry: %w", retainErr)
+	}
+	queueBehind, backlogErr := c.hasQueuedBacklog(ctx)
+	if backlogErr != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("check queued backlog before retry: %w", backlogErr)
+	}
+
 	content, err := retryPromptContent(prompt.DeliveryContentJSON, c.Capabilities())
 	if err != nil {
 		return domain.ConversationTurn{}, err
@@ -1664,6 +1680,20 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 			}
 		}
 		return domain.ConversationTurn{}, ErrTurnNotRetryable
+	}
+
+	if queueBehind {
+		// A retry is a new turn. It joins the queued backlog behind its head; an
+		// explicit drain/resume releases the oldest queued turn first, never the
+		// retry.
+		return domain.ConversationTurn{
+			ID:                 newTurnID,
+			ConversationID:     c.conversation.ID,
+			HandledBySessionID: c.sessionID,
+			HandledByReviewID:  c.reviewID,
+			State:              domain.TurnStateQueued,
+			RequestedAt:        now,
+		}, nil
 	}
 
 	return c.dispatch(ctx, newTurnID, ports.ChatUserMessage{

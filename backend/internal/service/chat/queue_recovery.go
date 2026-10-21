@@ -156,6 +156,36 @@ func (c *Controller) manualResumeRetained() bool {
 	return c.retainedQueue != nil && c.retainedQueue.generation == c.generation
 }
 
+// retainedBacklog reports whether the manual-resume retention is active with
+// queued work still behind it. A retention whose backlog already emptied is
+// cleared here, so no hidden state can block a later dispatch.
+func (c *Controller) retainedBacklog(ctx context.Context) (bool, error) {
+	if !c.manualResumeRetained() {
+		return false, nil
+	}
+	if _, err := c.store.NextQueuedTurn(ctx, c.conversation.ID); err != nil {
+		if errors.Is(err, domain.ErrNoQueuedTurn) {
+			c.clearRetainedQueue()
+			return false, nil
+		}
+		return true, err
+	}
+	return true, nil
+}
+
+// hasQueuedBacklog reports whether a never-sent turn is already waiting. A new
+// message must join that backlog instead of dispatching in front of it, no matter
+// why the head is waiting (a hold, a retention, or a drain that has not run yet).
+func (c *Controller) hasQueuedBacklog(ctx context.Context) (bool, error) {
+	if _, err := c.store.NextQueuedTurn(ctx, c.conversation.ID); err != nil {
+		if errors.Is(err, domain.ErrNoQueuedTurn) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // consumeResumeHold clears and reports whether a primary terminal event belongs
 // to the one-shot resumed turn. Only a matching event suppresses the automatic
 // drain; an ordinary completed turn is unaffected. It returns the hold so the
@@ -407,28 +437,30 @@ type QueueState struct {
 type QueueStateValue string
 
 const (
-	// QueueStateIdle: controller ready, no running turn, empty queue.
+	// QueueStateIdle means the controller is ready, no turn is running and the
+	// queue is empty.
 	QueueStateIdle QueueStateValue = "idle"
-	// QueueStateRunning: a bound turn is in flight.
+	// QueueStateRunning means a bound turn is in flight.
 	QueueStateRunning QueueStateValue = "running"
-	// QueueStateCompacting: a compaction is in flight.
+	// QueueStateCompacting means a compaction is in flight.
 	QueueStateCompacting QueueStateValue = "compacting"
-	// QueueStateWaitingForActiveTurn: queued turns wait behind an active turn.
+	// QueueStateWaitingForActiveTurn means queued turns wait behind an active turn.
 	QueueStateWaitingForActiveTurn QueueStateValue = "queued_waiting_for_active_turn"
-	// QueueStateHeldAfterFailure: queued turns are held behind a non-completed
+	// QueueStateHeldAfterFailure means queued turns are held behind a non-completed
 	// terminal turn and nothing is running.
 	QueueStateHeldAfterFailure QueueStateValue = "held_after_terminal_failure"
-	// QueueStateHeldAfterManualResume: an explicit resume released one turn, that
-	// turn ended, and the remaining queued work is deliberately held until another
-	// explicit resume. There is no active turn.
+	// QueueStateHeldAfterManualResume means an explicit resume released one turn,
+	// that turn ended, and the remaining queued work is deliberately held until
+	// another explicit resume. There is no active turn.
 	QueueStateHeldAfterManualResume QueueStateValue = "held_after_manual_resume"
-	// QueueStateTerminated: the session is terminated.
+	// QueueStateTerminated means the session is terminated.
 	QueueStateTerminated QueueStateValue = "session_terminated"
-	// QueueStateControllerRecoveryRequired: pending work but no live controller.
+	// QueueStateControllerRecoveryRequired means pending work but no live
+	// controller.
 	QueueStateControllerRecoveryRequired QueueStateValue = "controller_recovery_required"
-	// QueueStateHandoffInProgress: a controller handoff is armed.
+	// QueueStateHandoffInProgress means a controller handoff is armed.
 	QueueStateHandoffInProgress QueueStateValue = "handoff_in_progress"
-	// QueueStateUncertain: a running turn's delivery is unconfirmed.
+	// QueueStateUncertain means a running turn's delivery is unconfirmed.
 	QueueStateUncertain QueueStateValue = "state_uncertain"
 )
 

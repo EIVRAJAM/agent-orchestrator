@@ -368,6 +368,31 @@ when the backlog becomes empty.
   observable state from durable rows plus the live controller.
 - Cold start is unchanged; the reason only exists on a live controller.
 
+### FIFO and explicit operations
+
+A durable queued head is authoritative for order, not only a manual-resume
+retention. A new `Send` — and the `SteerOrSend` fallback when there is no active
+turn, even though it calls `sendLocked(..., false)` — appends behind the head and
+never dispatches in front of it. Only the authorized drain or an explicit resume
+dispatches the head. This closes the historical case where an idle controller with
+a queued row dispatched a newly added message first.
+
+While a retention is active:
+
+- `RetryTurn` creates the retry as `queued` behind the head (the backlog is read
+  before the retry row is inserted) and does not clear the retention; an explicit
+  resume releases the head first.
+- Reorder, cancel and edit mutate the queue without dispatching. Cancelling every
+  held row clears the retention; cancelling only the head keeps it for the new
+  head.
+- Promote requires an acknowledged active turn; with the retention there is none,
+  so it is refused and the backlog is untouched.
+- Handoff clears the retention and blocks dispatch. Compaction may contact the
+  provider but does not release the backlog; a later `Compacted` drain is blocked
+  by the retention guard.
+- A normal completed turn still drains through the existing path when no backlog
+  hold applies.
+
 ### Lock order
 
 `controllerGate` → `sendMu` → `{ c.mu, Service.mu (registry read),
@@ -426,6 +451,12 @@ calls back into the service. So there is no cycle and no inversion.
   `state_uncertain` and zero further sends; a late `TurnStarted` persists the
   binding and its terminal settles the exact row; no events fall to recovery
   without a replay.
+- `backend/internal/service/chat/queue_dispatch_audit_test.go`: a new `Send`
+  joins an existing durable head (including failed/recovered/interrupted holds);
+  `RetryTurn` during a retention queues behind the head and does not clear it;
+  the `SteerOrSend` fallback queues; reorder keeps the retention and changes the
+  head; edit and promote do not dispatch; an unrelated completion that would
+  normally drain cannot pass the retained head.
 - `backend/internal/service/chat/queue_state_derivation_test.go`: a fresh queue, a
   completed terminal turn, a compaction, a handoff, and an absent controller are
   not labelled `held_after_terminal_failure`; a completed one-shot with queued
