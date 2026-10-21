@@ -653,6 +653,7 @@ func TestResumeEagerBindFailureIsUncertainUntilLateTerminal(t *testing.T) {
 			}
 			h.conv.emit(event)
 			turn = waitTurnState(t, h, first.ID, tc.wantState)
+			waitRetainedQueue(t, h, first.ID)
 			waitResumeHoldCleared(t, h)
 
 			if turn.CompletedAt == nil {

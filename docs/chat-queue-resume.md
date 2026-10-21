@@ -340,18 +340,30 @@ Exact cycle:
 
 ### Retained queue reason
 
-When the one-shot turn's terminal is consumed, the controller records a
-**retained queue reason** distinct from the active hold: `{turnID, generation}`.
-It means "a one-shot completed and the rest of the queue is waiting for another
-explicit resume". The snapshot derives `held_after_manual_resume` from it only
-while queued work exists and the latest terminal is `completed`; a
+When the one-shot turn's terminal is consumed **and a queued backlog exists**,
+the controller records a **retained queue reason** distinct from the active hold:
+`{turnID, generation}`. It means "a one-shot completed and the rest of the queue
+is waiting for another explicit resume". A one-shot that leaves nothing queued
+records nothing, so no hidden state can survive an empty queue. The snapshot
+derives `held_after_manual_resume` from it while queued work exists; a
 failed/interrupted one-shot keeps `held_after_terminal_failure`.
 
+Policy for messages that arrive during the retention: **they join the retained
+backlog** (option A). They are appended as `queued` behind the existing head and
+are never dispatched directly, so FIFO order is preserved. The retention ends
+when the backlog becomes empty.
+
 - The automatic drain refuses to dispatch while the reason is active; only an
-  explicit resume (`claim=true`) bypasses it.
+  explicit resume (`claim=true`) bypasses it, and it releases the current head.
 - A successful explicit resume clears it before claiming the next turn.
+- Cancelling every held row clears it; the snapshot becomes `idle` and a later
+  normal `Send` dispatches immediately.
+- Cancelling only the head keeps it; the new head is still held and must be named
+  by the next explicit resume.
 - Handoff, close, terminate and controller replacement clear it; the next
   generation never inherits it.
+- `Send` checks the retention before dispatching when the controller is otherwise
+  idle, and defensively clears a retention whose backlog is already empty.
 - It is not persisted and is not a display status: the snapshot derives the
   observable state from durable rows plus the live controller.
 - Cold start is unchanged; the reason only exists on a live controller.
@@ -420,7 +432,12 @@ calls back into the service. So there is no cycle and no inversion.
   work is `held_after_manual_resume` (no active turn), clears on the next resume,
   reappears after the next completion, and ends `idle`; a failed/interrupted
   one-shot stays `held_after_terminal_failure`; a normal completion never retains;
-  handoff/close clear the retention and a replacement does not inherit it.
+  handoff/close clear the retention and a replacement does not inherit it; a
+  one-shot with no backlog records nothing and a later normal Send dispatches; a
+  Send during a retained backlog queues behind the original head and the resume
+  releases that head; cancelling the whole backlog clears the retention and the
+  next Send dispatches; cancelling only the head keeps the retention for the new
+  head and a stale resume is refused.
 - `backend/internal/service/chat/controller_hold_queue_test.go`: the #4861 hold
   tests, unchanged.
 - `backend/internal/httpd/controllers/conversation_queue_resume_test.go`: route

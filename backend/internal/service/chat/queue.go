@@ -115,7 +115,15 @@ func (c *Controller) CancelQueuedTurn(ctx context.Context, turnID string) error 
 	if c.handoffActive() {
 		return ErrControllerHandoff
 	}
-	return c.store.CancelQueuedTurnByID(ctx, c.conversation.ID, turnID, c.now())
+	if err := c.store.CancelQueuedTurnByID(ctx, c.conversation.ID, turnID, c.now()); err != nil {
+		return err
+	}
+	// If that was the last held row, the manual-resume retention no longer
+	// describes any backlog and must not survive invisibly.
+	if _, err := c.store.NextQueuedTurn(ctx, c.conversation.ID); errors.Is(err, domain.ErrNoQueuedTurn) {
+		c.clearRetainedQueue()
+	}
+	return nil
 }
 
 // EditQueuedTurn rewrites the durable human prompt for a queued turn.

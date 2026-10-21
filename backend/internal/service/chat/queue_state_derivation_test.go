@@ -3,6 +3,7 @@ package chat_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -211,6 +212,7 @@ func TestSnapshotHistoricalFailureDoesNotHoldPendingWork(t *testing.T) {
 	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 		return turnStateByText(t, s)["automation"] == domain.TurnStateCompleted
 	})
+	waitRetainedQueue(t, h, first.ID)
 
 	queue := snapshotQueue(t, h)
 	if queue.State == chatsvc.QueueStateHeldAfterFailure {
@@ -490,4 +492,198 @@ func TestManualResumeRetentionClearedByHandoffAndClose(t *testing.T) {
 			t.Fatalf("close did not clear the retention: %q", retained)
 		}
 	})
+}
+
+// setupRetainedBacklog leaves a completed one-shot with two queued turns held by
+// held_after_manual_resume. It returns the one-shot turn and the two retained
+// queued heads in FIFO order.
+func setupRetainedBacklog(t *testing.T, h *harness) (domain.ConversationTurn, domain.ConversationTurn, domain.ConversationTurn) {
+	t.Helper()
+	ctx := context.Background()
+	first := queueWhileRunning(t, h, "c1", "automation", "c2")
+	second, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "automation2", ClientMessageID: "c3", Origin: domain.MessageOriginAutomation,
+	})
+	if err != nil {
+		t.Fatalf("queue automation2: %v", err)
+	}
+	third, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "automation3", ClientMessageID: "c4", Origin: domain.MessageOriginAutomation,
+	})
+	if err != nil {
+		t.Fatalf("queue automation3: %v", err)
+	}
+	failRootTurn(t, h)
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, first.ID, currentGeneration(h)); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	h.conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
+		TurnState: domain.TurnStateCompleted,
+	})
+	waitTurnState(t, h, first.ID, domain.TurnStateCompleted)
+	waitRetainedQueue(t, h, first.ID)
+	return first, second, third
+}
+
+// TestOneShotWithoutBacklogDoesNotRetain proves a one-shot that leaves nothing
+// queued does not keep a hidden retention: the snapshot is idle and a later
+// normal Send dispatches immediately.
+func TestOneShotWithoutBacklogDoesNotRetain(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	queued := queueWhileRunning(t, h, "c1", "only", "c2")
+	failRootTurn(t, h)
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, queued.ID, currentGeneration(h)); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	h.conv.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-2",
+		TurnState: domain.TurnStateCompleted,
+	})
+	waitTurnState(t, h, queued.ID, domain.TurnStateCompleted)
+	waitResumeHoldCleared(t, h)
+
+	if retained := h.ctrl.RetainedQueueTurnIDForTest(); retained != "" {
+		t.Fatalf("retention survived a one-shot with no backlog: %q", retained)
+	}
+	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateIdle {
+		t.Fatalf("state = %q, want idle", queue.State)
+	}
+
+	before := len(h.conv.sentTexts())
+	turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "after", ClientMessageID: "c3", Origin: domain.MessageOriginHuman,
+	})
+	if err != nil {
+		t.Fatalf("Send after idle one-shot: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning {
+		t.Fatalf("new turn state = %q, want running", turn.State)
+	}
+	if got := h.conv.sentTexts(); len(got) != before+1 || got[len(got)-1] != "after" {
+		t.Fatalf("provider received %v, want exactly one new send", got)
+	}
+	if queue := snapshotQueue(t, h); queue.State == chatsvc.QueueStateHeldAfterManualResume {
+		t.Fatalf("new normal send inherited held_after_manual_resume")
+	}
+}
+
+// TestSendDuringRetainedBacklogQueuesBehindHead proves a new message cannot jump
+// ahead of a retained backlog: it is queued after the existing head and an
+// explicit resume releases the original head.
+func TestSendDuringRetainedBacklogQueuesBehindHead(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	_, second, third := setupRetainedBacklog(t, h)
+
+	before := h.conv.sentTexts()
+	fourth, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "automation4", ClientMessageID: "c5", Origin: domain.MessageOriginAutomation,
+	})
+	if err != nil {
+		t.Fatalf("Send during retention: %v", err)
+	}
+	if got := h.conv.sentTexts(); !reflect.DeepEqual(got, before) {
+		t.Fatalf("provider received %v after a retained Send, want no dispatch", got)
+	}
+	if fourth.State != domain.TurnStateQueued {
+		t.Fatalf("new turn state = %q, want queued", fourth.State)
+	}
+	for _, turn := range []domain.ConversationTurn{second, third, fourth} {
+		if state := turnStateByID(t, h, turn.ID); state != domain.TurnStateQueued {
+			t.Fatalf("turn %s state = %q, want queued", turn.ID, state)
+		}
+	}
+	queue := snapshotQueue(t, h)
+	if queue.State != chatsvc.QueueStateHeldAfterManualResume {
+		t.Fatalf("state = %q, want held_after_manual_resume", queue.State)
+	}
+	if queue.HeadTurnID != second.ID {
+		t.Fatalf("head = %q, want the original retained head %s", queue.HeadTurnID, second.ID)
+	}
+
+	// The explicit resume releases the original head, not the new message.
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, currentGeneration(h)); err != nil {
+		t.Fatalf("resume head: %v", err)
+	}
+	if got := h.conv.sentTexts(); len(got) != len(before)+1 || got[len(got)-1] != "automation2" {
+		t.Fatalf("provider received %v, want only the original head released", got)
+	}
+	for _, turn := range []domain.ConversationTurn{third, fourth} {
+		if state := turnStateByID(t, h, turn.ID); state != domain.TurnStateQueued {
+			t.Fatalf("turn %s state = %q, want still queued", turn.ID, state)
+		}
+	}
+}
+
+// TestCancelAllRetainedBacklogClearsRetention proves cancelling the whole held
+// backlog clears the retention: the snapshot is idle and a later Send dispatches.
+func TestCancelAllRetainedBacklogClearsRetention(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	_, second, third := setupRetainedBacklog(t, h)
+
+	for _, turn := range []domain.ConversationTurn{second, third} {
+		if err := h.svc.CancelQueuedTurn(ctx, testSession, turn.ID); err != nil {
+			t.Fatalf("CancelQueuedTurn %s: %v", turn.ID, err)
+		}
+	}
+	if retained := h.ctrl.RetainedQueueTurnIDForTest(); retained != "" {
+		t.Fatalf("retention survived cancelling the whole backlog: %q", retained)
+	}
+	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateIdle {
+		t.Fatalf("state = %q, want idle", queue.State)
+	}
+
+	before := len(h.conv.sentTexts())
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "after-cancel", ClientMessageID: "c5", Origin: domain.MessageOriginHuman,
+	}); err != nil {
+		t.Fatalf("Send after cancel: %v", err)
+	}
+	if got := h.conv.sentTexts(); len(got) != before+1 || got[len(got)-1] != "after-cancel" {
+		t.Fatalf("provider received %v, want one automatic dispatch", got)
+	}
+}
+
+// TestCancelHeadKeepsRetentionForNewHead proves cancelling only the retained head
+// keeps the retention: the next head is not dispatched automatically and must be
+// named by the next explicit resume.
+func TestCancelHeadKeepsRetentionForNewHead(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	first, second, third := setupRetainedBacklog(t, h)
+
+	if err := h.svc.CancelQueuedTurn(ctx, testSession, second.ID); err != nil {
+		t.Fatalf("CancelQueuedTurn head: %v", err)
+	}
+	if retained := h.ctrl.RetainedQueueTurnIDForTest(); retained != first.ID {
+		t.Fatalf("retention = %q, want %s", retained, first.ID)
+	}
+	queue := snapshotQueue(t, h)
+	if queue.State != chatsvc.QueueStateHeldAfterManualResume {
+		t.Fatalf("state = %q, want held_after_manual_resume", queue.State)
+	}
+	if queue.HeadTurnID != third.ID {
+		t.Fatalf("head = %q, want the new head %s", queue.HeadTurnID, third.ID)
+	}
+	if state := turnStateByID(t, h, third.ID); state != domain.TurnStateQueued {
+		t.Fatalf("new head state = %q, want queued", state)
+	}
+
+	// A stale resume of the cancelled head is refused; the new head works.
+	stale, err := h.svc.ResumeHeldQueue(ctx, testSession, second.ID, currentGeneration(h))
+	if err != nil {
+		t.Fatalf("resume of the cancelled head: %v", err)
+	}
+	if stale.Outcome == chatsvc.QueueResumeResumed {
+		t.Fatalf("resume of the cancelled head was reported as resumed")
+	}
+	if _, err := h.svc.ResumeHeldQueue(ctx, testSession, third.ID, currentGeneration(h)); err != nil {
+		t.Fatalf("resume new head: %v", err)
+	}
+	if got := h.conv.sentTexts(); got[len(got)-1] != "automation3" {
+		t.Fatalf("provider received %v, want the new head released", got)
+	}
 }

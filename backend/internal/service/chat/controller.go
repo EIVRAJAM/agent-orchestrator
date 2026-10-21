@@ -1474,8 +1474,19 @@ func (c *Controller) sendLocked(
 
 	now := c.now()
 	turnID := c.newID()
+	// A retained backlog is a queue, not an idle controller: a new message must
+	// join it behind the held head instead of jumping ahead. A retention with no
+	// queued work is meaningless, so clear it rather than let a hidden field block
+	// this send.
+	retained := c.manualResumeRetained()
+	if retained {
+		if _, queueErr := c.store.NextQueuedTurn(ctx, c.conversation.ID); errors.Is(queueErr, domain.ErrNoQueuedTurn) {
+			c.clearRetainedQueue()
+			retained = false
+		}
+	}
 	markedSending := false
-	if !queueWhenBusy || !c.busy() {
+	if !queueWhenBusy || (!c.busy() && !retained) {
 		c.setSendingTurn(turnID)
 		markedSending = true
 	}
@@ -1528,13 +1539,15 @@ func (c *Controller) sendLocked(
 		return domain.ConversationTurn{}, nil
 	}
 
-	if queueWhenBusy && c.busy() {
+	if queueWhenBusy && (c.busy() || retained) {
 		// AppendUserMessage wrote it as queued, which is exactly where it belongs
-		// until the running turn ends. drain picks it up from there.
+		// until the running turn ends or the held backlog is resumed. drain picks it
+		// up from there.
 		c.mu.Lock()
-		c.log.Info("chat send queued behind busy controller",
+		c.log.Info("chat send queued behind a busy or retained controller",
 			"session", c.sessionID, "clientMessageId", msg.ClientMessageID, "turn", turnID,
-			"pendingTurn", c.pendingTurnID, "compactionPending", c.compactionPending, "state", c.state)
+			"pendingTurn", c.pendingTurnID, "compactionPending", c.compactionPending,
+			"retained", retained, "state", c.state)
 		c.mu.Unlock()
 		return domain.ConversationTurn{
 			ID:                 turnID,
@@ -3592,10 +3605,18 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 		// "not this turn's" while the hold is still unbound.
 		if hold, consumed := c.consumeResumeHold(event.ProviderTurnID); consumed {
 			allow = false
-			// The one-shot finished. Record that the rest of the queue is held by the
-			// manual resume until another explicit action, so the snapshot can say
-			// held_after_manual_resume instead of implying a phantom active turn.
-			c.retainQueueAfterOneShot(hold.turnID)
+			// The one-shot finished. Retain the rest of the queue only when a
+			// backlog actually exists: a hidden retention after an empty queue would
+			// later block or mislabel a normal Send.
+			if _, queueErr := c.store.NextQueuedTurn(ctx, c.conversation.ID); queueErr == nil {
+				c.retainQueueAfterOneShot(hold.turnID)
+			} else if errors.Is(queueErr, domain.ErrNoQueuedTurn) {
+				c.clearRetainedQueue()
+			} else {
+				c.log.Error("failed to check the retained backlog after a one-shot",
+					"session", c.sessionID, "turn", hold.turnID, "error", queueErr)
+				c.clearRetainedQueue()
+			}
 			// An eager send whose provider id could not be recorded leaves the row
 			// running/unbound. The terminal still names the provider id the marker
 			// captured, so settle the known AO turn by id; consuming the marker alone

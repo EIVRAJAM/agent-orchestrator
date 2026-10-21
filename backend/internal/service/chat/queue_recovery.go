@@ -469,12 +469,11 @@ func deriveQueueState(
 		(facts.LatestTerminalState == domain.TurnStateFailed ||
 			facts.LatestTerminalState == domain.TurnStateRecovered ||
 			facts.LatestTerminalState == domain.TurnStateInterrupted)
-	// A one-shot resume that completed leaves the rest of the queue held on
-	// purpose. There is no active turn, so this must not read as
-	// queued_waiting_for_active_turn. A failed/interrupted one-shot keeps the
-	// stronger held_after_terminal_failure reason.
+	// A one-shot resume that completed and left a backlog keeps that backlog held
+	// until another explicit resume. The retention itself is the signal; a later
+	// cancellation of the head leaves it in place with a new head. A failed or
+	// interrupted one-shot is caught by heldAfterFailure first.
 	heldAfterManualResume := facts.PendingCount > 0 && facts.RunningCount == 0 &&
-		facts.LatestTerminalState == domain.TurnStateCompleted &&
 		controller != nil && controller.manualResumeRetained()
 
 	// Priority, strongest first: terminated, handoff, an uncertain running turn,
