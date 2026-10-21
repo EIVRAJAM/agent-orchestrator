@@ -308,7 +308,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	if strings.TrimSpace(msg.Text) == "" {
 		// There is no keystroke concept here: an empty message is a caller bug,
 		// not a way to nudge the agent.
-		return ports.ChatTurnRef{}, errors.New("chat message text is empty")
+		return ports.ChatTurnRef{}, fmt.Errorf("%w: chat message text is empty", ports.ErrTurnNotDelivered)
 	}
 
 	c.sendMu.Lock()
@@ -331,7 +331,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		} `json:"turn"`
 	}
 	if err := c.conn.request(ctx, "turn/start", params, &resp); err != nil {
-		return ports.ChatTurnRef{}, fmt.Errorf("turn/start: %w", err)
+		return ports.ChatTurnRef{}, classifySendTurnError(err)
 	}
 
 	c.mu.Lock()
@@ -339,6 +339,23 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	c.mu.Unlock()
 
 	return ports.ChatTurnRef{ProviderTurnID: c.scopedID(resp.Turn.ID)}, nil
+}
+
+// classifySendTurnError distinguishes what the adapter can prove from what it
+// cannot. A provider error response is a definitive rejection; a connection
+// refused before any write is definitively not delivered. Everything else —
+// a write failure, EOF, timeout, cancellation after the write, an unreadable
+// response — may have reached the provider and stays a plain error so the
+// controller treats the delivery as uncertain.
+func classifySendTurnError(err error) error {
+	var rpcErr *rpcError
+	if errors.As(err, &rpcErr) {
+		return fmt.Errorf("%w: %w", ports.ErrTurnRejected, err)
+	}
+	if errors.Is(err, errConnClosedBeforeWrite) {
+		return fmt.Errorf("%w: %w", ports.ErrTurnNotDelivered, err)
+	}
+	return err
 }
 
 // applyTurnSettings folds the caller's per-turn choices into a turn/start payload.

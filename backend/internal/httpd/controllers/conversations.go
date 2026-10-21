@@ -127,6 +127,7 @@ func (c *ConversationsController) Register(r chi.Router) {
 	r.Post("/sessions/{sessionId}/conversation/turns/{turnId}/cancel", c.cancelQueuedTurn)
 	r.Post("/sessions/{sessionId}/conversation/turns/{turnId}/queue/edit", c.editQueuedTurn)
 	r.Post("/sessions/{sessionId}/conversation/queue/reorder", c.reorderQueuedTurns)
+	r.Post("/sessions/{sessionId}/conversation/queue/resume", c.resumeHeldQueue)
 	r.Post("/sessions/{sessionId}/conversation/compact", c.compact)
 	r.Get("/sessions/{sessionId}/conversation/models", c.models)
 	r.Get("/sessions/{sessionId}/conversation/config-options", c.configOptions)
@@ -1214,6 +1215,7 @@ func conversationSnapshotResponse(s chatsvc.Snapshot) ConversationSnapshotRespon
 		ThreadState:                      threadStatePayload(s.Conversation.ThreadState),
 		MCPServers:                       mcpServersPayload(s.Conversation.MCPServers),
 		Capabilities:                     capabilityNames(s.Capabilities),
+		Queue:                            conversationQueuePayload(s.Queue),
 	}
 
 	for _, turn := range s.Turns {

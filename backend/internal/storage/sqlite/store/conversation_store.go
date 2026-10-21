@@ -1802,6 +1802,29 @@ func (s *Store) ListVisibleRunningTurnProviderIDs(
 	return providerTurnIDs, nil
 }
 
+// ListActiveRunningTurnProviderIDs returns the active-branch running turns for one
+// controller epoch only. It excludes rolled-back and promoted rows and ignores
+// work owned by an obsolete session or generation, which recovery settles. The
+// dispatch guard and the explicit resume use it so a replacement controller is
+// neither blocked forever by an old row nor allowed to dispatch behind an
+// uncertain turn of its own generation.
+func (s *Store) ListActiveRunningTurnProviderIDs(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	generation string,
+) ([]string, error) {
+	providerTurnIDs, err := s.qr.ListActiveRunningTurnsForController(ctx, gen.ListActiveRunningTurnsForControllerParams{
+		ConversationID: conversationID,
+		SessionID:      session,
+		Generation:     generation,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list active running turns for %s: %w", conversationID, err)
+	}
+	return providerTurnIDs, nil
+}
+
 // SetConversationSettings records the provider choices for the next turn.
 //
 // An empty field is stored as NULL rather than as an empty string, so "the user
@@ -2256,7 +2279,55 @@ func (s *Store) NextQueuedTurn(ctx context.Context, conversationID string) (doma
 		ClientMessageID:     row.ClientMessageID,
 		Origin:              row.Origin,
 		DeliveryContentJSON: row.DeliveryContentJson,
+		RequestedAt:         row.RequestedAt,
 	}, nil
+}
+
+// ConversationQueueFacts returns the aggregate, window-independent facts the
+// observable queue view is derived from. It is a read only: nothing here is
+// persisted.
+func (s *Store) ConversationQueueFacts(ctx context.Context, conversationID string) (domain.ConversationQueueFacts, error) {
+	row, err := s.qr.SelectConversationQueueFacts(ctx, conversationID)
+	if err != nil {
+		return domain.ConversationQueueFacts{}, fmt.Errorf("select conversation queue facts for %s: %w", conversationID, err)
+	}
+	return domain.ConversationQueueFacts{
+		PendingCount:        int(row.PendingCount),
+		RunningCount:        int(row.RunningCount),
+		RunningUnboundCount: int(row.RunningUnboundCount),
+		ActiveTurnID:        row.ActiveTurnID,
+		LatestTerminalState: domain.TurnState(row.LatestTerminalState),
+	}, nil
+}
+
+// ClaimQueuedTurnForResume atomically promotes one exact queued turn to running
+// for an explicit queue resume. It is the durable compare-and-set the resume
+// requires: a pre-check followed by an unconditional update would let a row that
+// another path already dispatched, promoted, cancelled or rolled back cross the
+// provider boundary. It also requires the row's generation and the handling
+// session's live generation to equal expectedControllerGeneration, inside the
+// same statement, so a controller that lost ownership cannot claim even if it
+// passed a preliminary Go-side check. Returns false when the row is no longer a
+// claimable queue item or the epoch changed, in which case the caller must not
+// call the provider.
+func (s *Store) ClaimQueuedTurnForResume(
+	ctx context.Context,
+	conversationID, turnID, expectedControllerGeneration string,
+	now time.Time,
+) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.ClaimQueuedConversationTurnForResume(ctx,
+		gen.ClaimQueuedConversationTurnForResumeParams{
+			Now:                          sql.NullTime{Time: now, Valid: true},
+			ID:                           turnID,
+			ConversationID:               conversationID,
+			ExpectedControllerGeneration: expectedControllerGeneration,
+		})
+	if err != nil {
+		return false, fmt.Errorf("claim queued turn %s for resume: %w", turnID, err)
+	}
+	return rows > 0, nil
 }
 
 // ReserveQueuedTurnForPromotion atomically removes one selected queued turn from

@@ -776,6 +776,47 @@ WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
   ))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
 
+-- Running turns that belong to one controller epoch. The durable dispatch guard
+-- and the explicit resume use this instead of every visible running row: a
+-- replacement controller must not be blocked forever by a row recovery will
+-- settle for an obsolete generation or session, and a rolled-back or promoted
+-- row is not running work. The visible-branch lineage matches
+-- ListVisibleRunningTurnsForConversation.
+-- name: ListActiveRunningTurnsForController :many
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
+    FROM conversations
+    WHERE conversations.id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE
+               WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+               WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+               ELSE path.max_sequence
+           END
+    FROM active_path AS path
+    JOIN conversation_branches AS branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+)
+SELECT conversation_turns.provider_turn_id FROM conversation_turns
+JOIN active_path AS path ON path.branch_id = conversation_turns.branch_id
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(session_id)
+  AND conversation_turns.controller_generation = sqlc.arg(generation)
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.promoted_to_turn_id IS NULL
+  AND (path.max_sequence IS NULL OR EXISTS (
+      SELECT 1 FROM conversation_messages AS lineage_message
+      WHERE lineage_message.turn_id = conversation_turns.id
+        AND lineage_message.sequence <= path.max_sequence
+      UNION ALL
+      SELECT 1 FROM conversation_activities AS lineage_activity
+      WHERE lineage_activity.turn_id = conversation_turns.id
+        AND lineage_activity.sequence <= path.max_sequence
+  ))
+ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
+
 -- Overwrite the turn's changed-file summary. The provider re-sends the whole diff
 -- on every update, so the latest payload is the complete answer and there is
 -- nothing to merge with what was there before.
@@ -1014,7 +1055,8 @@ SELECT conversation_turns.id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
-       conversation_messages.delivery_content_json
+       conversation_messages.delivery_content_json,
+       conversation_turns.requested_at
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
@@ -1024,6 +1066,74 @@ WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.promotion_started_at IS NULL
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
+
+-- Durable compare-and-set for an explicit queue resume: the exact turn must
+-- still be an unsent, unpromoted, unrolled-back queued row AND it must still
+-- belong to the controller generation the caller named. execrows is the CAS
+-- result: zero means the queue moved (another dispatch, a promotion, a cancel, a
+-- settle or a rollback) or the session owner changed, and the provider must not
+-- be called. Unlike MarkConversationTurnStarted this is conditional on the row
+-- still being queued, so a resume cannot promote a row another path already
+-- claimed.
+--
+-- The generation is checked inside the same statement that claims the row, so
+-- the ownership decision is atomic with the claim: there is no window between a
+-- Go-side generation read and this write. Two facts must both hold:
+--   * conversation_turns.controller_generation = the named generation, i.e. the
+--     row itself belongs to that controller epoch (never a newer one), and
+--   * the handling session's live sessions.controller_generation = the named
+--     generation, i.e. that epoch is still the durable owner.
+-- handled_by_session_id is the durable conversation -> session link for a chat
+-- turn; a reviewer owner never reaches this path (requireChatSession gates it).
+-- NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
+-- offset, so a multi-byte character here silently corrupts later queries.
+-- name: ClaimQueuedConversationTurnForResume :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    started_at = COALESCE(started_at, sqlc.arg(now))
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = sqlc.arg(expected_controller_generation)
+  AND EXISTS (
+      SELECT 1 FROM sessions AS s
+      WHERE s.id = conversation_turns.handled_by_session_id
+        AND s.controller_generation = sqlc.arg(expected_controller_generation)
+  );
+
+-- Aggregate, window-independent facts for the derived observable queue view.
+-- Each subquery is conversation-scoped and served by
+-- idx_conversation_turns_conversation, so a paginated snapshot reports the same
+-- queue as a full one. Every column is COALESCEd to a non-null scalar: a bare
+-- scalar subquery is inferred non-nullable by sqlc but returns NULL at runtime
+-- when it matches no row, which would fail the scan. Terminal states are listed
+-- explicitly rather than using state <> 'queued' AND state <> 'running' so a
+-- future state cannot silently change the meaning of "the last terminal turn".
+-- The head id and its timestamp come from SelectNextQueuedConversationTurn.
+-- NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
+-- offset, so a multi-byte character here silently corrupts later queries.
+-- name: SelectConversationQueueFacts :one
+SELECT
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS q
+        WHERE q.conversation_id = sqlc.arg(conversation_id)
+          AND q.state = 'queued' AND q.promotion_started_at IS NULL AND q.rolled_back_at IS NULL), 0) AS INTEGER) AS pending_count,
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS r
+        WHERE r.conversation_id = sqlc.arg(conversation_id)
+          AND r.state = 'running' AND r.rolled_back_at IS NULL), 0) AS INTEGER) AS running_count,
+    CAST(COALESCE((SELECT COUNT(*) FROM conversation_turns AS r
+        WHERE r.conversation_id = sqlc.arg(conversation_id)
+          AND r.state = 'running' AND r.rolled_back_at IS NULL AND r.provider_turn_id = ''), 0) AS INTEGER) AS running_unbound_count,
+    CAST(COALESCE((SELECT r.id FROM conversation_turns AS r
+        WHERE r.conversation_id = sqlc.arg(conversation_id)
+          AND r.state = 'running' AND r.rolled_back_at IS NULL
+        ORDER BY r.requested_at, r.rowid LIMIT 1), '') AS TEXT) AS active_turn_id,
+    CAST(COALESCE((SELECT t.state FROM conversation_turns AS t
+        WHERE t.conversation_id = sqlc.arg(conversation_id)
+          AND t.rolled_back_at IS NULL
+          AND t.state IN ('completed','recovered','interrupted','failed','cancelled')
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state;
 
 -- Claim one selected queue item before contacting the provider. execrows is the
 -- compare-and-set result: zero means the turn is absent, settled, or already being

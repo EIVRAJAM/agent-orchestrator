@@ -610,6 +610,28 @@ type QueuedTurn struct {
 	// DeliveryContentJSON carries provider-neutral native prompt blocks through
 	// the durable queue. It is not rendered and never contains provider DTOs.
 	DeliveryContentJSON string
+	// RequestedAt is when the turn was recorded. The queue is ordered by it, so
+	// the head's value is the age of the oldest never-sent turn.
+	RequestedAt time.Time
+}
+
+// ConversationQueueFacts is the aggregate, non-persisted read the observable
+// queue view is derived from. It is a window-independent read so a paginated
+// snapshot reports the same queue as a full one. Every field is a non-null
+// scalar; the queue head and its timestamp come from QueuedTurn.
+type ConversationQueueFacts struct {
+	// PendingCount counts never-sent turns: state 'queued', unpromoted, unrolled
+	// back.
+	PendingCount int
+	// RunningCount counts live turns; RunningUnboundCount those without a
+	// provider binding (delivery unconfirmed).
+	RunningCount        int
+	RunningUnboundCount int
+	// ActiveTurnID is the oldest running turn, empty when none.
+	ActiveTurnID string
+	// LatestTerminalState is the state of the newest terminal turn, empty when
+	// the conversation has none.
+	LatestTerminalState TurnState
 }
 
 // RetryPrompt is the durable human-authored content of a failed turn that may

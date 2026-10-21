@@ -83,6 +83,7 @@ type Store interface {
 	CleanupOwnedControllerWork(ctx context.Context, session domain.SessionID, conversationID, generation string, now time.Time) (bool, error)
 	CleanupOwnedReviewControllerWork(ctx context.Context, reviewID, conversationID, generation string, now time.Time) (bool, error)
 	ListVisibleRunningTurnProviderIDs(ctx context.Context, conversationID string) ([]string, error)
+	ListActiveRunningTurnProviderIDs(ctx context.Context, conversationID string, session domain.SessionID, generation string) ([]string, error)
 
 	SetConversationSettings(ctx context.Context, conversationID string, settings domain.ConversationSettings, now time.Time) error
 
@@ -93,6 +94,8 @@ type Store interface {
 	RecordRateLimits(ctx context.Context, conversationID string, limits domain.ConversationRateLimits) error
 
 	NextQueuedTurn(ctx context.Context, conversationID string) (domain.QueuedTurn, error)
+	ConversationQueueFacts(ctx context.Context, conversationID string) (domain.ConversationQueueFacts, error)
+	ClaimQueuedTurnForResume(ctx context.Context, conversationID, turnID, expectedControllerGeneration string, now time.Time) (bool, error)
 	ReserveQueuedTurnForPromotion(ctx context.Context, conversationID, turnID string, now time.Time) (domain.QueuedTurn, error)
 	ReleaseQueuedTurnPromotion(ctx context.Context, conversationID, turnID string) error
 	CompleteQueuedTurnPromotion(ctx context.Context, conversationID, sourceTurnID, providerTurnID string, activity domain.ConversationActivity, now time.Time) error
@@ -248,6 +251,17 @@ type Controller struct {
 	sendingTurnID string
 	// A compact request can be accepted before its provider turn starts.
 	compactionPending bool
+	// resumeHold is the one-shot explicit queue resume in flight: the exact turn
+	// a manual resume dispatched, so its terminal event holds the queue instead
+	// of releasing the next turn. Bound to the AO turn id and the controller
+	// generation it was resumed under, never a bare boolean; nil when nothing is
+	// armed. Guarded by mu.
+	resumeHold *resumeHold
+	// retainedQueue records that a one-shot resume finished and left the rest of
+	// the queue deliberately held. It is distinct from resumeHold (a turn still in
+	// flight), bound to the generation that produced it, and cleared by the next
+	// explicit resume or by handoff/close/terminate. Guarded by mu.
+	retainedQueue *retainedQueue
 	// Provider calls keep automatic hibernation out without blocking explicit Kill.
 	operations int
 	// ackedTurnID is the turn the PROVIDER has confirmed it started, which lags
@@ -1460,8 +1474,25 @@ func (c *Controller) sendLocked(
 
 	now := c.now()
 	turnID := c.newID()
+	// A durable queued head means this message joins the backlog instead of
+	// dispatching in front of it. A manual-resume retention is one reason the
+	// head waits; any other hold or a drain that has not run yet is another. Only
+	// the authorized drain/resume may dispatch the head.
+	retained, retainErr := c.retainedBacklog(ctx)
+	if retainErr != nil {
+		retained = true
+	}
+	backlog, backlogErr := c.hasQueuedBacklog(ctx)
+	if backlogErr != nil {
+		// Conservative: a read error must not let a new turn jump a possible backlog.
+		backlog = true
+	}
+	queueBehind := retained || backlog
+	if queueBehind {
+		queueWhenBusy = true
+	}
 	markedSending := false
-	if !queueWhenBusy || !c.busy() {
+	if !queueWhenBusy || (!c.busy() && !queueBehind) {
 		c.setSendingTurn(turnID)
 		markedSending = true
 	}
@@ -1514,13 +1545,15 @@ func (c *Controller) sendLocked(
 		return domain.ConversationTurn{}, nil
 	}
 
-	if queueWhenBusy && c.busy() {
+	if queueWhenBusy && (c.busy() || queueBehind) {
 		// AppendUserMessage wrote it as queued, which is exactly where it belongs
-		// until the running turn ends. drain picks it up from there.
+		// until the running turn ends or the held backlog is resumed. drain picks it
+		// up from there.
 		c.mu.Lock()
-		c.log.Info("chat send queued behind busy controller",
+		c.log.Info("chat send queued behind a busy or retained controller",
 			"session", c.sessionID, "clientMessageId", msg.ClientMessageID, "turn", turnID,
-			"pendingTurn", c.pendingTurnID, "compactionPending", c.compactionPending, "state", c.state)
+			"pendingTurn", c.pendingTurnID, "compactionPending", c.compactionPending,
+			"retained", retained, "backlog", backlog, "state", c.state)
 		c.mu.Unlock()
 		return domain.ConversationTurn{
 			ID:                 turnID,
@@ -1603,6 +1636,16 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 		return domain.ConversationTurn{}, ErrTurnRunning
 	}
 
+	// Determine the existing backlog before inserting the retry turn: the insert
+	// writes the retry as queued and would otherwise look like backlog itself.
+	if _, retainErr := c.retainedBacklog(ctx); retainErr != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("check retained queue before retry: %w", retainErr)
+	}
+	queueBehind, backlogErr := c.hasQueuedBacklog(ctx)
+	if backlogErr != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("check queued backlog before retry: %w", backlogErr)
+	}
+
 	content, err := retryPromptContent(prompt.DeliveryContentJSON, c.Capabilities())
 	if err != nil {
 		return domain.ConversationTurn{}, err
@@ -1637,6 +1680,20 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 			}
 		}
 		return domain.ConversationTurn{}, ErrTurnNotRetryable
+	}
+
+	if queueBehind {
+		// A retry is a new turn. It joins the queued backlog behind its head; an
+		// explicit drain/resume releases the oldest queued turn first, never the
+		// retry.
+		return domain.ConversationTurn{
+			ID:                 newTurnID,
+			ConversationID:     c.conversation.ID,
+			HandledBySessionID: c.sessionID,
+			HandledByReviewID:  c.reviewID,
+			State:              domain.TurnStateQueued,
+			RequestedAt:        now,
+		}, nil
 	}
 
 	return c.dispatch(ctx, newTurnID, ports.ChatUserMessage{
@@ -1794,12 +1851,39 @@ func (c *Controller) busy() bool {
 	return c.pendingTurnID != "" || c.compactionPending
 }
 
+// Compacting reports whether a compaction the provider accepted is still in
+// flight. It is part of busy(), but surfaced separately so a client can tell a
+// compaction from a running turn.
+func (c *Controller) Compacting() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.compactionPending
+}
+
+// Busy reports whether a provider turn or compaction is in flight.
+func (c *Controller) Busy() bool { return c.busy() }
+
 // dispatch hands a recorded turn to the provider. Callers must hold sendMu.
 func (c *Controller) dispatch(
 	ctx context.Context,
 	turnID string,
 	msg ports.ChatUserMessage,
 	requestedAt time.Time,
+) (domain.ConversationTurn, error) {
+	return c.dispatchTurn(ctx, turnID, msg, requestedAt, false)
+}
+
+// dispatchTurn is dispatch with an explicit claim precondition. preClaimed means
+// the caller already moved the row queued -> running with a durable
+// compare-and-set (the explicit-resume path), so the row must not be marked
+// dispatching again. Every other caller leaves it false and keeps the existing
+// behavior. Callers must hold sendMu.
+func (c *Controller) dispatchTurn(
+	ctx context.Context,
+	turnID string,
+	msg ports.ChatUserMessage,
+	requestedAt time.Time,
+	preClaimed bool,
 ) (domain.ConversationTurn, error) {
 	// Every dispatch carries the conversation's choices, including one AO makes on
 	// the user's behalf: a queued message draining, or a relay from `ao send`. A
@@ -1811,7 +1895,9 @@ func (c *Controller) dispatch(
 	// Move it out of the durable queue before crossing that boundary, or a live
 	// reconnect can drain the same prompt after the provider completes it. ACP's
 	// deferred start crosses the provider boundary only after binding succeeds.
-	if !hasDeferredStart {
+	// A pre-claimed turn (explicit resume) already made that move with a
+	// conditional compare-and-set, so it is not marked again here.
+	if !hasDeferredStart && !preClaimed {
 		if err := c.store.MarkTurnDispatching(ctx, turnID); err != nil {
 			return domain.ConversationTurn{}, fmt.Errorf("mark turn dispatching: %w", err)
 		}
@@ -1823,16 +1909,37 @@ func (c *Controller) dispatch(
 	c.mu.Unlock()
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
+		// A turn is definitive only when the adapter can prove the provider never
+		// received it, when the provider explicitly rejected it, or when the driver
+		// is deferred and SendTurn is still the prepare step (no boundary crossed).
+		// Anything else on an eager driver may have crossed the boundary: the
+		// provider could be running the instruction, so the turn stays running and
+		// uncertain rather than becoming failed.
+		definitive := hasDeferredStart ||
+			errors.Is(err, ports.ErrTurnNotDelivered) ||
+			errors.Is(err, ports.ErrTurnRejected) ||
+			isProviderRefusal(err)
+		if !definitive {
+			// Keep the dispatching turn id so a late TurnStarted can persist the
+			// provider binding, and keep the row running/unbound. The one-shot stays
+			// armed; the queue cannot advance. Return the AO turn so callers can still
+			// navigate it.
+			return domain.ConversationTurn{
+				ID:                 turnID,
+				ConversationID:     c.conversation.ID,
+				HandledBySessionID: c.sessionID,
+				State:              domain.TurnStateRunning,
+				RequestedAt:        requestedAt,
+			}, fmt.Errorf("%w: send turn: %w", errUncertainDelivery, err)
+		}
 		c.mu.Lock()
 		if c.dispatchingTurnID == turnID {
 			c.dispatchingTurnID = ""
 		}
 		c.mu.Unlock()
-		// The provider may or may not have accepted it. Settle the turn as failed
-		// rather than retrying: a duplicate turn would run the work twice. Settling
-		// by AO's own turn id is required here — an undispatched turn has no
-		// provider id, so looking one up by the empty string would hit whichever
-		// undispatched turn the database returned first.
+		// Definitive: the provider cannot have accepted the turn. Settle it failed
+		// rather than retrying; settling by AO's own turn id avoids looking up an
+		// empty provider id after the error.
 		completedAt := c.now()
 		if settleErr := c.store.SettleTurnByID(
 			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
@@ -1849,16 +1956,46 @@ func (c *Controller) dispatch(
 		}, fmt.Errorf("send turn: %w", err)
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
+	// Eager drivers cross the provider boundary inside SendTurn. Record the
+	// provider id on the one-shot hold before any durable write that can fail, so
+	// a later bind failure cannot let a late terminal look like an ordinary
+	// completion and drain the queue.
+	if !hasDeferredStart {
 		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
+		if hold := c.resumeHold; hold != nil && hold.turnID == turnID {
+			hold.providerTurnID = ref.ProviderTurnID
 		}
 		c.mu.Unlock()
+	}
+
+	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
 		if hasDeferredStart {
+			// Deferred: the provider never received the prompt, so no boundary was
+			// crossed. Discard the prepared turn and settle the row failed; the
+			// caller clears the one-shot because there is nothing in flight.
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			if settleErr := c.store.SettleTurnByID(
+				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+				c.log.Error("failed to settle deferred turn after bind error", "error", settleErr)
+			}
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
+			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
 		}
-		return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+		// Eager: SendTurn already crossed the provider boundary, so the provider
+		// may have accepted and run the instruction even though AO could not record
+		// its id. The delivery is uncertain, not undispatched: never requeue or
+		// retry, and keep the controller busy so no later event can drain the
+		// queue. The row stays running/unbound (the snapshot reports state_uncertain)
+		// and the hold stays bound to this provider id so a late terminal still
+		// consumes it. Recovery settles the orphan.
+		c.mu.Lock()
+		c.pendingTurnID = ref.ProviderTurnID
+		c.mu.Unlock()
+		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, err)
 	}
 
 	c.mu.Lock()
@@ -1869,6 +2006,14 @@ func (c *Controller) dispatch(
 	// Dispatched, not yet acknowledged: turn/start returning is AO's fact, and the
 	// provider's own turn-started notification is the one an interrupt needs.
 	c.ackedTurnID = ""
+	// Bind the one-shot resume hold's provider id here, under the same lock that
+	// publishes the provider id, and before sendMu is released. The terminal-event
+	// handler consumes the hold under sendMu, so a completion the driver emits
+	// synchronously from SendTurn cannot be seen as "not this turn's" while the
+	// hold is still unbound.
+	if hold := c.resumeHold; hold != nil && hold.turnID == turnID {
+		hold.providerTurnID = ref.ProviderTurnID
+	}
 	c.mu.Unlock()
 
 	// ACP's session/prompt request stays open until the turn finishes, so an ACP
@@ -1877,14 +2022,23 @@ func (c *Controller) dispatch(
 	// projected. Eager drivers do not implement this optional interface.
 	if hasDeferredStart {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
-			c.mu.Lock()
-			c.pendingTurnID = ""
-			c.mu.Unlock()
-			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
-				c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
+			if errors.Is(err, ports.ErrDeferredTurnNotStarted) {
+				// The driver proved the provider boundary was not crossed: the
+				// prompt cannot have reached the provider. Settle it failed and let
+				// the caller clear the one-shot.
+				c.mu.Lock()
+				c.pendingTurnID = ""
+				c.mu.Unlock()
+				if settleErr := c.store.SettleTurnByID(
+					ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+					c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
+				}
+				return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
 			}
-			return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
+			// Ambiguous: the request may already have been written to the provider.
+			// Keep the durable binding, the in-memory pending turn and the one-shot,
+			// and do not settle, retry or drain. A late terminal settles it.
+			return domain.ConversationTurn{}, fmt.Errorf("%w: start turn: %w", errUncertainDelivery, err)
 		}
 	}
 
@@ -1954,6 +2108,17 @@ func (c *Controller) drain(ctx context.Context) error {
 // allowDispatch gates sending the next queued turn. A pending Stop cutoff forces
 // it true so messages typed after Stop still send.
 func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error {
+	return c.drainLockedFor(ctx, allowDispatch, "", "", false)
+}
+
+// drainLockedFor is drainLocked with an explicit-resume precondition. When
+// expectedTurnID is set the caller intends to release exactly that queue head:
+// the loop refuses with errResumeNoPendingWork when the queue is empty and with
+// errResumeStaleQueueState when the head is a different turn. When claim is set
+// the row is moved queued -> running with a durable compare-and-set before the
+// provider is contacted, so a row another path already claimed is never sent.
+// Callers must hold sendMu.
+func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, expectedTurnID, expectedGeneration string, claim bool) error {
 	c.mu.Lock()
 	cutoff := c.cancelQueuedAt
 	c.cancelQueuedAt = time.Time{}
@@ -1982,14 +2147,51 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 		return nil
 	}
 
+	// A completed one-shot holds the rest of the queue until another explicit
+	// resume. Only that action (claim=true) may bypass the retention.
+	if !claim && c.manualResumeRetained() {
+		return nil
+	}
+
+	// A durable running turn means the provider may still own work. Do not
+	// dispatch behind it even when the in-memory ownership was already cleared:
+	// an eager send whose provider id could not be recorded leaves exactly this
+	// state, and that delivery is uncertain. Recovery settles the orphan; the
+	// queue must not advance first.
+	if running, err := c.store.ListActiveRunningTurnProviderIDs(ctx, c.conversation.ID, c.sessionID, c.generation); err != nil {
+		return err
+	} else if len(running) > 0 {
+		return nil
+	}
+
 	for {
 		queued, err := c.store.NextQueuedTurn(ctx, c.conversation.ID)
 		if errors.Is(err, domain.ErrNoQueuedTurn) {
+			if expectedTurnID != "" {
+				return errResumeNoPendingWork
+			}
 			return nil
 		}
 		if err != nil {
 			c.log.Error("failed to read queued turn", "session", c.sessionID, "error", err)
 			return err
+		}
+		if expectedTurnID != "" && queued.TurnID != expectedTurnID {
+			// Another path moved the head (dispatch, promotion, cancel or
+			// settle) between the client's snapshot and this call. Never release
+			// a different turn than the one named.
+			return errResumeStaleQueueState
+		}
+		if claim {
+			claimed, claimErr := c.store.ClaimQueuedTurnForResume(ctx, c.conversation.ID, queued.TurnID, expectedGeneration, c.now())
+			if claimErr != nil {
+				return claimErr
+			}
+			if !claimed {
+				// The row is no longer an unsent, unpromoted, unrolled-back
+				// queue item; the durable compare-and-set refused it.
+				return errResumeStaleQueueState
+			}
 		}
 
 		var content []ports.ChatContent
@@ -2034,7 +2236,7 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 				return err
 			}
 		}
-		if _, err := c.dispatch(ctx, queued.TurnID, queuedMessage, c.now()); err != nil {
+		if _, err := c.dispatchTurn(ctx, queued.TurnID, queuedMessage, c.now(), claim); err != nil {
 			// dispatch already settled this turn as failed. Stopping here rather than
 			// walking the rest of the queue: whatever broke the send is likely to break
 			// the next one too, and failing them all on one bad provider state would
@@ -2071,6 +2273,9 @@ func (c *Controller) ArmHandoff(
 	}
 
 	c.mu.Lock()
+	// A handoff closes source intake; a one-shot resume must not survive it.
+	c.resumeHold = nil
+	c.retainedQueue = nil
 	if c.handoff == want {
 		c.mu.Unlock()
 		return nil
@@ -2397,6 +2602,10 @@ func (c *Controller) interruptForHandoff(ctx context.Context) error {
 func (c *Controller) Interrupt(ctx context.Context) error {
 	c.mu.Lock()
 	c.interrupts++
+	// An explicit stop retires any one-shot resume: the user is no longer asking
+	// for the next turn to be released.
+	c.resumeHold = nil
+	c.retainedQueue = nil
 	if c.forkCancel != nil {
 		c.forkCancel()
 	}
@@ -2652,6 +2861,8 @@ func (c *Controller) Rollback(ctx context.Context, turnID string) (int, error) {
 // their historical process-close behavior. The persistent host replays detached
 // output and unresolved provider requests to the replacement controller.
 func (c *Controller) Close(ctx context.Context) error {
+	c.clearResumeHold()
+	c.clearRetainedQueue()
 	c.once.Do(func() {
 		if preserver, ok := c.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {
 			c.mu.Lock()
@@ -2676,6 +2887,8 @@ func (c *Controller) Close(ctx context.Context) error {
 // and controller replacement use Terminate.
 func (c *Controller) Terminate(ctx context.Context) error {
 	c.mu.Lock()
+	c.resumeHold = nil
+	c.retainedQueue = nil
 	if c.forkCancel != nil {
 		c.forkCancel()
 	}
@@ -2982,6 +3195,14 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
 					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
 				}
+				// A late TurnStarted is the only correlation a driver can offer after
+				// an ambiguous eager send. Bind it onto the one-shot too, so a later
+				// terminal is recognized and cannot drain the queue.
+				c.mu.Lock()
+				if hold := c.resumeHold; hold != nil && hold.turnID == dispatchingTurnID {
+					hold.providerTurnID = event.ProviderTurnID
+				}
+				c.mu.Unlock()
 			} else {
 				// A turn AO dispatched already has a row, bound in dispatch. This covers
 				// the turn AO did NOT dispatch: a compaction, or work the provider resumed
@@ -3402,7 +3623,44 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 		c.reportActivity(ctx, activityState, activityEvent, now)
 		// Only a completed turn releases queued work; a failed or recovered one holds
 		// the queue so it cannot cascade through the same outage (issue #4861).
-		_ = c.drainLocked(ctx, settledTurnState(event) == domain.TurnStateCompleted) // drain logs failures.
+		//
+		// A one-shot explicit resume holds even after a completed turn: the manual
+		// transition releases exactly the turn it named, never the next one. The
+		// hold is consumed only when this terminal event is that exact turn's, so an
+		// ordinary completed turn still drains the queue as before.
+		allow := settledTurnState(event) == domain.TurnStateCompleted
+		// This runs with sendMu held (project() takes it for lifecycle events), and
+		// dispatchTurn binds the hold's provider id before releasing sendMu, so a
+		// completion the driver emits synchronously from SendTurn cannot be seen as
+		// "not this turn's" while the hold is still unbound.
+		if hold, consumed := c.consumeResumeHold(event.ProviderTurnID); consumed {
+			allow = false
+			// The one-shot finished. Retain the rest of the queue only when a
+			// backlog actually exists: a hidden retention after an empty queue would
+			// later block or mislabel a normal Send.
+			if _, queueErr := c.store.NextQueuedTurn(ctx, c.conversation.ID); queueErr == nil {
+				c.retainQueueAfterOneShot(hold.turnID)
+			} else if errors.Is(queueErr, domain.ErrNoQueuedTurn) {
+				c.clearRetainedQueue()
+			} else {
+				c.log.Error("failed to check the retained backlog after a one-shot",
+					"session", c.sessionID, "turn", hold.turnID, "error", queueErr)
+				c.clearRetainedQueue()
+			}
+			// An eager send whose provider id could not be recorded leaves the row
+			// running/unbound. The terminal still names the provider id the marker
+			// captured, so settle the known AO turn by id; consuming the marker alone
+			// would leave the row running forever.
+			message := ""
+			if event.Err != nil {
+				message = event.Err.Error()
+			}
+			if err := c.settleResumeHoldTerminal(ctx, hold, settledTurnState(event), message, now); err != nil {
+				c.log.Error("failed to settle one-shot turn after a late terminal",
+					"session", c.sessionID, "turn", hold.turnID, "error", err)
+			}
+		}
+		_ = c.drainLocked(ctx, allow) // drain logs failures.
 	case ports.ChatEventApprovalRequested:
 		c.reportActivity(ctx, domain.ActivityWaitingInput, "chat.approval.requested", now)
 	case ports.ChatEventApprovalResolved:
@@ -3797,6 +4055,9 @@ func (c *Controller) handoffActive() bool {
 	defer c.mu.Unlock()
 	return c.handoff != controllerHandoffNone
 }
+
+// HandoffActive reports whether a controller handoff has closed source intake.
+func (c *Controller) HandoffActive() bool { return c.handoffActive() }
 
 // planItemID keys a turn's plan activity. The provider sends no item id with a plan
 // update — a plan is not an item — so the key is synthesized from the turn, which

@@ -167,12 +167,15 @@ func TestQueuedProviderDispatchFailureStopsDrain(t *testing.T) {
 	h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
 		ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		return turnStateByText(t, s)["provider failure"] == domain.TurnStateFailed
+		return turnStateByText(t, s)["provider failure"] == domain.TurnStateRunning
 	})
 	if turnStateByText(t, snapshot)["still queued"] != domain.TurnStateQueued {
 		t.Fatal("provider failure settled an unrelated queued message")
 	}
+	if queue := snapshotQueue(t, h); queue.State != chatsvc.QueueStateUncertain {
+		t.Fatalf("snapshot state = %q, want state_uncertain", queue.State)
+	}
 	if got := h.conv.sendCallCount(); got != 2 {
-		t.Fatalf("provider calls = %d, want initial send and one failed dispatch", got)
+		t.Fatalf("provider calls = %d, want initial send and one uncertain dispatch", got)
 	}
 }

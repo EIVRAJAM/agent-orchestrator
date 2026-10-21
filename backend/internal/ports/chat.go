@@ -808,6 +808,16 @@ type ChatTurnRef struct {
 	ProviderTurnID string
 }
 
+// ErrTurnNotDelivered reports that a turn SendTurn error is definitively before
+// the provider boundary: the adapter can prove no request was written, so the
+// provider cannot have received the turn.
+var ErrTurnNotDelivered = errors.New("turn was not delivered to the provider")
+
+// ErrTurnRejected reports that the provider explicitly rejected the turn. The
+// provider answered with an error and did not accept the work. Adapters wrap
+// this only when they have that explicit response.
+var ErrTurnRejected = errors.New("provider rejected the turn")
+
 // ChatDeferredTurnStarter is implemented by protocols whose prompt call is the
 // whole lifetime of a turn rather than a quick "accepted" request. SendTurn
 // prepares such a turn and returns its id; the controller calls StartDeferredTurn
@@ -818,11 +828,24 @@ type ChatTurnRef struct {
 // Drivers whose SendTurn already receives a provider acknowledgement (Codex's
 // app-server, for example) do not implement this interface.
 type ChatDeferredTurnStarter interface {
+	// StartDeferredTurn crosses the provider boundary. It must return
+	// ErrDeferredTurnNotStarted (wrapped) when it can prove the provider never
+	// received the prompt — for example, local validation or a prepared turn that
+	// no longer exists. Any other error must be treated as ambiguous: the request
+	// may already have been written to the provider, so callers must not retry it,
+	// requeue it, or dispatch behind it.
 	StartDeferredTurn(providerTurnID string) error
 	// DiscardDeferredTurn releases a prepared turn when AO could not persist its
 	// correlation id. No provider request has started at this point.
 	DiscardDeferredTurn(providerTurnID string)
 }
+
+// ErrDeferredTurnNotStarted reports that a deferred StartDeferredTurn error is
+// definitively before the provider boundary: the provider cannot have received
+// the prompt. Drivers wrap it only when they can prove that. Any other
+// StartDeferredTurn error is ambiguous and must be treated as a possible
+// acceptance.
+var ErrDeferredTurnNotStarted = errors.New("deferred turn was not started")
 
 // ChatDecisionOption is one choice the provider says is valid for a pending
 // request. Providers vary the offered set per request — some do not offer a

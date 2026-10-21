@@ -1707,6 +1707,11 @@ type Snapshot struct {
 	// controller is live, because an unstarted session's abilities are not yet known
 	// and guessing them is how a control appears and then vanishes.
 	Capabilities ports.ChatCapabilities
+	// Queue is the derived send-queue and controller view. It is never persisted:
+	// it is computed from the durable turns and the live controller so a client
+	// can tell a deliberately held queue from a merely idle session. Nil for a
+	// reviewer-owned snapshot, which is a separate surface.
+	Queue *QueueState
 }
 
 // SnapshotReader is the durable read the service serves snapshots from. Kept
@@ -1813,15 +1818,35 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 	if waking && !record.IsTerminated && state == ports.ChatControllerStopped {
 		state = ports.ChatControllerHibernated
 	}
-	var caps ports.ChatCapabilities
-	var dispatching []string
-	if controller, err := s.Controller(id); err == nil {
-		dispatching = controller.DispatchingTurnIDs()
-		if live := controller.State(); (record.HibernatedAt == nil && !waking) || live != ports.ChatControllerStopped {
-			state = live
-			caps = controller.Capabilities()
+	var (
+		caps        ports.ChatCapabilities
+		dispatching []string
+		controller  *Controller
+	)
+	if live, err := s.Controller(id); err == nil {
+		controller = live
+		dispatching = live.DispatchingTurnIDs()
+		if liveState := live.State(); (record.HibernatedAt == nil && !waking) || liveState != ports.ChatControllerStopped {
+			state = liveState
+			caps = live.Capabilities()
 		}
 	}
+
+	// The queue head a resume must name. Read with the same predicate the drain
+	// uses, so a mid-promotion row is never presented as resumable.
+	var head *domain.QueuedTurn
+	switch queued, err := s.store.NextQueuedTurn(ctx, conversation.ID); {
+	case err == nil:
+		head = &queued
+	case errors.Is(err, domain.ErrNoQueuedTurn):
+	default:
+		return Snapshot{}, fmt.Errorf("read queued head %s: %w", conversation.ID, err)
+	}
+	facts, err := s.store.ConversationQueueFacts(ctx, conversation.ID)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("read queue facts %s: %w", conversation.ID, err)
+	}
+	queue := deriveQueueState(record, facts, head, controller)
 
 	return Snapshot{
 		Conversation:                     rows.Conversation,
@@ -1838,6 +1863,7 @@ func (s *Service) Snapshot(ctx context.Context, id domain.SessionID) (Snapshot, 
 		BranchPoints:                     rows.BranchPoints,
 		BranchedFromEarlierMessage:       rows.BranchedFromEarlierMessage,
 		Capabilities:                     caps,
+		Queue:                            &queue,
 		Usage:                            rows.Conversation.Usage,
 		RateLimits:                       rows.Conversation.RateLimits,
 	}, nil
@@ -1918,15 +1944,32 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 	if waking && !record.IsTerminated && state == ports.ChatControllerStopped {
 		state = ports.ChatControllerHibernated
 	}
-	var caps ports.ChatCapabilities
-	var dispatching []string
-	if controller, err := s.Controller(id); err == nil {
-		dispatching = controller.DispatchingTurnIDs()
-		if live := controller.State(); (record.HibernatedAt == nil && !waking) || live != ports.ChatControllerStopped {
-			state = live
-			caps = controller.Capabilities()
+	var (
+		caps        ports.ChatCapabilities
+		dispatching []string
+		controller  *Controller
+	)
+	if live, err := s.Controller(id); err == nil {
+		controller = live
+		dispatching = live.DispatchingTurnIDs()
+		if liveState := live.State(); (record.HibernatedAt == nil && !waking) || liveState != ports.ChatControllerStopped {
+			state = liveState
+			caps = live.Capabilities()
 		}
 	}
+	var head *domain.QueuedTurn
+	switch queued, err := s.store.NextQueuedTurn(ctx, conversation.ID); {
+	case err == nil:
+		head = &queued
+	case errors.Is(err, domain.ErrNoQueuedTurn):
+	default:
+		return Snapshot{}, fmt.Errorf("read queued head %s: %w", conversation.ID, err)
+	}
+	facts, err := s.store.ConversationQueueFacts(ctx, conversation.ID)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("read queue facts %s: %w", conversation.ID, err)
+	}
+	queue := deriveQueueState(record, facts, head, controller)
 	return Snapshot{
 		Conversation:                     rows.Conversation,
 		ActiveBranch:                     rows.ActiveBranch,
@@ -1944,6 +1987,7 @@ func (s *Service) SnapshotPage(ctx context.Context, id domain.SessionID, beforeS
 		OldestSequence:                   rows.OldestSequence,
 		HasMoreBefore:                    rows.HasMoreBefore,
 		Capabilities:                     caps,
+		Queue:                            &queue,
 		Usage:                            rows.Conversation.Usage,
 		RateLimits:                       rows.Conversation.RateLimits,
 	}, nil
