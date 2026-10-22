@@ -601,11 +601,21 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return fmt.Errorf("%w: %w", ports.ErrDeferredTurnNotStarted, errConversationClosed)
+		return ports.WithProviderError(
+			fmt.Errorf("%w: %w", ports.ErrDeferredTurnNotStarted, errConversationClosed),
+			domain.ProviderErrorEvidence{
+				Class: domain.ProviderErrorNotDelivered, Protocol: "acp", Operation: "session/prompt",
+			},
+		)
 	}
 	if c.prepared == nil || c.prepared.id != providerTurnID {
 		c.mu.Unlock()
-		return fmt.Errorf("%w: ACP prepared turn not found", ports.ErrDeferredTurnNotStarted)
+		return ports.WithProviderError(
+			fmt.Errorf("%w: ACP prepared turn not found", ports.ErrDeferredTurnNotStarted),
+			domain.ProviderErrorEvidence{
+				Class: domain.ProviderErrorNotDelivered, Protocol: "acp", Operation: "session/prompt",
+			},
+		)
 	}
 	turn := *c.prepared
 	c.prepared = nil
@@ -726,6 +736,7 @@ func (c *conversation) finishPrompt(
 			}})
 		}
 	}
+	turnErr = attachACPPromptEvidence(turnErr, eventID)
 	if errors.Is(turnErr, ports.ErrChatAuthRequired) {
 		// The provider has just contradicted whatever the readiness cache holds.
 		// Correct it for both request errors and structured prompt failures.

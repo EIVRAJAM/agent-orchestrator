@@ -824,10 +824,13 @@ func isACPInternalError(err error) bool {
 }
 
 func normalizeACPError(operation string, err error) error {
+	var normalized error
 	if isACPAuthRequired(err) {
-		return fmt.Errorf("%w: %s: %w", ports.ErrChatAuthRequired, operation, err)
+		normalized = fmt.Errorf("%w: %s: %w", ports.ErrChatAuthRequired, operation, err)
+	} else {
+		normalized = fmt.Errorf("%s: %w", operation, err)
 	}
-	return fmt.Errorf("%s: %w", operation, err)
+	return ports.WithProviderError(normalized, acpProviderErrorEvidence(operation, err))
 }
 
 // normalizeACPLoadError normalizes a failed ACP session/load whose calling

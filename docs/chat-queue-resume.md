@@ -484,6 +484,93 @@ calls back into the service. So there is no cycle and no inversion.
   write to `ErrTurnNotDelivered`, and leaves EOF/close-after-write/timeout/
   cancellation/undecodable ambiguous; empty text is a local definitive error.
 
+## Provider failure taxonomy and local evidence
+
+This delivery adds diagnostics, not a recovery policy. It does not add a scheduler,
+automatic canary, cold-start adoption, process lock, or controller lease. A
+failed or recovered turn still holds the queue exactly as described above, and
+`ao session resume-queue` is still the only way to release one held turn.
+
+### Demonstrated classes
+
+The durable vocabulary has only classes backed by a structured signal:
+
+| Class | Evidence |
+| --- | --- |
+| `auth_required` | ACP JSON-RPC `-32000`, or Codex `CodexErrorInfo=unauthorized` |
+| `rejected` | An explicit Codex `turn/start` RPC error response |
+| `not_delivered` | A local empty message, a connection refused before the first write, or an ACP deferred start that provably did not cross the boundary |
+| `uncertain` | EOF, timeout, cancellation after a write, an unreadable response, or a late connection close |
+| `interrupted` | A deliberate local interrupt |
+| `provider_internal` | A structured ACP `RequestError` (for example `-32603`) describing the provider's own failure |
+| `unknown` | A demonstrated provider failure that does not match a narrower class |
+
+There is deliberately **no `rate_limited` and no `transient` class**. Prose such as
+"rate limit exceeded", "try again", or "timeout" is never classified with string
+matching. An RPC rejection carrying that prose remains `rejected`; an ACP
+`RequestError` carrying it remains `provider_internal`/`unknown`. A future
+scheduler would need a stable structured temporal signal (or an explicit product
+decision), not a text heuristic.
+
+`ErrTurnNotDelivered` means only that the instruction did not reach the provider.
+It says nothing about temporary availability and is not a retry signal.
+
+### Sanitized archive
+
+The existing local provider-event archive is the only persistence route:
+`conversation_provider_events.payload_json` under `AO_DATA_DIR`. There is no new
+table, migration, telemetry exporter, network call, or second event file.
+
+Classified terminal events gain one structured block:
+
+```json
+{
+  "providerError": {
+    "class": "provider_internal",
+    "protocol": "acp",
+    "operation": "session/prompt",
+    "code": -32603,
+    "dataShape": { "error": "string" },
+    "eventId": "validated-host-event-id"
+  }
+}
+```
+
+`dataShape` contains only allowlisted field names and JSON types. It never contains
+a `data` value, a nested body, an array item, or a blob. `eventId` is copied only
+when AO's existing relay event-id validation accepts it. The block contains no
+provider message, prompt, response text, path, token, cookie, credential, email,
+or raw `RequestError.Error()`.
+
+For a `SendTurn`/deferred-start failure with evidence, the same archive receives a
+`provider.error` row through `ProjectProviderEvent` with a no-op projection. It
+does not create a synthetic timeline event, settle a turn, or advance the queue.
+For classified events, the archive's raw `error` field is the class; the existing
+visible `error_message` on the durable turn still carries the provider's message.
+Unclassified events retain their previous archive behavior.
+
+### OpenCode representative case
+
+The repository has no original frame from the reported OpenCode incident. Tests
+use a clearly synthetic representative `-32603` frame with
+`data.error = "Rate limit exceeded. Please try again later."`; it is not claimed
+as forensic evidence. The tests prove that:
+
+- it is `provider_internal` (never `rate_limited` or `transient`);
+- `data.error` is absent from the structured evidence;
+- `dataShape.error` is `"string"`;
+- OpenCode and OpenCode v2 keep the same ACP semantics;
+- no automatic retry or queue decision is made.
+
+### Separation from behavior
+
+The class is diagnostic evidence only. It does not change whether a turn settles
+as failed/running/interrupted, whether a queue drains, whether a held queue can be
+resumed, or how Start/Stop/handoff/live reconnect work. Existing regression tests
+(`TestFailedPrimaryTurnHoldsQueuedWork`,
+`TestRecoveredPrimaryTurnHoldsQueuedWork`, the uncertain-delivery tests, and the
+`resume-queue` tests) must keep passing unchanged.
+
 ## Out of scope
 
 - Preserving `queued` rows across a cold start (Option B).

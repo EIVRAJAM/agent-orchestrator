@@ -1909,6 +1909,11 @@ func (c *Controller) dispatchTurn(
 	c.mu.Unlock()
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
+		// The dispatch never produced a provider event, but the adapter may have
+		// attached sanitized evidence. Archive it in the same provider-event file
+		// without a projection, so diagnostics remain durable without inventing a
+		// second persistence path or changing the turn's state.
+		c.archiveDispatchError(ctx, turnID, err)
 		// A turn is definitive only when the adapter can prove the provider never
 		// received it, when the provider explicitly rejected it, or when the driver
 		// is deferred and SendTurn is still the prepare step (no boundary crossed).
@@ -2022,6 +2027,7 @@ func (c *Controller) dispatchTurn(
 	// projected. Eager drivers do not implement this optional interface.
 	if hasDeferredStart {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
+			c.archiveDispatchError(ctx, turnID, err)
 			if errors.Is(err, ports.ErrDeferredTurnNotStarted) {
 				// The driver proved the provider boundary was not crossed: the
 				// prompt cannot have reached the provider. Settle it failed and let
@@ -3065,6 +3071,44 @@ func (c *Controller) cleanupOwnedControllerWork(ctx context.Context, now time.Ti
 	return err
 }
 
+// archiveDispatchError records sanitized evidence from a SendTurn or deferred
+// start failure. It deliberately uses the existing conversation provider-event
+// archive with a no-op projection: dispatch already settled (or deliberately
+// left uncertain) the turn, and the diagnostic must not change that outcome.
+// Errors without evidence are not fabricated as provider diagnostics.
+func (c *Controller) archiveDispatchError(ctx context.Context, turnID string, err error) {
+	evidence, ok := ports.ProviderErrorEvidenceOf(err)
+	if !ok {
+		return
+	}
+	payload, marshalErr := json.Marshal(map[string]any{
+		"kind":           "provider.error",
+		"providerTurnId": turnID,
+		"providerError":  evidence,
+		"error":          string(evidence.Class),
+	})
+	if marshalErr != nil {
+		c.log.Warn("failed to encode dispatch error evidence", "error", marshalErr)
+		return
+	}
+	project := func(context.Context) error { return nil }
+	var archiveErr error
+	if c.reviewID != "" {
+		_, archiveErr = c.store.ProjectReviewProviderEvent(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation,
+			"", "provider.error", string(payload), c.now(), project,
+		)
+	} else {
+		_, archiveErr = c.store.ProjectProviderEvent(
+			ctx, c.conversation.ID, c.sessionID, c.generation,
+			"", "provider.error", string(payload), c.now(), project,
+		)
+	}
+	if archiveErr != nil {
+		c.log.Warn("failed to archive dispatch error evidence", "error", archiveErr)
+	}
+}
+
 // projectEvent archives one normalized provider event and applies its durable
 // projection in the same SQLite transaction.
 func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (bool, bool, error) {
@@ -3112,7 +3156,15 @@ func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (b
 		record["input"] = event.Input
 	}
 	if event.Err != nil {
-		record["error"] = event.Err.Error()
+		if evidence, ok := ports.ProviderErrorEvidenceOf(event.Err); ok {
+			record["providerError"] = evidence
+			// The visible message remains the durable turn's error_message. The
+			// raw archive keeps only the class for classified provider failures so
+			// ACP RequestError.Data values cannot become a second copy of prose.
+			record["error"] = string(evidence.Class)
+		} else {
+			record["error"] = event.Err.Error()
+		}
 	}
 	payload, err := json.Marshal(record)
 	if err != nil {
