@@ -19,15 +19,17 @@ import (
 func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
+	const promptSecret = "SECRET_PROMPT"
+	const rootText = "root " + promptSecret
 
 	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "root", ClientMessageID: "evidence-root", Origin: domain.MessageOriginHuman,
+		Text: rootText, ClientMessageID: "evidence-root", Origin: domain.MessageOriginHuman,
 	}); err != nil {
 		t.Fatalf("send root: %v", err)
 	}
 	h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
 	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		return turnStateByText(t, s)["root"] == domain.TurnStateRunning
+		return turnStateByText(t, s)[rootText] == domain.TurnStateRunning
 	})
 
 	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
@@ -36,13 +38,14 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 		t.Fatalf("queue automation: %v", err)
 	}
 
-	const visible = "ACP session/prompt: Internal error: Rate limit exceeded. Please try again later."
+	const visible = "ACP session/prompt: Internal error: Rate limit exceeded. token=SECRET_TOKEN"
 	code := -32603
 	h.conv.emit(ports.ChatEvent{
 		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1",
 		ProviderEventID: "terminal-event-1", TurnState: domain.TurnStateFailed,
 		Err: ports.WithProviderError(errors.New(visible), domain.ProviderErrorEvidence{
-			Class: domain.ProviderErrorProviderInternal, Protocol: "acp", Operation: "session/prompt",
+			Class: domain.ProviderErrorProviderInternal, Protocol: "acp",
+			Harness: "opencode", Operation: "session/prompt",
 			Code: &code,
 			DataShape: map[string]string{
 				"error":   "string",
@@ -53,13 +56,13 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	})
 
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		return turnStateByText(t, s)["root"] == domain.TurnStateFailed
+		return turnStateByText(t, s)[rootText] == domain.TurnStateFailed
 	})
 	if got := snapshot.Turns[0].ErrorMessage; got != visible {
 		t.Fatalf("visible turn error = %q, want unchanged %q", got, visible)
 	}
 	assertTurnStaysQueued(t, h, "automation")
-	if got := h.conv.sentTexts(); len(got) != 1 || got[0] != "root" {
+	if got := h.conv.sentTexts(); len(got) != 1 || got[0] != rootText {
 		t.Fatalf("provider received %v, want only root", got)
 	}
 
@@ -87,8 +90,8 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 		t.Fatalf("archived providerError = %#v", archived)
 	}
 	if providerError["class"] != string(domain.ProviderErrorProviderInternal) ||
-		providerError["protocol"] != "acp" || providerError["operation"] != "session/prompt" ||
-		providerError["eventId"] != "terminal-event-1" {
+		providerError["protocol"] != "acp" || providerError["harness"] != "opencode" ||
+		providerError["operation"] != "session/prompt" || providerError["eventId"] != "terminal-event-1" {
 		t.Fatalf("archived providerError = %#v", providerError)
 	}
 	if providerError["code"] != float64(-32603) {
@@ -104,6 +107,11 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	if strings.Contains(strings.ToLower(archivedPayload), "rate limit exceeded") {
 		t.Fatal("visible provider prose leaked into the provider-event archive")
 	}
+	for _, secret := range []string{promptSecret, "SECRET_TOKEN"} {
+		if strings.Contains(archivedPayload, secret) {
+			t.Fatalf("prompt/token %q leaked into the provider-event archive", secret)
+		}
+	}
 	if providerError["message"] != nil || providerError["data"] != nil {
 		t.Fatalf("providerError carried a message/data value: %#v", providerError)
 	}
@@ -113,17 +121,19 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 // no-op projection. The durable turn remains failed and the queue is untouched.
 func TestDispatchErrorEvidenceIsDurableWithoutChangingTurn(t *testing.T) {
 	h := newHarness(t)
-	cause := fmt.Errorf("%w: Rate limit exceeded. Please try again later.", ports.ErrTurnNotDelivered)
+	const promptSecret = "SECRET_DISPATCH_PROMPT"
+	cause := fmt.Errorf("%w: Rate limit exceeded. token=SECRET_TOKEN", ports.ErrTurnNotDelivered)
 	visible := cause.Error()
 	h.conv.sendErr = ports.WithProviderError(
 		cause,
 		domain.ProviderErrorEvidence{
-			Class: domain.ProviderErrorNotDelivered, Protocol: "codex", Operation: "turn/start",
+			Class: domain.ProviderErrorNotDelivered, Protocol: "codex",
+			Harness: "codex", Operation: "turn/start",
 		},
 	)
 
 	_, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
-		Text: "root", ClientMessageID: "dispatch-evidence", Origin: domain.MessageOriginHuman,
+		Text: "root " + promptSecret, ClientMessageID: "dispatch-evidence", Origin: domain.MessageOriginHuman,
 	})
 	if err == nil {
 		t.Fatal("SendTurn failure was reported as success")
@@ -154,7 +164,8 @@ func TestDispatchErrorEvidenceIsDurableWithoutChangingTurn(t *testing.T) {
 	}
 	providerError, ok := archived["providerError"].(map[string]any)
 	if !ok || providerError["class"] != string(domain.ProviderErrorNotDelivered) ||
-		providerError["protocol"] != "codex" || providerError["operation"] != "turn/start" {
+		providerError["protocol"] != "codex" || providerError["harness"] != "codex" ||
+		providerError["operation"] != "turn/start" {
 		t.Fatalf("dispatch evidence = %#v", archived)
 	}
 	if archived["error"] != string(domain.ProviderErrorNotDelivered) {
@@ -163,6 +174,11 @@ func TestDispatchErrorEvidenceIsDurableWithoutChangingTurn(t *testing.T) {
 	encoded, _ := json.Marshal(archived)
 	if strings.Contains(strings.ToLower(string(encoded)), "rate limit exceeded") {
 		t.Fatalf("dispatch evidence leaked provider prose: %s", encoded)
+	}
+	for _, secret := range []string{promptSecret, "SECRET_TOKEN"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("dispatch evidence leaked %q: %s", secret, encoded)
+		}
 	}
 }
 

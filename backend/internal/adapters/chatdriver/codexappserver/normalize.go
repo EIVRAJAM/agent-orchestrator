@@ -673,7 +673,8 @@ func normalizeNotification(n notification, now time.Time) []ports.ChatEvent {
 			Err: ports.WithProviderError(
 				fmt.Errorf("provider error: %s", truncateForLog(n.Params)),
 				domain.ProviderErrorEvidence{
-					Class: domain.ProviderErrorUnknown, Protocol: "codex", Operation: "turn/error",
+					Class: domain.ProviderErrorUnknown, Protocol: "codex",
+					Harness: string(domain.HarnessCodex), Operation: "turn/error",
 				},
 			),
 		}}

@@ -22,6 +22,11 @@ var acpProviderErrorShapeKeys = []string{
 	persistenthost.ACPEventIDMetaKey,
 }
 
+// acpProviderErrorMaxShapeFields is the allowlist size. It is a hard bound even
+// if a future caller accidentally adds duplicate or provider-derived names; the
+// shape never grows with the provider payload.
+const acpProviderErrorMaxShapeFields = 3
+
 func acpProviderErrorEvidence(operation string, err error) domain.ProviderErrorEvidence {
 	evidence := domain.ProviderErrorEvidence{
 		Class:     domain.ProviderErrorUnknown,
@@ -32,9 +37,14 @@ func acpProviderErrorEvidence(operation string, err error) domain.ProviderErrorE
 	if !errors.As(err, &requestErr) {
 		return evidence
 	}
-	evidence.Class = domain.ProviderErrorProviderInternal
-	if requestErr.Code == -32000 {
+	switch requestErr.Code {
+	case -32000:
 		evidence.Class = domain.ProviderErrorAuthRequired
+	case -32603:
+		// -32603 is the only ACP internal-error code AO has demonstrated as
+		// provider-internal. Other structured codes remain unknown until their
+		// meaning is proven rather than inferred.
+		evidence.Class = domain.ProviderErrorProviderInternal
 	}
 	code := requestErr.Code
 	evidence.Code = &code
@@ -48,7 +58,7 @@ func acpProviderErrorEvidence(operation string, err error) domain.ProviderErrorE
 // attachACPPromptEvidence preserves the adapter's classification and adds the
 // terminal prompt's already-used host event id when it is safe. It is also the
 // fallback for structured prompt failures that carry no RequestError.
-func attachACPPromptEvidence(err error, eventID string) error {
+func attachACPPromptEvidence(err error, eventID string, harness domain.AgentHarness) error {
 	if err == nil {
 		return nil
 	}
@@ -62,6 +72,9 @@ func attachACPPromptEvidence(err error, eventID string) error {
 		if errors.Is(err, ports.ErrChatAuthRequired) {
 			evidence.Class = domain.ProviderErrorAuthRequired
 		}
+	}
+	if evidence.Harness == "" {
+		evidence.Harness = string(harness)
 	}
 	if safeID, safe := ports.SafeProviderEventID(eventID); safe && evidence.EventID == "" {
 		evidence.EventID = safeID
@@ -90,6 +103,9 @@ func acpProviderErrorDataShape(data any) map[string]string {
 
 func addACPProviderErrorShape(shape map[string]string, values map[string]any) {
 	for _, key := range acpProviderErrorShapeKeys {
+		if len(shape) >= acpProviderErrorMaxShapeFields {
+			return
+		}
 		value, present := values[key]
 		if !present {
 			continue

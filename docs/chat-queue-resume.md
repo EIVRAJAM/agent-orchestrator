@@ -502,15 +502,18 @@ The durable vocabulary has only classes backed by a structured signal:
 | `not_delivered` | A local empty message, a connection refused before the first write, or an ACP deferred start that provably did not cross the boundary |
 | `uncertain` | EOF, timeout, cancellation after a write, an unreadable response, or a late connection close |
 | `interrupted` | A deliberate local interrupt |
-| `provider_internal` | A structured ACP `RequestError` (for example `-32603`) describing the provider's own failure |
-| `unknown` | A demonstrated provider failure that does not match a narrower class |
+| `provider_internal` | ACP JSON-RPC `-32603`; other structured codes remain `unknown` until demonstrated |
+| `unknown` | A demonstrated provider failure that does not match a narrower class, including Codex errors not proven ambiguous and other ACP request codes |
 
 There is deliberately **no `rate_limited` and no `transient` class**. Prose such as
 "rate limit exceeded", "try again", or "timeout" is never classified with string
 matching. An RPC rejection carrying that prose remains `rejected`; an ACP
-`RequestError` carrying it remains `provider_internal`/`unknown`. A future
-scheduler would need a stable structured temporal signal (or an explicit product
-decision), not a text heuristic.
+`RequestError` carrying it remains `provider_internal` only for `-32603`, or
+`unknown` otherwise. Codex EOF/timeout/cancellation/close-after-write and
+unreadable-response boundaries are the demonstrated `uncertain` cases; every
+other Codex send error remains `unknown`. A future scheduler would need a stable
+structured temporal signal (or an explicit product decision), not a text
+heuristic.
 
 `ErrTurnNotDelivered` means only that the instruction did not reach the provider.
 It says nothing about temporary availability and is not a retry signal.
@@ -528,6 +531,7 @@ Classified terminal events gain one structured block:
   "providerError": {
     "class": "provider_internal",
     "protocol": "acp",
+    "harness": "opencode",
     "operation": "session/prompt",
     "code": -32603,
     "dataShape": { "error": "string" },
@@ -537,10 +541,14 @@ Classified terminal events gain one structured block:
 ```
 
 `dataShape` contains only allowlisted field names and JSON types. It never contains
-a `data` value, a nested body, an array item, or a blob. `eventId` is copied only
-when AO's existing relay event-id validation accepts it. The block contains no
-provider message, prompt, response text, path, token, cookie, credential, email,
-or raw `RequestError.Error()`.
+a `data` value, a nested body, an array item, or a blob. Its bound is explicit: at
+most the three allowlisted names (`error`, `eventId`, and the relay's
+`ao.persistentEventId`), one known relay wrapper level, and no recursive copy.
+`eventId` is copied only when AO's existing relay event-id validation accepts it;
+the format check also rejects non-printable/whitespace values and values over 256
+bytes. The block contains no provider message, prompt, response text, path, token,
+cookie, credential, email, or raw `RequestError.Error()`. The `harness` identifies
+the adapter family (`opencode`, `opencode-v2`, `codex`, etc.).
 
 For a `SendTurn`/deferred-start failure with evidence, the same archive receives a
 `provider.error` row through `ProjectProviderEvent` with a no-op projection. It

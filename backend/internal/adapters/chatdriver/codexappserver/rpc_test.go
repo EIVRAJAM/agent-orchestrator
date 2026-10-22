@@ -137,6 +137,29 @@ func TestRequestSurfacesServerError(t *testing.T) {
 	}
 }
 
+// A malformed result is structurally ambiguous: the request reached the
+// provider and may have executed, but AO could not read the answer. The marker
+// lets send classification report uncertain without inspecting error prose.
+func TestRequestMarksUndecodableResponse(t *testing.T) {
+	c, fake := newFakeAppServer(t, rejectAllServerRequests)
+	done := make(chan error, 1)
+	var out struct {
+		ID string `json:"id"`
+	}
+	go func() { done <- c.request(context.Background(), "turn/start", nil, &out) }()
+
+	req := fake.nextRequest()
+	fake.push(`{"id":` + string(*req.ID) + `,"result":"not-an-object"}`)
+
+	err := <-done
+	if !errors.Is(err, errDecodeResponse) {
+		t.Fatalf("err = %v, want errDecodeResponse", err)
+	}
+	if !strings.Contains(err.Error(), "decode result") {
+		t.Fatalf("visible error changed: %v", err)
+	}
+}
+
 // A response that never arrives must not pin the caller forever, and the late
 // response must not corrupt anything.
 func TestRequestHonorsContextAndToleratesLateResponse(t *testing.T) {

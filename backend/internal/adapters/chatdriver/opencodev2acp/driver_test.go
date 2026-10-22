@@ -198,7 +198,8 @@ func TestOpenCodeV2ACPInternalErrorEvidence(t *testing.T) {
 	}
 	evidence, ok := ports.ProviderErrorEvidenceOf(completed.Err)
 	if !ok || evidence.Class != domain.ProviderErrorProviderInternal ||
-		evidence.Protocol != "acp" || evidence.Operation != "session/prompt" ||
+		evidence.Protocol != "acp" || evidence.Harness != string(domain.HarnessOpenCodeV2) ||
+		evidence.Operation != "session/prompt" ||
 		evidence.Code == nil || *evidence.Code != -32603 ||
 		evidence.DataShape["error"] != "string" {
 		t.Fatalf("evidence = (%+v, %v)", evidence, ok)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -17,6 +18,9 @@ import (
 )
 
 func TestNormalizeACPErrorEvidence(t *testing.T) {
+	if len(acpProviderErrorShapeKeys) != acpProviderErrorMaxShapeFields {
+		t.Fatalf("shape allowlist has %d keys, bound is %d", len(acpProviderErrorShapeKeys), acpProviderErrorMaxShapeFields)
+	}
 	t.Run("auth code", func(t *testing.T) {
 		evidence := acpEvidence(t, normalizeACPError("ACP session/prompt", acpsdk.NewAuthRequired(nil)))
 		if evidence.Class != domain.ProviderErrorAuthRequired ||
@@ -31,7 +35,7 @@ func TestNormalizeACPErrorEvidence(t *testing.T) {
 			Code:    -32603,
 			Message: "Internal error",
 			Data: map[string]any{
-				"error":                          "Rate limit exceeded. Please try again later.",
+				"error":                          "Rate limit exceeded. token=secret-token",
 				"eventId":                        "not-the-real-event-key",
 				persistenthost.ACPEventIDMetaKey: "terminal-event-1",
 				"nested":                         map[string]any{"secret": "nested-secret"},
@@ -62,7 +66,7 @@ func TestNormalizeACPErrorEvidence(t *testing.T) {
 		if marshalErr != nil {
 			t.Fatal(marshalErr)
 		}
-		for _, secret := range []string{"Rate limit exceeded", "nested-secret", "array-secret", "not-the-real-event-key"} {
+		for _, secret := range []string{"Rate limit exceeded", "secret-token", "nested-secret", "array-secret", "not-the-real-event-key"} {
 			if strings.Contains(string(encoded), secret) {
 				t.Fatalf("evidence persisted %q: %s", secret, encoded)
 			}
@@ -113,6 +117,50 @@ func TestNormalizeACPErrorEvidence(t *testing.T) {
 			}
 			if evidence.DataShape[persistenthost.ACPEventIDMetaKey] != "string" {
 				t.Fatalf("event ID type shape = %#v", evidence.DataShape)
+			}
+		}
+	})
+
+	t.Run("other request code is unknown", func(t *testing.T) {
+		evidence := acpEvidence(t, normalizeACPError("ACP session/prompt", &acpsdk.RequestError{
+			Code: -32602,
+			Data: map[string]any{"error": "not demonstrated"},
+		}))
+		if evidence.Class != domain.ProviderErrorUnknown {
+			t.Fatalf("class = %q, want unknown for an undemonstrated code", evidence.Class)
+		}
+		if evidence.Code == nil || *evidence.Code != -32602 {
+			t.Fatalf("code = %#v", evidence.Code)
+		}
+	})
+
+	t.Run("shape is bounded and ignores deep provider data", func(t *testing.T) {
+		data := make(map[string]any)
+		for i := 0; i < 100; i++ {
+			data[fmt.Sprintf("unknown-%d", i)] = "unknown-secret"
+		}
+		data["error"] = map[string]any{"nested": map[string]any{"tooDeep": "deep-secret"}}
+		data["providerData"] = map[string]any{
+			"eventId": "inner-event-secret",
+			"extra":   map[string]any{"deeper": "deeper-secret"},
+		}
+		evidence := acpEvidence(t, normalizeACPError("ACP session/prompt", &acpsdk.RequestError{
+			Code: -32603,
+			Data: data,
+		}))
+		if len(evidence.DataShape) > acpProviderErrorMaxShapeFields {
+			t.Fatalf("shape grew beyond the allowlist: %#v", evidence.DataShape)
+		}
+		if evidence.DataShape["error"] != "object" {
+			t.Fatalf("error shape = %#v, want object", evidence.DataShape)
+		}
+		if _, ok := evidence.DataShape["extra"]; ok {
+			t.Fatalf("unknown nested field entered shape: %#v", evidence.DataShape)
+		}
+		encoded, _ := json.Marshal(evidence)
+		for _, secret := range []string{"inner-event-secret", "deep-secret", "deeper-secret", "unknown-secret"} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("deep value persisted: %s", encoded)
 			}
 		}
 	})
@@ -182,7 +230,8 @@ func TestSyntheticOpenCodeACPInternalRateLimitIsNotAClass(t *testing.T) {
 				t.Fatalf("completion has no structured evidence: %v", completed.Err)
 			}
 			if evidence.Class != domain.ProviderErrorProviderInternal ||
-				evidence.Protocol != "acp" || evidence.Operation != "session/prompt" ||
+				evidence.Protocol != "acp" || evidence.Harness != string(test.harness) ||
+				evidence.Operation != "session/prompt" ||
 				evidence.Code == nil || *evidence.Code != -32603 {
 				t.Fatalf("evidence = %+v", evidence)
 			}
@@ -207,15 +256,16 @@ func TestSyntheticOpenCodeACPInternalRateLimitIsNotAClass(t *testing.T) {
 }
 
 func TestACPStartDeferredNotStartedIsNotDelivered(t *testing.T) {
-	conv := &conversation{closed: true}
+	conv := &conversation{closed: true, harness: domain.HarnessOpenCode}
 	err := conv.StartDeferredTurn("missing")
 	if !errors.Is(err, ports.ErrDeferredTurnNotStarted) {
 		t.Fatalf("err = %v, want ErrDeferredTurnNotStarted", err)
 	}
 	evidence, ok := ports.ProviderErrorEvidenceOf(err)
 	if !ok || evidence.Class != domain.ProviderErrorNotDelivered ||
-		evidence.Protocol != "acp" || evidence.Operation != "session/prompt" {
-		t.Fatalf("evidence = (%+v, %v), want acp not_delivered", evidence, ok)
+		evidence.Protocol != "acp" || evidence.Harness != "opencode" ||
+		evidence.Operation != "session/prompt" {
+		t.Fatalf("evidence = (%+v, %v), want opencode/acp not_delivered", evidence, ok)
 	}
 }
 

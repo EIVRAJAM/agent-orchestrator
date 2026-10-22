@@ -86,6 +86,7 @@ type conversation struct {
 	legacyWire           *legacyACPTransport
 	proc                 *process
 	log                  *slog.Logger
+	harness              domain.AgentHarness
 	providerScopeID      string
 	decodeConversationID func(string) (string, error)
 	canDeleteFork        bool
@@ -604,7 +605,8 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 		return ports.WithProviderError(
 			fmt.Errorf("%w: %w", ports.ErrDeferredTurnNotStarted, errConversationClosed),
 			domain.ProviderErrorEvidence{
-				Class: domain.ProviderErrorNotDelivered, Protocol: "acp", Operation: "session/prompt",
+				Class: domain.ProviderErrorNotDelivered, Protocol: "acp",
+				Harness: string(c.harness), Operation: "session/prompt",
 			},
 		)
 	}
@@ -613,7 +615,8 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 		return ports.WithProviderError(
 			fmt.Errorf("%w: ACP prepared turn not found", ports.ErrDeferredTurnNotStarted),
 			domain.ProviderErrorEvidence{
-				Class: domain.ProviderErrorNotDelivered, Protocol: "acp", Operation: "session/prompt",
+				Class: domain.ProviderErrorNotDelivered, Protocol: "acp",
+				Harness: string(c.harness), Operation: "session/prompt",
 			},
 		)
 	}
@@ -736,7 +739,7 @@ func (c *conversation) finishPrompt(
 			}})
 		}
 	}
-	turnErr = attachACPPromptEvidence(turnErr, eventID)
+	turnErr = attachACPPromptEvidence(turnErr, eventID, c.harness)
 	if errors.Is(turnErr, ports.ErrChatAuthRequired) {
 		// The provider has just contradicted whatever the readiness cache holds.
 		// Correct it for both request errors and structured prompt failures.

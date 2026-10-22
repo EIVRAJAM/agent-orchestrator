@@ -311,7 +311,8 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		return ports.ChatTurnRef{}, ports.WithProviderError(
 			fmt.Errorf("%w: chat message text is empty", ports.ErrTurnNotDelivered),
 			domain.ProviderErrorEvidence{
-				Class: domain.ProviderErrorNotDelivered, Protocol: "codex", Operation: "turn/start",
+				Class: domain.ProviderErrorNotDelivered, Protocol: "codex",
+				Harness: string(domain.HarnessCodex), Operation: "turn/start",
 			},
 		)
 	}

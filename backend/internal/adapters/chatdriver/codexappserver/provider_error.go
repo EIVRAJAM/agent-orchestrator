@@ -1,7 +1,9 @@
 package codexappserver
 
 import (
+	"context"
 	"errors"
+	"io"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/codexappserver/codexproto"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -14,8 +16,9 @@ import (
 // provider exposes a stable structured field for it.
 func codexSendErrorEvidence(err error) domain.ProviderErrorEvidence {
 	evidence := domain.ProviderErrorEvidence{
-		Class:     domain.ProviderErrorUncertain,
+		Class:     domain.ProviderErrorUnknown,
 		Protocol:  "codex",
+		Harness:   string(domain.HarnessCodex),
 		Operation: "turn/start",
 	}
 	var rpcErr *rpcError
@@ -27,6 +30,12 @@ func codexSendErrorEvidence(err error) domain.ProviderErrorEvidence {
 	}
 	if errors.Is(err, errConnClosedBeforeWrite) {
 		evidence.Class = domain.ProviderErrorNotDelivered
+		return evidence
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, ErrConnClosed) || errors.Is(err, errDecodeResponse) {
+		evidence.Class = domain.ProviderErrorUncertain
 	}
 	return evidence
 }
@@ -38,6 +47,7 @@ func codexTurnFailureEvidence(turnErr codexproto.TurnError) domain.ProviderError
 	evidence := domain.ProviderErrorEvidence{
 		Class:     domain.ProviderErrorUnknown,
 		Protocol:  "codex",
+		Harness:   string(domain.HarnessCodex),
 		Operation: "turn/error",
 	}
 	if turnErr.CodexErrorInfo != nil && string(*turnErr.CodexErrorInfo) == `"unauthorized"` {

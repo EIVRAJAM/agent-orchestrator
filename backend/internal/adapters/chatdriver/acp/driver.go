@@ -584,6 +584,7 @@ func (d *Driver) initialize(
 	conv := newConversation(
 		proc, d.log, cfg.ProviderScopeID, d.cfg.ClientExtension, d.cfg.ClientExtensionAliases,
 	)
+	conv.harness = d.cfg.Harness
 	conv.onAuthRejected = d.cfg.OnAuthRejected
 	conv.promptResponseFailure = d.cfg.PromptResponseFailure
 	conv.hibernationCheck = d.cfg.CanHibernate

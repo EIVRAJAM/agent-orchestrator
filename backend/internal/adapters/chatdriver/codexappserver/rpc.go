@@ -73,6 +73,23 @@ var ErrConnClosed = errors.New("app-server connection closed")
 // connection that closes after a write, which leaves the request's fate unknown.
 var errConnClosedBeforeWrite = errors.New("app-server connection closed before write")
 
+// errDecodeResponse marks a response whose envelope arrived but whose result
+// could not be decoded. The request may have executed, so this is ambiguous
+// delivery, not an absent provider.
+var errDecodeResponse = errors.New("app-server response could not be decoded")
+
+// responseDecodeError preserves the existing user-visible error text while
+// making the undecodable-response boundary structural for classification.
+type responseDecodeError struct {
+	err error
+}
+
+func (e *responseDecodeError) Error() string { return e.err.Error() }
+func (e *responseDecodeError) Unwrap() error { return e.err }
+func (e *responseDecodeError) Is(target error) bool {
+	return target == errDecodeResponse
+}
+
 // conn is one live stdio connection to an app-server process.
 //
 // It is transport only: framing, request/response correlation, and fan-out. It
@@ -371,7 +388,7 @@ func (c *conn) request(ctx context.Context, method string, params, out any) erro
 		}
 		if out != nil && len(f.Result) > 0 {
 			if err := json.Unmarshal(f.Result, out); err != nil {
-				return fmt.Errorf("%s: decode result: %w", method, err)
+				return &responseDecodeError{err: fmt.Errorf("%s: decode result: %w", method, err)}
 			}
 		}
 		return nil

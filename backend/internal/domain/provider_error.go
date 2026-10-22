@@ -41,6 +41,7 @@ const (
 type ProviderErrorEvidence struct {
 	Class     ProviderErrorClass `json:"class"`
 	Protocol  string             `json:"protocol,omitempty"`
+	Harness   string             `json:"harness,omitempty"`
 	Operation string             `json:"operation,omitempty"`
 	Code      *int               `json:"code,omitempty"`
 	DataShape map[string]string  `json:"dataShape,omitempty"`

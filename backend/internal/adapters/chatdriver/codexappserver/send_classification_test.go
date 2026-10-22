@@ -14,8 +14,9 @@ import (
 
 // TestClassifySendTurnError proves the adapter only claims a definitive outcome
 // when it has one. A provider error response is a rejection; a connection
-// refused before any write is not delivered. Everything else stays ambiguous so
-// the controller leaves the turn running/uncertain.
+// refused before any write is not delivered. The demonstrated post-write
+// ambiguity cases remain uncertain; anything else is unknown, so diagnosis
+// never invents a class while the controller still treats it as non-definitive.
 func TestClassifySendTurnError(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -31,7 +32,8 @@ func TestClassifySendTurnError(t *testing.T) {
 		{"closed after write", fmt.Errorf("turn/start: %w", ErrConnClosed), false, false, domain.ProviderErrorUncertain},
 		{"timeout", context.DeadlineExceeded, false, false, domain.ProviderErrorUncertain},
 		{"cancelled", context.Canceled, false, false, domain.ProviderErrorUncertain},
-		{"undecodable response", fmt.Errorf("turn/start: decode result: %w", errors.New("invalid character")), false, false, domain.ProviderErrorUncertain},
+		{"undecodable response", &responseDecodeError{err: fmt.Errorf("turn/start: decode result: %w", errors.New("invalid character"))}, false, false, domain.ProviderErrorUncertain},
+		{"undemonstrated failure", errors.New("unexpected local failure"), false, false, domain.ProviderErrorUnknown},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := classifySendTurnError(tc.err)
@@ -51,8 +53,8 @@ func TestClassifySendTurnError(t *testing.T) {
 			if evidence.Class == "rate_limited" || evidence.Class == "transient" {
 				t.Fatalf("prose produced an undemonstrated class %q", evidence.Class)
 			}
-			if evidence.Protocol != "codex" || evidence.Operation != "turn/start" {
-				t.Fatalf("evidence identity = %+v, want codex turn/start", evidence)
+			if evidence.Protocol != "codex" || evidence.Harness != "codex" || evidence.Operation != "turn/start" {
+				t.Fatalf("evidence identity = %+v, want codex/codex turn/start", evidence)
 			}
 		})
 	}
@@ -65,8 +67,9 @@ func TestCodexProviderFailureEvidence(t *testing.T) {
 		CodexErrorInfo: &unauthorized,
 	})
 	evidence, ok := ports.ProviderErrorEvidenceOf(err)
-	if !ok || evidence.Class != domain.ProviderErrorAuthRequired {
-		t.Fatalf("unauthorized evidence = (%+v, %v), want auth_required", evidence, ok)
+	if !ok || evidence.Class != domain.ProviderErrorAuthRequired ||
+		evidence.Harness != "codex" || evidence.Operation != "turn/error" {
+		t.Fatalf("unauthorized evidence = (%+v, %v), want codex auth_required", evidence, ok)
 	}
 	if !errors.Is(err, ports.ErrChatAuthRequired) {
 		t.Fatalf("unauthorized error = %v, want ErrChatAuthRequired", err)
@@ -100,7 +103,7 @@ func TestSendTurnEmptyTextIsDefinitive(t *testing.T) {
 	}
 	evidence, ok := ports.ProviderErrorEvidenceOf(err)
 	if !ok || evidence.Class != domain.ProviderErrorNotDelivered ||
-		evidence.Protocol != "codex" || evidence.Operation != "turn/start" {
+		evidence.Protocol != "codex" || evidence.Harness != "codex" || evidence.Operation != "turn/start" {
 		t.Fatalf("local validation evidence = (%+v, %v), want codex not_delivered", evidence, ok)
 	}
 }

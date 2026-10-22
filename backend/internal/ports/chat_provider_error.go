@@ -54,6 +54,9 @@ func mergeProviderErrorEvidence(base, next domain.ProviderErrorEvidence) domain.
 	if next.Protocol != "" {
 		merged.Protocol = next.Protocol
 	}
+	if next.Harness != "" {
+		merged.Harness = next.Harness
+	}
 	if next.Operation != "" {
 		merged.Operation = next.Operation
 	}
