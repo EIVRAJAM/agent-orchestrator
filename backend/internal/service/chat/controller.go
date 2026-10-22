@@ -1909,11 +1909,6 @@ func (c *Controller) dispatchTurn(
 	c.mu.Unlock()
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
-		// The dispatch never produced a provider event, but the adapter may have
-		// attached sanitized evidence. Archive it in the same provider-event file
-		// without a projection, so diagnostics remain durable without inventing a
-		// second persistence path or changing the turn's state.
-		c.archiveDispatchError(ctx, turnID, err)
 		// A turn is definitive only when the adapter can prove the provider never
 		// received it, when the provider explicitly rejected it, or when the driver
 		// is deferred and SendTurn is still the prepare step (no boundary crossed).
@@ -1926,9 +1921,11 @@ func (c *Controller) dispatchTurn(
 			isProviderRefusal(err)
 		if !definitive {
 			// Keep the dispatching turn id so a late TurnStarted can persist the
-			// provider binding, and keep the row running/unbound. The one-shot stays
-			// armed; the queue cannot advance. Return the AO turn so callers can still
-			// navigate it.
+			// provider binding, and keep the row running/unbound. The diagnostic is
+			// archive-only and must not delay or replace that decision. The one-shot
+			// stays armed; the queue cannot advance. Return the AO turn so callers can
+			// still navigate it.
+			c.archiveDispatchError(ctx, turnID, err)
 			return domain.ConversationTurn{
 				ID:                 turnID,
 				ConversationID:     c.conversation.ID,
@@ -1944,12 +1941,15 @@ func (c *Controller) dispatchTurn(
 		c.mu.Unlock()
 		// Definitive: the provider cannot have accepted the turn. Settle it failed
 		// rather than retrying; settling by AO's own turn id avoids looking up an
-		// empty provider id after the error.
+		// empty provider id after the error. Archiving is deliberately after this
+		// durable transition: a crash must not leave a definitive failure running
+		// merely because the diagnostic write was attempted first.
 		completedAt := c.now()
 		if settleErr := c.store.SettleTurnByID(
 			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
 			c.log.Error("failed to settle turn after send error", "error", settleErr)
 		}
+		c.archiveDispatchError(ctx, turnID, err)
 		return domain.ConversationTurn{
 			ID:                 turnID,
 			ConversationID:     c.conversation.ID,
@@ -2027,11 +2027,11 @@ func (c *Controller) dispatchTurn(
 	// projected. Eager drivers do not implement this optional interface.
 	if hasDeferredStart {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
-			c.archiveDispatchError(ctx, turnID, err)
 			if errors.Is(err, ports.ErrDeferredTurnNotStarted) {
 				// The driver proved the provider boundary was not crossed: the
 				// prompt cannot have reached the provider. Settle it failed and let
-				// the caller clear the one-shot.
+				// the caller clear the one-shot. Archive only after that durable
+				// transition so a crash cannot strand a definitive failure running.
 				c.mu.Lock()
 				c.pendingTurnID = ""
 				c.mu.Unlock()
@@ -2039,11 +2039,14 @@ func (c *Controller) dispatchTurn(
 					ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
 					c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
 				}
+				c.archiveDispatchError(ctx, turnID, err)
 				return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
 			}
 			// Ambiguous: the request may already have been written to the provider.
 			// Keep the durable binding, the in-memory pending turn and the one-shot,
-			// and do not settle, retry or drain. A late terminal settles it.
+			// and do not settle, retry or drain. A late terminal settles it. The
+			// diagnostic is archive-only and must not change that outcome.
+			c.archiveDispatchError(ctx, turnID, err)
 			return domain.ConversationTurn{}, fmt.Errorf("%w: start turn: %w", errUncertainDelivery, err)
 		}
 	}
@@ -3081,11 +3084,12 @@ func (c *Controller) archiveDispatchError(ctx context.Context, turnID string, er
 	if !ok {
 		return
 	}
+	evidence = ports.SanitizeProviderErrorEvidence(evidence)
 	payload, marshalErr := json.Marshal(map[string]any{
-		"kind":           "provider.error",
-		"providerTurnId": turnID,
-		"providerError":  evidence,
-		"error":          string(evidence.Class),
+		"kind":          "provider.error",
+		"turnId":        turnID,
+		"providerError": evidence,
+		"error":         string(evidence.Class),
 	})
 	if marshalErr != nil {
 		c.log.Warn("failed to encode dispatch error evidence", "error", marshalErr)
@@ -3157,6 +3161,7 @@ func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (b
 	}
 	if event.Err != nil {
 		if evidence, ok := ports.ProviderErrorEvidenceOf(event.Err); ok {
+			evidence = ports.SanitizeProviderErrorEvidence(evidence)
 			record["providerError"] = evidence
 			// The visible message remains the durable turn's error_message. The
 			// raw archive keeps only the class for classified provider failures so

@@ -17,6 +17,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+var testRelayEventID = "acp-host:" + strings.Repeat("a", 64) + ":1"
+
 func TestNormalizeACPErrorEvidence(t *testing.T) {
 	if len(acpProviderErrorShapeKeys) != acpProviderErrorMaxShapeFields {
 		t.Fatalf("shape allowlist has %d keys, bound is %d", len(acpProviderErrorShapeKeys), acpProviderErrorMaxShapeFields)
@@ -37,7 +39,7 @@ func TestNormalizeACPErrorEvidence(t *testing.T) {
 			Data: map[string]any{
 				"error":                          "Rate limit exceeded. token=secret-token",
 				"eventId":                        "not-the-real-event-key",
-				persistenthost.ACPEventIDMetaKey: "terminal-event-1",
+				persistenthost.ACPEventIDMetaKey: testRelayEventID,
 				"nested":                         map[string]any{"secret": "nested-secret"},
 				"array":                          []any{"array-secret"},
 			},
@@ -59,7 +61,7 @@ func TestNormalizeACPErrorEvidence(t *testing.T) {
 		if _, ok := evidence.DataShape["array"]; ok {
 			t.Fatalf("unknown array field entered shape: %#v", evidence.DataShape)
 		}
-		if evidence.EventID != "terminal-event-1" {
+		if evidence.EventID != testRelayEventID {
 			t.Fatalf("event ID = %q, want the relay's safe event ID", evidence.EventID)
 		}
 		encoded, marshalErr := json.Marshal(evidence)
@@ -107,7 +109,14 @@ func TestNormalizeACPErrorEvidence(t *testing.T) {
 	})
 
 	t.Run("invalid event ID is omitted", func(t *testing.T) {
-		for _, eventID := range []string{"line\nbreak", "contains space", strings.Repeat("x", 257)} {
+		for _, eventID := range []string{
+			"line\nbreak",
+			"contains space",
+			strings.Repeat("x", 257),
+			"provider-supplied-ascii-id",
+			"acp-host:abc:1",
+			"acp-host:" + strings.Repeat("g", 64) + ":1",
+		} {
 			evidence := acpEvidence(t, normalizeACPError("ACP session/prompt", &acpsdk.RequestError{
 				Code: -32603,
 				Data: map[string]any{persistenthost.ACPEventIDMetaKey: eventID},

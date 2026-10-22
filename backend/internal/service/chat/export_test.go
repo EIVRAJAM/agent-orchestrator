@@ -21,6 +21,14 @@ func SetRenderMeasureTimeout(timeout time.Duration) (restore func()) {
 // WaitRenderMeasures waits for the background measures PublishRender started.
 func (s *Service) WaitRenderMeasures() { s.renderMeasures.Wait() }
 
+// PendingTurnIDForTest reports the controller's in-memory pending provider turn
+// id. Tests use it to observe the dispatch ordering at the archive boundary.
+func (c *Controller) PendingTurnIDForTest() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pendingTurnID
+}
+
 // ResumeHoldTurnIDForTest reports the turn id of the armed explicit-resume
 // one-shot, or "" when none is armed. The marker is otherwise unexported.
 func (c *Controller) ResumeHoldTurnIDForTest() string {

@@ -21,6 +21,7 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	ctx := context.Background()
 	const promptSecret = "SECRET_PROMPT"
 	const rootText = "root " + promptSecret
+	relayEventID := "acp-host:" + strings.Repeat("a", 64) + ":1"
 
 	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
 		Text: rootText, ClientMessageID: "evidence-root", Origin: domain.MessageOriginHuman,
@@ -42,7 +43,7 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	code := -32603
 	h.conv.emit(ports.ChatEvent{
 		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1",
-		ProviderEventID: "terminal-event-1", TurnState: domain.TurnStateFailed,
+		ProviderEventID: relayEventID, TurnState: domain.TurnStateFailed,
 		Err: ports.WithProviderError(errors.New(visible), domain.ProviderErrorEvidence{
 			Class: domain.ProviderErrorProviderInternal, Protocol: "acp",
 			Harness: "opencode", Operation: "session/prompt",
@@ -51,7 +52,7 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 				"error":   "string",
 				"eventId": "string",
 			},
-			EventID: "terminal-event-1",
+			EventID: relayEventID,
 		}),
 	})
 
@@ -73,7 +74,7 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	var archived map[string]any
 	var archivedPayload string
 	for _, event := range events {
-		if event.ProviderEventID != "terminal-event-1" {
+		if event.ProviderEventID != relayEventID {
 			continue
 		}
 		archivedPayload = event.PayloadJson
@@ -91,7 +92,7 @@ func TestProviderErrorEvidencePreservesFailureRetention(t *testing.T) {
 	}
 	if providerError["class"] != string(domain.ProviderErrorProviderInternal) ||
 		providerError["protocol"] != "acp" || providerError["harness"] != "opencode" ||
-		providerError["operation"] != "session/prompt" || providerError["eventId"] != "terminal-event-1" {
+		providerError["operation"] != "session/prompt" || providerError["eventId"] != relayEventID {
 		t.Fatalf("archived providerError = %#v", providerError)
 	}
 	if providerError["code"] != float64(-32603) {

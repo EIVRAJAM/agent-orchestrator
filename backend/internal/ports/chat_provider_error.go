@@ -79,18 +79,124 @@ func mergeProviderErrorEvidence(base, next domain.ProviderErrorEvidence) domain.
 	return merged
 }
 
-// SafeProviderEventID reports whether an ACP host event id is safe to copy into
-// structured evidence. The relay already uses this value for acknowledgement;
-// the conservative format check keeps control characters, whitespace, and
-// unbounded host data out of the diagnostic record.
+// SafeProviderEventID reports whether value is the exact event-id shape AO's
+// persistent ACP relay owns: "acp-host:<64 lowercase hex>:<decimal sequence>".
+// ASCII alone is not enough: an arbitrary provider identifier must not become
+// trusted evidence merely because it contains printable characters.
 func SafeProviderEventID(value string) (string, bool) {
-	if value == "" || len(value) > 256 || strings.TrimSpace(value) != value {
+	const prefix = "acp-host:"
+	if value == "" || len(value) > 256 || !strings.HasPrefix(value, prefix) {
 		return "", false
 	}
-	for _, r := range value {
-		if r < 0x21 || r > 0x7e {
+	parts := strings.Split(strings.TrimPrefix(value, prefix), ":")
+	if len(parts) != 2 || len(parts[0]) != 64 || len(parts[1]) == 0 || len(parts[1]) > 20 {
+		return "", false
+	}
+	for i := 0; i < len(parts[0]); i++ {
+		c := parts[0][i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", false
+		}
+	}
+	for i := 0; i < len(parts[1]); i++ {
+		if parts[1][i] < '0' || parts[1][i] > '9' {
 			return "", false
 		}
 	}
 	return value, true
+}
+
+var providerErrorClasses = map[domain.ProviderErrorClass]struct{}{
+	domain.ProviderErrorAuthRequired:     {},
+	domain.ProviderErrorRejected:         {},
+	domain.ProviderErrorNotDelivered:     {},
+	domain.ProviderErrorUncertain:        {},
+	domain.ProviderErrorInterrupted:      {},
+	domain.ProviderErrorProviderInternal: {},
+	domain.ProviderErrorUnknown:          {},
+}
+
+var providerErrorDataShapeKeys = []string{
+	"error",
+	"eventId",
+	"ao.persistentEventId",
+}
+
+var providerErrorDataShapeTypes = map[string]struct{}{
+	"null": {}, "string": {}, "boolean": {}, "number": {},
+	"object": {}, "array": {}, "unknown": {},
+}
+
+var providerErrorOperations = map[string]map[string]struct{}{
+	"codex": {"turn/start": {}, "turn/error": {}},
+	"acp":   {"session/prompt": {}},
+}
+
+const providerErrorMaxDataShapeFields = 3
+
+// SanitizeProviderErrorEvidence is the closed boundary applied before writing
+// provider evidence to conversation_provider_events. Adapters are not trusted
+// to hand over safe values: unknown classes fall back to unknown, unknown
+// protocols/harnesses/operations are omitted, and DataShape is rebuilt from a
+// fixed key/type allowlist with no values. It returns a copy and never mutates
+// the caller's evidence.
+func SanitizeProviderErrorEvidence(evidence domain.ProviderErrorEvidence) domain.ProviderErrorEvidence {
+	sanitized := domain.ProviderErrorEvidence{Class: domain.ProviderErrorUnknown}
+	if _, ok := providerErrorClasses[evidence.Class]; ok {
+		sanitized.Class = evidence.Class
+	}
+
+	protocol := ""
+	if _, ok := providerErrorOperations[evidence.Protocol]; ok {
+		protocol = evidence.Protocol
+		sanitized.Protocol = protocol
+	}
+
+	if protocol != "" && evidence.Harness != "" {
+		harness := domain.AgentHarness(evidence.Harness)
+		pertinent := harness.IsKnown() &&
+			((protocol == "codex" && harness == domain.HarnessCodex) ||
+				(protocol == "acp" && harness != domain.HarnessCodex))
+		if pertinent {
+			sanitized.Harness = evidence.Harness
+		}
+	}
+
+	if operations, ok := providerErrorOperations[protocol]; ok {
+		if _, ok := operations[evidence.Operation]; ok {
+			sanitized.Operation = evidence.Operation
+		}
+	}
+
+	if evidence.Code != nil {
+		code := *evidence.Code
+		sanitized.Code = &code
+	}
+
+	if len(evidence.DataShape) > 0 {
+		shape := make(map[string]string, providerErrorMaxDataShapeFields)
+		for _, key := range providerErrorDataShapeKeys {
+			if len(shape) >= providerErrorMaxDataShapeFields {
+				break
+			}
+			valueType, present := evidence.DataShape[key]
+			if !present {
+				continue
+			}
+			if _, ok := providerErrorDataShapeTypes[valueType]; !ok {
+				continue
+			}
+			shape[key] = valueType
+		}
+		if len(shape) > 0 {
+			sanitized.DataShape = shape
+		}
+	}
+
+	if protocol == "acp" {
+		if eventID, ok := SafeProviderEventID(evidence.EventID); ok {
+			sanitized.EventID = eventID
+		}
+	}
+	return sanitized
 }

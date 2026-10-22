@@ -544,18 +544,72 @@ Classified terminal events gain one structured block:
 a `data` value, a nested body, an array item, or a blob. Its bound is explicit: at
 most the three allowlisted names (`error`, `eventId`, and the relay's
 `ao.persistentEventId`), one known relay wrapper level, and no recursive copy.
-`eventId` is copied only when AO's existing relay event-id validation accepts it;
-the format check also rejects non-printable/whitespace values and values over 256
-bytes. The block contains no provider message, prompt, response text, path, token,
-cookie, credential, email, or raw `RequestError.Error()`. The `harness` identifies
-the adapter family (`opencode`, `opencode-v2`, `codex`, etc.).
+`eventId` is copied only for ACP and only when it matches the exact AO-owned relay
+shape `acp-host:<64 lowercase hex>:<decimal sequence>`; arbitrary printable
+provider ids, whitespace/control characters, Unicode, and values over 256 bytes
+are rejected. The block contains no provider message, prompt, response text, path,
+token, cookie, credential, email, or raw `RequestError.Error()`. The `harness`
+identifies the adapter family (`opencode`, `opencode-v2`, `codex`, etc.).
 
 For a `SendTurn`/deferred-start failure with evidence, the same archive receives a
 `provider.error` row through `ProjectProviderEvent` with a no-op projection. It
-does not create a synthetic timeline event, settle a turn, or advance the queue.
-For classified events, the archive's raw `error` field is the class; the existing
-visible `error_message` on the durable turn still carries the provider's message.
-Unclassified events retain their previous archive behavior.
+does not create a synthetic timeline event, settle a turn, or advance the queue:
+
+```json
+{
+  "kind": "provider.error",
+  "turnId": "ao-internal-turn-id",
+  "providerError": {
+    "class": "not_delivered",
+    "protocol": "codex",
+    "harness": "codex",
+    "operation": "turn/start"
+  },
+  "error": "not_delivered"
+}
+```
+
+`turnId` is AO's internal turn id. The diagnostic row deliberately has **no**
+`providerTurnId`: the provider never produced one, and writing a fake value there
+would make the row look like dispatch acceptance. For classified events, the
+archive's raw `error` field is the class; the existing visible `error_message` on
+the durable turn still carries the provider's message. Unclassified events retain
+their previous archive behavior.
+
+### Closed sanitization boundary
+
+The archive boundary does not trust adapter-built evidence. Before serializing,
+both terminal events and `provider.error` rows pass through the same closed
+sanitizer:
+
+- class must be one of the seven demonstrated classes, otherwise `unknown`;
+- protocol must be `codex` or `acp`, otherwise omitted;
+- harness must be a known `domain.AgentHarness` pertinent to the protocol,
+  otherwise omitted;
+- operation is limited to `turn/start`, `turn/error`, and `session/prompt` and the
+  protocol's allowed operations, otherwise omitted;
+- `dataShape` is rebuilt from `error`, `eventId`, and `ao.persistentEventId`, with
+  at most three entries and only the documented type names; unknown keys/types are
+  dropped and no values are copied;
+- `eventId` is retained only for `acp` and only when it matches the exact
+  AO-owned relay shape `acp-host:<64 lowercase hex>:<decimal sequence>`. A
+  printable but arbitrary provider id is not trusted;
+- code remains the structured integer.
+
+### Settlement before diagnostic archival
+
+Evidence is best effort and never precedes a durable transition that the safety
+policy requires:
+
+- definitive `SendTurn` failure: memory cleanup, `SettleTurnByID(failed)`, then
+  archive; the row is failed with `completed_at` before the diagnostic write;
+- deferred `ErrDeferredTurnNotStarted`: clear `pendingTurnID`,
+  `SettleTurnByID(failed)`, then archive;
+- ambiguous eager/deferred failure: keep the row running/unbound, pending binding
+  and one-shot hold, archive without settling, and do not retry or drain.
+
+A crash after the durable settle but before the diagnostic archive can therefore
+lose only the diagnostic row, never the turn transition.
 
 ### OpenCode representative case
 
