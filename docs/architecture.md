@@ -618,9 +618,10 @@ Ownership invariants:
    confer daemon ownership.
 5. A residual `daemon.lock` does not imply that an owner exists.
 6. The daemon never breaks a lock based on PID, health, or timestamps.
-7. This delivery does not change queue settlement or preservation.
-8. Preservation/adoption of queued turns will be a later delivery built on this
-   single-owner guarantee.
+7. Queue preservation and controller adoption rely on this single-owner
+   guarantee; no second process can race the same generation.
+8. A direct writer of `ao.db` must hold the same lock before claiming Chat
+   controller ownership or changing queue state.
 
 A conflicting daemon exits before opening its store, publishing a run-file,
 removing a socket, or binding a listener. It prints that another daemon owns the
@@ -640,7 +641,78 @@ it and never migrates or writes. Provider-owned databases (for example OpenCode)
 are outside this lock. Any future writer of the main `ao.db` must acquire the
 same lock; it must not rely on `running.json`.
 
-This delivery still does not preserve or adopt queued turns.
+### Chat queue ownership across controller loss
+
+`conversation_turns` separates two facts that must never be settled the same
+way:
+
+- `running` crossed the provider boundary. A dead controller may have caused the
+  provider to accept the work, so orphaned running rows settle as `failed` and
+  are never re-sent or moved back to `queued`.
+- `queued` never crossed the provider boundary. Crash, stream end, controller
+  replacement, and clean daemon shutdown preserve those rows.
+
+`SettleOrphanedRunningTurns` is the only crash/stream-end settlement used by the
+daemon. `CleanupOwnedControllerWork` is fenced by controller generation and uses
+the same running-only rule. The general settlement is deliberately absent from
+the crash path.
+
+A replacement controller claims ownership and adopts queued work in one
+`BEGIN IMMEDIATE` transaction:
+
+1. compare-and-set `sessions.controller_generation` against the generation the
+   caller observed;
+2. require a non-terminated Chat session;
+3. refuse when a conversation running turn exists, unless this is cold recovery,
+   which first settles only running rows;
+4. update `conversation_turns.controller_generation` only for rows that are
+   `queued`, unpromoted, not rolled back, owned by the same session and
+   conversation, after the last durable Stop cutoff, and at or before the queue
+   rowid observed by the claim;
+5. set `conversations.queue_recovery_required` when queued rows were adopted.
+
+Any failure rolls back the generation, running settlement, row adoption, and the
+recovery hold together. The provider is not published as the session owner and
+no queued row can dispatch from the transaction. IDs, `requested_at`, rowid
+ordering, promotion state, and retry links are untouched.
+
+`queue_recovery_required` is an operational hold, not a display status. The
+snapshot derives `controller_recovery_required` while a queued head exists; the
+new controller cannot auto-drain it. `resume-queue` releases exactly one named
+head through the existing durable CAS. A completed one-shot leaves the rest
+held, and a repeated restart remains held until queued work is explicitly
+resumed or cancelled. Sending, steering, or retrying during the hold queues
+behind the existing head.
+
+`conversations` also records the latest closed Stop episode:
+
+- `stop_reason` is one of `user_stop`, `interface_interrupt`,
+  `handoff_interrupt`, `agent_switch`, or `session_terminated`;
+- `stop_episode_id` is an opaque episode identity;
+- `stop_intent_at` is the intent instant;
+- `stop_cutoff_rowid` is the maximum queued rowid observed inside the same
+  `BEGIN IMMEDIATE` transaction that writes the intent and interrupts queued
+  rows through that cutoff.
+
+Rows inserted after the cutoff are new work and survive. The transaction
+commits before provider interruption, so a crash either leaves no Stop intent
+or leaves the complete cancellation. A clean daemon shutdown uses `Close`, not a
+user Stop, and does not cancel queued work.
+
+Live reconnect is not a replacement claim. It reuses the durable
+`controller_generation`, restores only the provider-bound session it can
+reattach, settles only unbound running rows, and does not adopt queued work or
+rotate the generation. A native provider handoff is an explicit ownership
+transfer to a different provider context: it retires the predecessor Session
+and settles both its queued and running accepted work because neither belongs in
+the target context. That is intentionally separate from crash recovery.
+Reviewer Chat keeps its separate controller/review cleanup path; the shared Stop
+operation also records the cutoff for a review conversation when its controller
+is explicitly interrupted.
+
+There is no scheduler, automatic recovery, automatic retry, backoff,
+rate-limit classification, SQLite lease, heartbeat, or force unlock in this
+model. A preserved queue waits for a person.
 
 ---
 
