@@ -316,10 +316,17 @@ func cloneStartConfig(cfg StartConfig) StartConfig {
 // Best-effort by design: a failure here must not stop a session from coming back,
 // because a session the user cannot reopen is worse than a stale row. Both
 // failures are logged rather than swallowed.
-func (s *Service) settleOrphanedWork(ctx context.Context, session domain.SessionID, conversationID string) {
+func (s *Service) settleOrphanedWork(
+	ctx context.Context,
+	session domain.SessionID,
+	conversationID string,
+	settleRunning bool,
+) {
 	now := s.now()
-	if err := s.store.SettleOrphanedTurns(ctx, session, now); err != nil {
-		s.log.Error("chat start: settle orphaned turns", "session", session, "error", err)
+	if settleRunning {
+		if err := s.store.SettleOrphanedRunningTurns(ctx, session, now); err != nil {
+			s.log.Error("chat start: settle orphaned running turns", "session", session, "error", err)
+		}
 	}
 	// An approval left pending can never be answered: the provider call it was
 	// blocking died with the process that was holding it.
@@ -426,10 +433,12 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	s.mu.RLock()
 	existing := s.ownerControllers[owner]
 	s.mu.RUnlock()
+	replacedStoppedController := false
 	if existing != nil {
 		if existing.State() != ports.ChatControllerStopped {
 			return existing, nil
 		}
+		replacedStoppedController = true
 		// A stopped event can reach the UI before the projector finishes its final
 		// durable cleanup and the registry goroutine releases the entry. Never hand
 		// that dead controller back as a successful resume. Wait for its stream to
@@ -824,9 +833,19 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	// commit instead, so a failed provider connect or callback cannot split the
 	// session owner from the conversation head.
 	generation := strings.TrimSpace(cfg.ControllerGeneration)
-	if generation == "" {
+	if liveReconnect {
+		// Live reconnect attaches to the same provider epoch. Reuse the durable
+		// generation; a legacy row with no generation has nothing to rotate, so
+		// fall back to the caller's reserved value or a fresh one exactly once.
+		if durable := strings.TrimSpace(sessionRecord.Metadata.ControllerGeneration); durable != "" {
+			generation = durable
+		} else if generation == "" {
+			generation = s.newID()
+		}
+	} else if generation == "" {
 		generation = s.newID()
 	}
+	queueRecoveryRequired := false
 	if providerBoundaryID == "" {
 		if owner.Kind == domain.ConversationOwnerReview {
 			claimed, claimErr := s.store.ClaimReviewChatController(ctx, owner.ID, conv.ProviderConversationID(), generation, s.now())
@@ -837,9 +856,44 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 				}
 				return nil, errors.New("reviewer chat controller ownership changed")
 			}
-		} else if err := s.store.ClaimChatControllerGeneration(ctx, cfg.SessionID, generation); err != nil {
-			_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
-			return nil, fmt.Errorf("claim chat controller: %w", err)
+		} else if !liveReconnect {
+			firstOrPreController := queuedBeforeFirstController || preserveUndispatchedQueue
+			// RepairIncompleteConversationEdit can rewrite the durable controller
+			// generation while this Start is opening the conversation. The CAS
+			// compares the value actually on disk now, not the pre-repair read.
+			expectedGeneration := sessionRecord.Metadata.ControllerGeneration
+			if s.sessions != nil {
+				current, found, readErr := s.sessions.GetSession(ctx, cfg.SessionID)
+				if readErr != nil {
+					_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
+					return nil, fmt.Errorf("read chat session before controller claim: %w", readErr)
+				}
+				if !found {
+					_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
+					return nil, ports.ErrSessionNotFound
+				}
+				expectedGeneration = current.Metadata.ControllerGeneration
+			}
+			claim := domain.ChatControllerClaim{
+				SessionID:          cfg.SessionID,
+				ConversationID:     conversation.ID,
+				ExpectedGeneration: expectedGeneration,
+				Generation:         generation,
+				AdoptQueued:        true,
+				// A controller that already stopped in this process must not
+				// reclaim while a durable running turn still exists. Cold recovery
+				// has no live writer (the exclusive data-directory lock proves it)
+				// and settles only running rows before adopting queued ones.
+				SettleRunning:    !firstOrPreController && !replacedStoppedController,
+				RecoveryRequired: !firstOrPreController,
+				Now:              s.now(),
+			}
+			adopted, claimErr := s.store.ClaimChatControllerGenerationAndAdoptQueued(ctx, claim)
+			if claimErr != nil {
+				_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
+				return nil, fmt.Errorf("claim chat controller and adopt queue: %w", claimErr)
+			}
+			queueRecoveryRequired = claim.RecoveryRequired && adopted > 0
 		}
 	}
 	if liveReconnect {
@@ -868,26 +922,29 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	// Whatever the previous controller left in flight is not this controller's, and
 	// it is not evidence that any work finished.
 	//
-	// The graceful path settles this when the event stream ends, but a daemon that
-	// was killed never got there — so on a crash the timeline was left claiming a
-	// turn was still running and a queued message was still waiting to be sent,
-	// behind a controller that no longer existed. Nothing would ever have corrected
-	// it. Settling here covers every way a controller can come up, and is a no-op
-	// for a session that has none of it.
+	// A controller that was killed leaves a running row that is not evidence the
+	// provider work finished. The claim transaction settles that row and adopts
+	// the queued intake behind it; the queued rows are preserved, not failed.
 	//
 	// A session whose first controller this is has no previous controller and so
 	// no orphaned work — only the intake an asynchronous spawn queued ahead of
-	// it. Settling that would fail the user's opening prompt the moment the agent
-	// it was waiting for finally arrived.
+	// it. Settling that would be wrong: the opening prompt is safe, never sent,
+	// and must be adopted rather than failed.
 	if !liveReconnect && cfg.ProviderHandoff == nil &&
 		owner.Kind != domain.ConversationOwnerReview &&
 		!queuedBeforeFirstController && !preserveUndispatchedQueue {
-		s.settleOrphanedWork(ctx, cfg.SessionID, conversation.ID)
+		// The ordinary no-boundary claim already settled running rows atomically
+		// with adoption. A pending provider boundary or an in-process replacement
+		// still needs the explicit running-only settlement here.
+		s.settleOrphanedWork(ctx, cfg.SessionID, conversation.ID, providerBoundaryID != "")
 	}
-	// A fresh generation per launch, so events from the controller this one
-	// replaced can be told apart from the current one's.
+	// A fresh generation for a replacement, so events from the controller this
+	// one replaced can be told apart. Live reconnect reuses the existing epoch.
 	controller := newController(
 		cfg.SessionID, owner, conversation, generation, cfg.Harness, conv, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged, s.reader)
+	// Install the hold before the controller can be published or start its
+	// projector: there is no window in which a restored queue can auto-drain.
+	controller.setQueueRecoveryRequired(queueRecoveryRequired)
 	var commitProviderHistory func(context.Context) error
 	if liveReconnect {
 		providerTurnID := controller.restoreLiveTurnOwnership(liveRows.Turns)
@@ -986,7 +1043,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 					// Settle the retired owner's work in the publication transaction.
 					// A failed replay must leave it untouched; a successful handoff
 					// must not dispatch its queue into an independent native context.
-					if err := s.store.SettleOrphanedTurns(commitCtx, handoff.PreviousSessionID, s.now()); err != nil {
+					if err := s.store.SettleRetiredSessionTurns(commitCtx, handoff.PreviousSessionID, s.now()); err != nil {
 						return err
 					}
 					if err := s.store.FailPendingApprovals(commitCtx, conversation.ID, s.now()); err != nil {
@@ -1534,8 +1591,21 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		delete(s.startConfigs, owner)
 		s.mu.Unlock()
 		var stopErr error
+		// A crash can leave durable queued work behind with no live controller.
+		// Explicit termination still owns that queue and must cancel it durably.
+		if s.store != nil {
+			if conversation, convErr := s.store.ConversationForSession(ctx, id); convErr == nil {
+				if _, recordErr := s.store.RecordStopIntentAndCancelQueued(
+					ctx, conversation.ID, domain.ChatStopReasonSessionTerminated, s.newID(), s.now(),
+				); recordErr != nil {
+					stopErr = errors.Join(stopErr, fmt.Errorf("record terminated chat queue: %w", recordErr))
+				}
+			} else if !errors.Is(convErr, domain.ErrNoConversation) {
+				stopErr = errors.Join(stopErr, fmt.Errorf("read conversation for termination: %w", convErr))
+			}
+		}
 		if s.stopProviderHost != nil {
-			stopErr = s.stopProviderHost(ctx, id)
+			stopErr = errors.Join(stopErr, s.stopProviderHost(ctx, id))
 		}
 		return errors.Join(stopErr, s.clearHibernation(ctx, id))
 	}
@@ -1549,7 +1619,11 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		// Explicit Kill can still retry authenticated shutdown of this owner.
 		hostErr = s.stopProviderHost(ctx, id)
 	}
-	err := errors.Join(hostErr, controller.Terminate(ctx))
+	// Explicit Kill is a user-visible termination even when it retires a failed
+	// hibernation. It must consume any queue that accumulated while shutdown was
+	// retrying; a successful hibernate already refuses to admit queued work.
+	terminateErr := controller.TerminateForStop(ctx, domain.ChatStopReasonSessionTerminated)
+	err := errors.Join(hostErr, terminateErr)
 	if preserved && !hibernating && s.stopProviderHost != nil {
 		// Close may already have retired this handle (for example after a failed
 		// projection). Explicit Stop targets current session ownership under the

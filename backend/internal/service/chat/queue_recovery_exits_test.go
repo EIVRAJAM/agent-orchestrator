@@ -67,7 +67,10 @@ func (s *generationStepStore) arm() {
 	close(s.armed)
 }
 
-func (s *generationStepStore) ClaimChatControllerGeneration(ctx context.Context, id domain.SessionID, generation string) error {
+func (s *generationStepStore) ClaimChatControllerGenerationAndAdoptQueued(
+	ctx context.Context,
+	claim domain.ChatControllerClaim,
+) (int, error) {
 	select {
 	case <-s.armed:
 		s.once.Do(func() {
@@ -76,7 +79,7 @@ func (s *generationStepStore) ClaimChatControllerGeneration(ctx context.Context,
 		})
 	default:
 	}
-	return s.Store.ClaimChatControllerGeneration(ctx, id, generation)
+	return s.Store.ClaimChatControllerGenerationAndAdoptQueued(ctx, claim)
 }
 
 // queueTwoBehindFailingRoot queues two automation turns behind a running root

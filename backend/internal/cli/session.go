@@ -819,7 +819,10 @@ func (c *commandContext) showSessionQueue(ctx context.Context, cmd *cobra.Comman
 			return err
 		}
 	}
-	if (snap.Queue.State == "held_after_terminal_failure" || snap.Queue.State == "held_after_manual_resume") && snap.Queue.HeadTurnID != "" {
+	recoverable := snap.Queue.State == "held_after_terminal_failure" ||
+		snap.Queue.State == "held_after_manual_resume" ||
+		(snap.Queue.State == "controller_recovery_required" && snap.Queue.ControllerAvailable)
+	if recoverable && snap.Queue.HeadTurnID != "" {
 		_, err := fmt.Fprintf(w, "resume with: ao session resume-queue %s --turn %s --generation %s\n",
 			id, snap.Queue.HeadTurnID, snap.Queue.ControllerGeneration)
 		return err

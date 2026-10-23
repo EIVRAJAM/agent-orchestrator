@@ -4941,19 +4941,21 @@ type failFirstQueueCancellationStore struct {
 	calls int
 }
 
-func (s *failFirstQueueCancellationStore) CancelAllQueuedTurns(
+func (s *failFirstQueueCancellationStore) RecordStopIntentAndCancelQueued(
 	ctx context.Context,
 	conversationID string,
+	reason domain.ChatStopReason,
+	episodeID string,
 	now time.Time,
-) error {
+) (domain.ChatStopIntent, error) {
 	s.mu.Lock()
 	s.calls++
 	call := s.calls
 	s.mu.Unlock()
 	if call == 1 {
-		return errors.New("injected queue cancellation failure")
+		return domain.ChatStopIntent{}, errors.New("injected queue cancellation failure")
 	}
-	return s.Store.CancelAllQueuedTurns(ctx, conversationID, now)
+	return s.Store.RecordStopIntentAndCancelQueued(ctx, conversationID, reason, episodeID, now)
 }
 
 func (s *failFirstQueueCancellationStore) callCount() int {
@@ -5471,8 +5473,9 @@ func TestServiceLiveReconnectKeepsDurableRunningTurnBusy(t *testing.T) {
 	if after.Activity != before.Activity || !after.UpdatedAt.Equal(before.UpdatedAt) {
 		t.Fatalf("reconnect changed activity/recency: before=%+v after=%+v", before, after)
 	}
-	if after.Metadata.ControllerGeneration == before.Metadata.ControllerGeneration {
-		t.Fatal("generation did not rotate")
+	if after.Metadata.ControllerGeneration != before.Metadata.ControllerGeneration {
+		t.Fatalf("live reconnect rotated generation %q -> %q; same provider epoch must be reused",
+			before.Metadata.ControllerGeneration, after.Metadata.ControllerGeneration)
 	}
 	// ACP adapters emit their initialized ready state before live reconnect
 	// restores ownership of the durable turn. The queued notification is stale
@@ -6428,20 +6431,24 @@ func testStartSettlesWorkLeftByAKilledController(t *testing.T, queuedOnly bool) 
 	}
 
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		for _, turn := range s.Turns {
-			if !turn.State.Terminal() {
-				return false
-			}
-		}
-		return len(s.Turns) == 2
+		states := turnStateByText(t, s)
+		return len(s.Turns) == 2 &&
+			states["running"] == domain.TurnStateFailed &&
+			states["queued"] == domain.TurnStateQueued
 	})
 	states := turnStateByText(t, snapshot)
 	if states["running"] != domain.TurnStateFailed {
 		t.Errorf("turn abandoned mid-flight = %q, want failed", states["running"])
 	}
-	if states["queued"] != domain.TurnStateFailed {
-		t.Errorf("message left queued by a dead controller = %q; nothing would ever send it",
+	if states["queued"] != domain.TurnStateQueued {
+		t.Errorf("message left queued by a dead controller = %q; safe work must survive",
 			states["queued"])
+	}
+	facts, factsErr := h.st.ConversationQueueFacts(ctx, h.ctrl.ConversationID())
+	if factsErr != nil {
+		t.Errorf("queue facts after restart: %v", factsErr)
+	} else if !facts.QueueRecoveryRequired || facts.PendingCount != 1 {
+		t.Errorf("queue facts after restart = %+v, want a held queued head", facts)
 	}
 	if got := snapshot.Activities[0].Status; got == domain.ActivityStatusPending {
 		t.Error("approval left pending by a dead controller; the user can never answer it")
