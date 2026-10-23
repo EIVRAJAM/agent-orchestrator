@@ -1611,10 +1611,10 @@ func terminalActivityStatus(state domain.TurnState) domain.ActivityStatus {
 	}
 }
 
-// SettleOrphanedTurns marks anything a dead controller left in flight. A turn the
-// controller was running is not evidence the work finished, so it settles as
-// failed rather than silently completing.
-func (s *Store) SettleOrphanedTurns(ctx context.Context, session domain.SessionID, now time.Time) error {
+// SettleOrphanedRunningTurns marks anything a dead controller left running.
+// Queued turns never crossed the provider boundary and are deliberately
+// preserved: they are the durable evidence that the user's work is still safe.
+func (s *Store) SettleOrphanedRunningTurns(ctx context.Context, session domain.SessionID, now time.Time) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
 	if err := q.FailOrphanedConversationActivities(ctx,
@@ -1624,12 +1624,27 @@ func (s *Store) SettleOrphanedTurns(ctx context.Context, session domain.SessionI
 		}); err != nil {
 		return fmt.Errorf("settle orphaned activities for %s: %w", session, err)
 	}
-	if err := q.SettleOrphanedConversationTurns(ctx,
-		gen.SettleOrphanedConversationTurnsParams{
+	if err := q.SettleOrphanedRunningTurns(ctx,
+		gen.SettleOrphanedRunningTurnsParams{
 			CompletedAt:        sql.NullTime{Time: now, Valid: true},
 			HandledBySessionID: session,
 		}); err != nil {
-		return fmt.Errorf("settle orphaned turns for %s: %w", session, err)
+		return fmt.Errorf("settle orphaned running turns for %s: %w", session, err)
+	}
+	return nil
+}
+
+// SettleRetiredSessionTurns settles both queued and running work for a session
+// that an explicit native provider handoff retires. The predecessor's queue
+// cannot cross into the target provider's independent context.
+func (s *Store) SettleRetiredSessionTurns(ctx context.Context, session domain.SessionID, now time.Time) error {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	if err := q.SettleRetiredConversationTurns(ctx, gen.SettleRetiredConversationTurnsParams{
+		CompletedAt:        sql.NullTime{Time: now, Valid: true},
+		HandledBySessionID: session,
+	}); err != nil {
+		return fmt.Errorf("settle retired session turns for %s: %w", session, err)
 	}
 	return nil
 }
@@ -1658,6 +1673,107 @@ func (s *Store) SettleUnboundRunningTurn(ctx context.Context, conversationID str
 	return nil
 }
 
+// ClaimChatControllerGenerationAndAdoptQueued atomically claims a new controller
+// generation and adopts the queued turns that belong to the same session and
+// conversation. It runs with BEGIN IMMEDIATE so the generation CAS, the
+// running-turn precondition/settlement, the queue row high-water cutoff and the
+// adoption all observe one durable state.
+//
+// SettleRunning is only for cold recovery: a replacement whose predecessor is
+// still running must receive ErrChatControllerRunningTurn and leave every row
+// untouched. Queued rows are never moved back from running, and only queued rows
+// are adopted.
+func (s *Store) ClaimChatControllerGenerationAndAdoptQueued(
+	ctx context.Context,
+	claim domain.ChatControllerClaim,
+) (adopted int, err error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	err = s.inImmediateTx(ctx, "claim chat controller generation and adopt queued turns", func(q *gen.Queries) error {
+		session, readErr := q.GetSession(ctx, claim.SessionID)
+		if errors.Is(readErr, sql.ErrNoRows) {
+			return fmt.Errorf("%w: session %s not found", domain.ErrChatControllerGenerationChanged, claim.SessionID)
+		}
+		if readErr != nil {
+			return fmt.Errorf("read session %s for controller claim: %w", claim.SessionID, readErr)
+		}
+		if session.IsTerminated {
+			return fmt.Errorf("%w: %s", domain.ErrChatControllerSessionTerminated, claim.SessionID)
+		}
+		if session.ControllerGeneration != claim.ExpectedGeneration {
+			return fmt.Errorf("%w: expected %q, found %q",
+				domain.ErrChatControllerGenerationChanged,
+				claim.ExpectedGeneration, session.ControllerGeneration)
+		}
+
+		running, countErr := q.CountRunningConversationTurnsForSession(ctx,
+			gen.CountRunningConversationTurnsForSessionParams{
+				ConversationID:     claim.ConversationID,
+				HandledBySessionID: claim.SessionID,
+			})
+		if countErr != nil {
+			return fmt.Errorf("count running turns before controller claim: %w", countErr)
+		}
+		if running > 0 && !claim.SettleRunning {
+			return fmt.Errorf("%w: %d running turn(s) in %s",
+				domain.ErrChatControllerRunningTurn, running, claim.ConversationID)
+		}
+		if claim.SettleRunning {
+			if err := q.FailOrphanedConversationActivitiesForConversation(ctx,
+				gen.FailOrphanedConversationActivitiesForConversationParams{
+					UpdatedAt: claim.Now, ConversationID: claim.ConversationID,
+				}); err != nil {
+				return fmt.Errorf("fail orphaned activities before adoption: %w", err)
+			}
+			if err := q.SettleOrphanedRunningTurnsForConversation(ctx,
+				gen.SettleOrphanedRunningTurnsForConversationParams{
+					CompletedAt:    sql.NullTime{Time: claim.Now, Valid: true},
+					ConversationID: claim.ConversationID,
+				}); err != nil {
+				return fmt.Errorf("settle orphaned running turns before adoption: %w", err)
+			}
+		}
+
+		rows, claimErr := q.ClaimChatControllerGenerationCAS(ctx,
+			gen.ClaimChatControllerGenerationCASParams{
+				ControllerGeneration:         claim.Generation,
+				ID:                           claim.SessionID,
+				ExpectedControllerGeneration: claim.ExpectedGeneration,
+			})
+		if claimErr != nil {
+			return fmt.Errorf("claim controller generation for %s: %w", claim.SessionID, claimErr)
+		}
+		if rows != 1 {
+			return fmt.Errorf("%w: %s changed during claim",
+				domain.ErrChatControllerGenerationChanged, claim.SessionID)
+		}
+
+		if claim.AdoptQueued {
+			adoptedRows, claimErr := q.AdoptQueuedConversationTurnsForController(ctx,
+				gen.AdoptQueuedConversationTurnsForControllerParams{
+					ControllerGeneration: claim.Generation,
+					ConversationID:       claim.ConversationID,
+					HandledBySessionID:   claim.SessionID,
+				})
+			if claimErr != nil {
+				return fmt.Errorf("adopt queued turns for %s: %w", claim.ConversationID, claimErr)
+			}
+			adopted = int(adoptedRows)
+			if adopted > 0 && claim.RecoveryRequired {
+				if err := q.SetConversationQueueRecoveryRequired(ctx, claim.ConversationID); err != nil {
+					return fmt.Errorf("record queue recovery hold for %s: %w", claim.ConversationID, err)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return adopted, nil
+}
+
 // CleanupOwnedControllerWork settles work only when the closing controller still
 // owns its session generation. Branch/interface handoffs start the replacement
 // before closing the source, so an unconditional stream-end cleanup would
@@ -1666,9 +1782,9 @@ func (s *Store) SettleUnboundRunningTurn(ctx context.Context, conversationID str
 // therefore scoped through turns handled by this session, not current ownership
 // of the conversation.
 //
-// Startup deliberately uses SettleOrphanedTurns and FailPending* directly: no
-// controller owns the abandoned generation then, and that repair must remain
-// unconditional.
+// Startup deliberately uses SettleOrphanedRunningTurns and FailPending*
+// directly: no controller owns the abandoned generation then, and that repair
+// must remain unconditional while queued rows stay preserved.
 func (s *Store) CleanupOwnedControllerWork(
 	ctx context.Context,
 	session domain.SessionID,
@@ -1711,12 +1827,12 @@ func cleanupOwnedControllerWork(
 		}); err != nil {
 		return false, fmt.Errorf("settle orphaned activities for %s: %w", session, err)
 	}
-	if err := q.SettleOrphanedConversationTurns(ctx,
-		gen.SettleOrphanedConversationTurnsParams{
+	if err := q.SettleOrphanedRunningTurns(ctx,
+		gen.SettleOrphanedRunningTurnsParams{
 			CompletedAt:        sql.NullTime{Time: now, Valid: true},
 			HandledBySessionID: session,
 		}); err != nil {
-		return false, fmt.Errorf("settle orphaned turns for %s: %w", session, err)
+		return false, fmt.Errorf("settle orphaned running turns for %s: %w", session, err)
 	}
 	if err := q.FailPendingConversationRequestsForSession(ctx,
 		gen.FailPendingConversationRequestsForSessionParams{
@@ -2292,12 +2408,24 @@ func (s *Store) ConversationQueueFacts(ctx context.Context, conversationID strin
 		return domain.ConversationQueueFacts{}, fmt.Errorf("select conversation queue facts for %s: %w", conversationID, err)
 	}
 	return domain.ConversationQueueFacts{
-		PendingCount:        int(row.PendingCount),
-		RunningCount:        int(row.RunningCount),
-		RunningUnboundCount: int(row.RunningUnboundCount),
-		ActiveTurnID:        row.ActiveTurnID,
-		LatestTerminalState: domain.TurnState(row.LatestTerminalState),
+		PendingCount:          int(row.PendingCount),
+		RunningCount:          int(row.RunningCount),
+		RunningUnboundCount:   int(row.RunningUnboundCount),
+		ActiveTurnID:          row.ActiveTurnID,
+		LatestTerminalState:   domain.TurnState(row.LatestTerminalState),
+		QueueRecoveryRequired: row.QueueRecoveryRequired != 0,
 	}, nil
+}
+
+// ClearChatQueueRecovery drops the manual-resume hold when no queued work
+// remains. It never cancels or dispatches a turn.
+func (s *Store) ClearChatQueueRecovery(ctx context.Context, conversationID string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.qw.ClearConversationQueueRecoveryIfEmpty(ctx, conversationID); err != nil {
+		return fmt.Errorf("clear queue recovery for %s: %w", conversationID, err)
+	}
+	return nil
 }
 
 // ClaimQueuedTurnForResume atomically promotes one exact queued turn to running
@@ -2422,6 +2550,59 @@ func (s *Store) CompleteQueuedTurnPromotion(
 	})
 }
 
+// RecordStopIntentAndCancelQueued records one durable Stop episode and cancels
+// exactly the queued rows that existed when it began. Both writes run under
+// BEGIN IMMEDIATE, so a crash before commit leaves neither an intent nor a
+// partial cancellation.
+func (s *Store) RecordStopIntentAndCancelQueued(
+	ctx context.Context,
+	conversationID string,
+	reason domain.ChatStopReason,
+	episodeID string,
+	now time.Time,
+) (domain.ChatStopIntent, error) {
+	if !reason.Valid() {
+		return domain.ChatStopIntent{}, fmt.Errorf("invalid chat stop reason %q", reason)
+	}
+	if episodeID == "" {
+		return domain.ChatStopIntent{}, errors.New("chat stop episode id is required")
+	}
+	intent := domain.ChatStopIntent{Reason: reason, EpisodeID: episodeID, IntentAt: now}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	err := s.inImmediateTx(ctx, "record chat stop intent and cancel queued turns", func(q *gen.Queries) error {
+		cutoff, err := q.SelectMaxQueuedConversationTurnRowID(ctx, conversationID)
+		if err != nil {
+			return fmt.Errorf("read queue cutoff for %s: %w", conversationID, err)
+		}
+		intent.CutoffRowID = cutoff
+		if err := q.RecordConversationStopIntent(ctx, gen.RecordConversationStopIntentParams{
+			StopReason:      string(reason),
+			StopEpisodeID:   episodeID,
+			StopIntentAt:    sql.NullTime{Time: now, Valid: true},
+			StopCutoffRowid: cutoff,
+			ID:              conversationID,
+		}); err != nil {
+			return fmt.Errorf("record stop intent for %s: %w", conversationID, err)
+		}
+		cancelled, err := q.CancelQueuedConversationTurnsThroughRowID(ctx,
+			gen.CancelQueuedConversationTurnsThroughRowIDParams{
+				CompletedAt:    sql.NullTime{Time: now, Valid: true},
+				ConversationID: conversationID,
+				CutoffRowid:    cutoff,
+			})
+		if err != nil {
+			return fmt.Errorf("cancel queued turns through %d for %s: %w", cutoff, conversationID, err)
+		}
+		intent.CancelledRows = cancelled
+		return nil
+	})
+	if err != nil {
+		return domain.ChatStopIntent{}, err
+	}
+	return intent, nil
+}
+
 // CancelQueuedTurns closes out everything queued at or before cutoff.
 //
 // They settle as interrupted rather than failed: nothing went wrong, the user
@@ -2434,14 +2615,19 @@ func (s *Store) CancelQueuedTurns(
 ) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if err := s.qw.CancelQueuedConversationTurns(ctx, gen.CancelQueuedConversationTurnsParams{
-		CompletedAt:    sql.NullTime{Time: now, Valid: true},
-		ConversationID: conversationID,
-		RequestedAt:    cutoff,
-	}); err != nil {
-		return fmt.Errorf("cancel queued turns for %s: %w", conversationID, err)
-	}
-	return nil
+	return s.inTx(ctx, "cancel queued turns", func(q *gen.Queries) error {
+		if err := q.CancelQueuedConversationTurns(ctx, gen.CancelQueuedConversationTurnsParams{
+			CompletedAt:    sql.NullTime{Time: now, Valid: true},
+			ConversationID: conversationID,
+			RequestedAt:    cutoff,
+		}); err != nil {
+			return fmt.Errorf("cancel queued turns for %s: %w", conversationID, err)
+		}
+		if err := q.ClearConversationQueueRecoveryIfEmpty(ctx, conversationID); err != nil {
+			return fmt.Errorf("clear queue recovery for %s: %w", conversationID, err)
+		}
+		return nil
+	})
 }
 
 // CancelAllQueuedTurns closes the whole durable queue after an interface
@@ -2454,13 +2640,18 @@ func (s *Store) CancelAllQueuedTurns(
 ) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	if err := s.qw.CancelAllQueuedConversationTurns(ctx, gen.CancelAllQueuedConversationTurnsParams{
-		CompletedAt:    sql.NullTime{Time: now, Valid: true},
-		ConversationID: conversationID,
-	}); err != nil {
-		return fmt.Errorf("cancel all queued turns for %s: %w", conversationID, err)
-	}
-	return nil
+	return s.inTx(ctx, "cancel all queued turns", func(q *gen.Queries) error {
+		if err := q.CancelAllQueuedConversationTurns(ctx, gen.CancelAllQueuedConversationTurnsParams{
+			CompletedAt:    sql.NullTime{Time: now, Valid: true},
+			ConversationID: conversationID,
+		}); err != nil {
+			return fmt.Errorf("cancel all queued turns for %s: %w", conversationID, err)
+		}
+		if err := q.ClearConversationQueueRecoveryIfEmpty(ctx, conversationID); err != nil {
+			return fmt.Errorf("clear queue recovery for %s: %w", conversationID, err)
+		}
+		return nil
+	})
 }
 
 // CancelQueuedTurnByID removes one undispatched queue item without disturbing
@@ -2472,19 +2663,24 @@ func (s *Store) CancelQueuedTurnByID(
 ) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	rows, err := s.qw.CancelQueuedConversationTurnByID(ctx,
-		gen.CancelQueuedConversationTurnByIDParams{
-			CompletedAt:    sql.NullTime{Time: now, Valid: true},
-			ID:             turnID,
-			ConversationID: conversationID,
-		})
-	if err != nil {
-		return fmt.Errorf("cancel queued turn %s: %w", turnID, err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("%w: %s", ErrQueuedTurnNotAvailable, turnID)
-	}
-	return nil
+	return s.inTx(ctx, "cancel queued turn", func(q *gen.Queries) error {
+		rows, err := q.CancelQueuedConversationTurnByID(ctx,
+			gen.CancelQueuedConversationTurnByIDParams{
+				CompletedAt:    sql.NullTime{Time: now, Valid: true},
+				ID:             turnID,
+				ConversationID: conversationID,
+			})
+		if err != nil {
+			return fmt.Errorf("cancel queued turn %s: %w", turnID, err)
+		}
+		if rows == 0 {
+			return fmt.Errorf("%w: %s", ErrQueuedTurnNotAvailable, turnID)
+		}
+		if err := q.ClearConversationQueueRecoveryIfEmpty(ctx, conversationID); err != nil {
+			return fmt.Errorf("clear queue recovery for %s: %w", conversationID, err)
+		}
+		return nil
+	})
 }
 
 // ErrInvalidQueuedTurnOrder means the requested queue order does not match the

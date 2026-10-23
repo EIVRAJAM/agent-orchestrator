@@ -695,8 +695,9 @@ WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   AND kind = 'plan';
 
 -- The same invariant applies when startup discovers work abandoned by a dead
--- controller. This runs before SettleOrphanedConversationTurns while their turn
--- states still identify the affected rows.
+-- controller. This runs before SettleOrphanedRunningTurns while their turn
+-- states still identify the affected rows. Queued turns have no running
+-- activity: they never crossed the provider boundary.
 -- name: FailOrphanedConversationActivities :exec
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
@@ -704,16 +705,50 @@ WHERE status = 'running'
   AND turn_id IN (
       SELECT id FROM conversation_turns
       WHERE handled_by_session_id = sqlc.arg(handled_by_session_id)
-        AND state IN ('queued', 'running')
+        AND state = 'running'
   );
 
 -- Restart reconciliation: a turn left running by a dead controller is not
 -- evidence the work finished, so it is settled honestly rather than silently
--- completed.
--- name: SettleOrphanedConversationTurns :exec
+-- completed. Queued rows are deliberately absent: they never crossed the
+-- provider boundary and are durable evidence that the work is still safe.
+-- name: SettleOrphanedRunningTurns :exec
 UPDATE conversation_turns
 SET state = 'failed',
     error_message = 'controller ended before the turn completed',
+    completed_at = ?
+WHERE handled_by_session_id = ? AND state = 'running';
+
+-- Controller claim is conversation-scoped: an unrelated project/session
+-- conversation handled by the same session must not be settled by this
+-- replacement.
+-- name: FailOrphanedConversationActivitiesForConversation :exec
+UPDATE conversation_activities
+SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND status = 'running'
+  AND turn_id IN (
+      SELECT id FROM conversation_turns
+      WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+        AND conversation_turns.state = 'running'
+  );
+
+-- name: SettleOrphanedRunningTurnsForConversation :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'controller ended before the turn completed',
+    completed_at = sqlc.arg(completed_at)
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'running';
+
+-- A native provider handoff retires the predecessor session and continues in a
+-- different provider context. Its queued rows cannot be replayed into that
+-- context, so this explicit handoff policy settles the whole accepted set. This
+-- is deliberately not used by crash/restart reconciliation.
+-- name: SettleRetiredConversationTurns :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'session was retired during provider handoff',
     completed_at = ?
 WHERE handled_by_session_id = ? AND state IN ('queued', 'running');
 
@@ -816,6 +851,86 @@ WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
         AND lineage_activity.sequence <= path.max_sequence
   ))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
+
+-- A replacement controller may only adopt queued rows after proving there is no
+-- running turn in this conversation. This is the NOT EXISTS precondition the
+-- claim transaction evaluates under its single writer lock.
+-- name: CountRunningConversationTurnsForSession :one
+SELECT CAST(COUNT(*) AS INTEGER) AS running_count
+FROM conversation_turns
+WHERE conversation_id = sqlc.arg(conversation_id)
+  AND handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND handled_by_review_id IS NULL
+  AND state = 'running'
+  AND rolled_back_at IS NULL;
+
+-- Claim queued turns for the new controller generation without changing their
+-- identity, requested_at, rowid ordering, promotion or rollback facts. Rows
+-- created concurrently after the claim are excluded by the rowid high-water
+-- mark, and rows deliberately cancelled by an earlier Stop are excluded by its
+-- durable cutoff. The caller runs this inside the same transaction as the
+-- generation CAS.
+-- name: AdoptQueuedConversationTurnsForController :execrows
+UPDATE conversation_turns
+SET controller_generation = sqlc.arg(controller_generation)
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND conversation_turns.handled_by_review_id IS NULL
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.rowid > COALESCE((
+      SELECT conversations.stop_cutoff_rowid FROM conversations
+      WHERE conversations.id = sqlc.arg(conversation_id)
+  ), 0)
+  AND conversation_turns.rowid <= COALESCE((
+      SELECT MAX(conversation_turns.rowid) FROM conversation_turns
+      WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  ), 0);
+
+-- The durable recovery hold is set only when queued turns were actually
+-- adopted. It is not a scheduler or a retry budget; it exists so a restart
+-- cannot auto-drain work that must be released explicitly.
+-- name: SetConversationQueueRecoveryRequired :exec
+UPDATE conversations
+SET queue_recovery_required = 1
+WHERE id = sqlc.arg(id);
+
+-- Clear the hold when a cancellation or explicit resume leaves no queued work.
+-- name: ClearConversationQueueRecoveryIfEmpty :exec
+UPDATE conversations
+SET queue_recovery_required = 0
+WHERE conversations.id = sqlc.arg(id)
+  AND NOT EXISTS (
+      SELECT 1 FROM conversation_turns
+      WHERE conversation_turns.conversation_id = sqlc.arg(id)
+        AND conversation_turns.state = 'queued'
+  );
+
+-- Stop is a durable episode. The cutoff is the max queued rowid observed inside
+-- the same IMMEDIATE transaction that cancels rows through it; rows inserted
+-- after the cutoff are post-Stop work and survive.
+-- name: SelectMaxQueuedConversationTurnRowID :one
+SELECT CAST(COALESCE(MAX(rowid), 0) AS INTEGER) AS cutoff_rowid
+FROM conversation_turns
+WHERE conversation_id = sqlc.arg(conversation_id)
+  AND state = 'queued';
+
+-- name: RecordConversationStopIntent :exec
+UPDATE conversations
+SET stop_reason = sqlc.arg(stop_reason),
+    stop_episode_id = sqlc.arg(stop_episode_id),
+    stop_intent_at = sqlc.arg(stop_intent_at),
+    stop_cutoff_rowid = sqlc.arg(stop_cutoff_rowid),
+    queue_recovery_required = 0
+WHERE id = sqlc.arg(id);
+
+-- name: CancelQueuedConversationTurnsThroughRowID :execrows
+UPDATE conversation_turns
+SET state = 'interrupted', completed_at = sqlc.arg(completed_at)
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.rowid <= CAST(sqlc.arg(cutoff_rowid) AS INTEGER);
 
 -- Overwrite the turn's changed-file summary. The provider re-sends the whole diff
 -- on every update, so the latest payload is the complete answer and there is
@@ -1133,7 +1248,9 @@ SELECT
         WHERE t.conversation_id = sqlc.arg(conversation_id)
           AND t.rolled_back_at IS NULL
           AND t.state IN ('completed','recovered','interrupted','failed','cancelled')
-        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state;
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state,
+    CAST(COALESCE((SELECT c.queue_recovery_required FROM conversations AS c
+        WHERE c.id = sqlc.arg(conversation_id)), 0) AS INTEGER) AS queue_recovery_required;
 
 -- Claim one selected queue item before contacting the provider. execrows is the
 -- compare-and-set result: zero means the turn is absent, settled, or already being

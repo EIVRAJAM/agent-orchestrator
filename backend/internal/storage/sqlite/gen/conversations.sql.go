@@ -154,6 +154,45 @@ func (q *Queries) AdoptProviderConversationTurn(ctx context.Context, arg AdoptPr
 	return err
 }
 
+const adoptQueuedConversationTurnsForController = `-- name: AdoptQueuedConversationTurnsForController :execrows
+UPDATE conversation_turns
+SET controller_generation = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.handled_by_session_id = ?3
+  AND conversation_turns.handled_by_review_id IS NULL
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.rowid > COALESCE((
+      SELECT conversations.stop_cutoff_rowid FROM conversations
+      WHERE conversations.id = ?2
+  ), 0)
+  AND conversation_turns.rowid <= COALESCE((
+      SELECT MAX(conversation_turns.rowid) FROM conversation_turns
+      WHERE conversation_turns.conversation_id = ?2
+  ), 0)
+`
+
+type AdoptQueuedConversationTurnsForControllerParams struct {
+	ControllerGeneration string
+	ConversationID       string
+	HandledBySessionID   domain.SessionID
+}
+
+// Claim queued turns for the new controller generation without changing their
+// identity, requested_at, rowid ordering, promotion or rollback facts. Rows
+// created concurrently after the claim are excluded by the rowid high-water
+// mark, and rows deliberately cancelled by an earlier Stop are excluded by its
+// durable cutoff. The caller runs this inside the same transaction as the
+// generation CAS.
+func (q *Queries) AdoptQueuedConversationTurnsForController(ctx context.Context, arg AdoptQueuedConversationTurnsForControllerParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, adoptQueuedConversationTurnsForController, arg.ControllerGeneration, arg.ConversationID, arg.HandledBySessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const adoptReviewProviderConversationTurn = `-- name: AdoptReviewProviderConversationTurn :exec
 INSERT OR IGNORE INTO conversation_turns (
     id, conversation_id, handled_by_session_id, handled_by_review_id,
@@ -533,6 +572,28 @@ func (q *Queries) CancelQueuedConversationTurns(ctx context.Context, arg CancelQ
 	return err
 }
 
+const cancelQueuedConversationTurnsThroughRowID = `-- name: CancelQueuedConversationTurnsThroughRowID :execrows
+UPDATE conversation_turns
+SET state = 'interrupted', completed_at = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.rowid <= CAST(?3 AS INTEGER)
+`
+
+type CancelQueuedConversationTurnsThroughRowIDParams struct {
+	CompletedAt    sql.NullTime
+	ConversationID string
+	CutoffRowid    int64
+}
+
+func (q *Queries) CancelQueuedConversationTurnsThroughRowID(ctx context.Context, arg CancelQueuedConversationTurnsThroughRowIDParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, cancelQueuedConversationTurnsThroughRowID, arg.CompletedAt, arg.ConversationID, arg.CutoffRowid)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const claimQueuedConversationTurnForResume = `-- name: ClaimQueuedConversationTurnForResume :execrows
 UPDATE conversation_turns
 SET state = 'running',
@@ -589,6 +650,23 @@ func (q *Queries) ClaimQueuedConversationTurnForResume(ctx context.Context, arg 
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const clearConversationQueueRecoveryIfEmpty = `-- name: ClearConversationQueueRecoveryIfEmpty :exec
+UPDATE conversations
+SET queue_recovery_required = 0
+WHERE conversations.id = ?1
+  AND NOT EXISTS (
+      SELECT 1 FROM conversation_turns
+      WHERE conversation_turns.conversation_id = ?1
+        AND conversation_turns.state = 'queued'
+  )
+`
+
+// Clear the hold when a cancellation or explicit resume leaves no queued work.
+func (q *Queries) ClearConversationQueueRecoveryIfEmpty(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, clearConversationQueueRecoveryIfEmpty, id)
+	return err
 }
 
 const completeQueuedConversationTurnPromotion = `-- name: CompleteQueuedConversationTurnPromotion :execrows
@@ -651,6 +729,31 @@ func (q *Queries) ConversationActivityExistsForProviderItem(ctx context.Context,
 	return exists, err
 }
 
+const countRunningConversationTurnsForSession = `-- name: CountRunningConversationTurnsForSession :one
+SELECT CAST(COUNT(*) AS INTEGER) AS running_count
+FROM conversation_turns
+WHERE conversation_id = ?1
+  AND handled_by_session_id = ?2
+  AND handled_by_review_id IS NULL
+  AND state = 'running'
+  AND rolled_back_at IS NULL
+`
+
+type CountRunningConversationTurnsForSessionParams struct {
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+}
+
+// A replacement controller may only adopt queued rows after proving there is no
+// running turn in this conversation. This is the NOT EXISTS precondition the
+// claim transaction evaluates under its single writer lock.
+func (q *Queries) CountRunningConversationTurnsForSession(ctx context.Context, arg CountRunningConversationTurnsForSessionParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunningConversationTurnsForSession, arg.ConversationID, arg.HandledBySessionID)
+	var running_count int64
+	err := row.Scan(&running_count)
+	return running_count, err
+}
+
 const detachSessionConversation = `-- name: DetachSessionConversation :exec
 UPDATE conversations SET current_session_id = NULL, updated_at = ?
 WHERE id = ? AND scope = 'session' AND current_session_id = ?
@@ -674,7 +777,7 @@ WHERE status = 'running'
   AND turn_id IN (
       SELECT id FROM conversation_turns
       WHERE handled_by_session_id = ?2
-        AND state IN ('queued', 'running')
+        AND state = 'running'
   )
 `
 
@@ -684,10 +787,36 @@ type FailOrphanedConversationActivitiesParams struct {
 }
 
 // The same invariant applies when startup discovers work abandoned by a dead
-// controller. This runs before SettleOrphanedConversationTurns while their turn
-// states still identify the affected rows.
+// controller. This runs before SettleOrphanedRunningTurns while their turn
+// states still identify the affected rows. Queued turns have no running
+// activity: they never crossed the provider boundary.
 func (q *Queries) FailOrphanedConversationActivities(ctx context.Context, arg FailOrphanedConversationActivitiesParams) error {
 	_, err := q.db.ExecContext(ctx, failOrphanedConversationActivities, arg.UpdatedAt, arg.HandledBySessionID)
+	return err
+}
+
+const failOrphanedConversationActivitiesForConversation = `-- name: FailOrphanedConversationActivitiesForConversation :exec
+UPDATE conversation_activities
+SET status = 'failed', revision = revision + 1, updated_at = ?1
+WHERE conversation_activities.conversation_id = ?2
+  AND status = 'running'
+  AND turn_id IN (
+      SELECT id FROM conversation_turns
+      WHERE conversation_turns.conversation_id = ?2
+        AND conversation_turns.state = 'running'
+  )
+`
+
+type FailOrphanedConversationActivitiesForConversationParams struct {
+	UpdatedAt      time.Time
+	ConversationID string
+}
+
+// Controller claim is conversation-scoped: an unrelated project/session
+// conversation handled by the same session must not be settled by this
+// replacement.
+func (q *Queries) FailOrphanedConversationActivitiesForConversation(ctx context.Context, arg FailOrphanedConversationActivitiesForConversationParams) error {
+	_, err := q.db.ExecContext(ctx, failOrphanedConversationActivitiesForConversation, arg.UpdatedAt, arg.ConversationID)
 	return err
 }
 
@@ -1745,6 +1874,35 @@ func (q *Queries) RecomputeConversationCompactedAt(ctx context.Context, arg Reco
 	return err
 }
 
+const recordConversationStopIntent = `-- name: RecordConversationStopIntent :exec
+UPDATE conversations
+SET stop_reason = ?1,
+    stop_episode_id = ?2,
+    stop_intent_at = ?3,
+    stop_cutoff_rowid = ?4,
+    queue_recovery_required = 0
+WHERE id = ?5
+`
+
+type RecordConversationStopIntentParams struct {
+	StopReason      string
+	StopEpisodeID   string
+	StopIntentAt    sql.NullTime
+	StopCutoffRowid int64
+	ID              string
+}
+
+func (q *Queries) RecordConversationStopIntent(ctx context.Context, arg RecordConversationStopIntentParams) error {
+	_, err := q.db.ExecContext(ctx, recordConversationStopIntent,
+		arg.StopReason,
+		arg.StopEpisodeID,
+		arg.StopIntentAt,
+		arg.StopCutoffRowid,
+		arg.ID,
+	)
+	return err
+}
+
 const rejectConversationEditDelivery = `-- name: RejectConversationEditDelivery :execrows
 UPDATE conversation_edit_deliveries
 SET state = 'rejected',
@@ -2416,7 +2574,7 @@ func (q *Queries) SelectConversationBranches(ctx context.Context, conversationID
 }
 
 const selectConversationByID = `-- name: SelectConversationByID :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE id = ? LIMIT 1
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE id = ? LIMIT 1
 `
 
 func (q *Queries) SelectConversationByID(ctx context.Context, id string) (Conversation, error) {
@@ -2458,12 +2616,17 @@ func (q *Queries) SelectConversationByID(ctx context.Context, id string) (Conver
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
 
 const selectConversationByReview = `-- name: SelectConversationByReview :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE current_review_id = ? LIMIT 1
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE current_review_id = ? LIMIT 1
 `
 
 func (q *Queries) SelectConversationByReview(ctx context.Context, currentReviewID sql.NullString) (Conversation, error) {
@@ -2505,12 +2668,17 @@ func (q *Queries) SelectConversationByReview(ctx context.Context, currentReviewI
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
 
 const selectConversationBySession = `-- name: SelectConversationBySession :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE current_session_id = ?
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE current_session_id = ?
 ORDER BY scope = 'project' DESC, created_at DESC, id DESC
 LIMIT 1
 `
@@ -2558,6 +2726,11 @@ func (q *Queries) SelectConversationBySession(ctx context.Context, currentSessio
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
@@ -3200,15 +3373,18 @@ SELECT
         WHERE t.conversation_id = ?1
           AND t.rolled_back_at IS NULL
           AND t.state IN ('completed','recovered','interrupted','failed','cancelled')
-        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state,
+    CAST(COALESCE((SELECT c.queue_recovery_required FROM conversations AS c
+        WHERE c.id = ?1), 0) AS INTEGER) AS queue_recovery_required
 `
 
 type SelectConversationQueueFactsRow struct {
-	PendingCount        int64
-	RunningCount        int64
-	RunningUnboundCount int64
-	ActiveTurnID        string
-	LatestTerminalState string
+	PendingCount          int64
+	RunningCount          int64
+	RunningUnboundCount   int64
+	ActiveTurnID          string
+	LatestTerminalState   string
+	QueueRecoveryRequired int64
 }
 
 // Aggregate, window-independent facts for the derived observable queue view.
@@ -3231,6 +3407,7 @@ func (q *Queries) SelectConversationQueueFacts(ctx context.Context, conversation
 		&i.RunningUnboundCount,
 		&i.ActiveTurnID,
 		&i.LatestTerminalState,
+		&i.QueueRecoveryRequired,
 	)
 	return i, err
 }
@@ -3721,6 +3898,23 @@ func (q *Queries) SelectLatestConversationTurn(ctx context.Context, conversation
 	return i, err
 }
 
+const selectMaxQueuedConversationTurnRowID = `-- name: SelectMaxQueuedConversationTurnRowID :one
+SELECT CAST(COALESCE(MAX(rowid), 0) AS INTEGER) AS cutoff_rowid
+FROM conversation_turns
+WHERE conversation_id = ?1
+  AND state = 'queued'
+`
+
+// Stop is a durable episode. The cutoff is the max queued rowid observed inside
+// the same IMMEDIATE transaction that cancels rows through it; rows inserted
+// after the cutoff are post-Stop work and survive.
+func (q *Queries) SelectMaxQueuedConversationTurnRowID(ctx context.Context, conversationID string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, selectMaxQueuedConversationTurnRowID, conversationID)
+	var cutoff_rowid int64
+	err := row.Scan(&cutoff_rowid)
+	return cutoff_rowid, err
+}
+
 const selectNextQueuedConversationTurn = `-- name: SelectNextQueuedConversationTurn :one
 SELECT conversation_turns.id,
        conversation_messages.text,
@@ -3769,7 +3963,7 @@ func (q *Queries) SelectNextQueuedConversationTurn(ctx context.Context, conversa
 }
 
 const selectProjectConversation = `-- name: SelectProjectConversation :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE project_id = ? AND scope = 'project' LIMIT 1
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE project_id = ? AND scope = 'project' LIMIT 1
 `
 
 func (q *Queries) SelectProjectConversation(ctx context.Context, projectID *domain.ProjectID) (Conversation, error) {
@@ -3811,6 +4005,11 @@ func (q *Queries) SelectProjectConversation(ctx context.Context, projectID *doma
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
@@ -4131,6 +4330,20 @@ func (q *Queries) SetConversationMessageDeliveryContent(ctx context.Context, arg
 	return err
 }
 
+const setConversationQueueRecoveryRequired = `-- name: SetConversationQueueRecoveryRequired :exec
+UPDATE conversations
+SET queue_recovery_required = 1
+WHERE id = ?1
+`
+
+// The durable recovery hold is set only when queued turns were actually
+// adopted. It is not a scheduler or a retry budget; it exists so a restart
+// cannot auto-drain work that must be released explicitly.
+func (q *Queries) SetConversationQueueRecoveryRequired(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, setConversationQueueRecoveryRequired, id)
+	return err
+}
+
 const settleConversationActivity = `-- name: SettleConversationActivity :exec
 UPDATE conversation_activities
 SET status = ?, summary = ?, detail_json = ?, revision = revision + 1, updated_at = ?
@@ -4239,27 +4452,6 @@ func (q *Queries) SettleConversationTurn(ctx context.Context, arg SettleConversa
 	return err
 }
 
-const settleOrphanedConversationTurns = `-- name: SettleOrphanedConversationTurns :exec
-UPDATE conversation_turns
-SET state = 'failed',
-    error_message = 'controller ended before the turn completed',
-    completed_at = ?
-WHERE handled_by_session_id = ? AND state IN ('queued', 'running')
-`
-
-type SettleOrphanedConversationTurnsParams struct {
-	CompletedAt        sql.NullTime
-	HandledBySessionID domain.SessionID
-}
-
-// Restart reconciliation: a turn left running by a dead controller is not
-// evidence the work finished, so it is settled honestly rather than silently
-// completed.
-func (q *Queries) SettleOrphanedConversationTurns(ctx context.Context, arg SettleOrphanedConversationTurnsParams) error {
-	_, err := q.db.ExecContext(ctx, settleOrphanedConversationTurns, arg.CompletedAt, arg.HandledBySessionID)
-	return err
-}
-
 const settleOrphanedReviewTurns = `-- name: SettleOrphanedReviewTurns :exec
 UPDATE conversation_turns
 SET state = 'failed',
@@ -4278,6 +4470,69 @@ type SettleOrphanedReviewTurnsParams struct {
 
 func (q *Queries) SettleOrphanedReviewTurns(ctx context.Context, arg SettleOrphanedReviewTurnsParams) error {
 	_, err := q.db.ExecContext(ctx, settleOrphanedReviewTurns, arg.CompletedAt, arg.ConversationID, arg.ReviewID)
+	return err
+}
+
+const settleOrphanedRunningTurns = `-- name: SettleOrphanedRunningTurns :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'controller ended before the turn completed',
+    completed_at = ?
+WHERE handled_by_session_id = ? AND state = 'running'
+`
+
+type SettleOrphanedRunningTurnsParams struct {
+	CompletedAt        sql.NullTime
+	HandledBySessionID domain.SessionID
+}
+
+// Restart reconciliation: a turn left running by a dead controller is not
+// evidence the work finished, so it is settled honestly rather than silently
+// completed. Queued rows are deliberately absent: they never crossed the
+// provider boundary and are durable evidence that the work is still safe.
+func (q *Queries) SettleOrphanedRunningTurns(ctx context.Context, arg SettleOrphanedRunningTurnsParams) error {
+	_, err := q.db.ExecContext(ctx, settleOrphanedRunningTurns, arg.CompletedAt, arg.HandledBySessionID)
+	return err
+}
+
+const settleOrphanedRunningTurnsForConversation = `-- name: SettleOrphanedRunningTurnsForConversation :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'controller ended before the turn completed',
+    completed_at = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.state = 'running'
+`
+
+type SettleOrphanedRunningTurnsForConversationParams struct {
+	CompletedAt    sql.NullTime
+	ConversationID string
+}
+
+func (q *Queries) SettleOrphanedRunningTurnsForConversation(ctx context.Context, arg SettleOrphanedRunningTurnsForConversationParams) error {
+	_, err := q.db.ExecContext(ctx, settleOrphanedRunningTurnsForConversation, arg.CompletedAt, arg.ConversationID)
+	return err
+}
+
+const settleRetiredConversationTurns = `-- name: SettleRetiredConversationTurns :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'session was retired during provider handoff',
+    completed_at = ?
+WHERE handled_by_session_id = ? AND state IN ('queued', 'running')
+`
+
+type SettleRetiredConversationTurnsParams struct {
+	CompletedAt        sql.NullTime
+	HandledBySessionID domain.SessionID
+}
+
+// A native provider handoff retires the predecessor session and continues in a
+// different provider context. Its queued rows cannot be replayed into that
+// context, so this explicit handoff policy settles the whole accepted set. This
+// is deliberately not used by crash/restart reconciliation.
+func (q *Queries) SettleRetiredConversationTurns(ctx context.Context, arg SettleRetiredConversationTurnsParams) error {
+	_, err := q.db.ExecContext(ctx, settleRetiredConversationTurns, arg.CompletedAt, arg.HandledBySessionID)
 	return err
 }
 

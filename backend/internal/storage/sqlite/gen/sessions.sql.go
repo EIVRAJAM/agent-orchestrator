@@ -79,6 +79,32 @@ func (q *Queries) ClaimChatControllerGeneration(ctx context.Context, arg ClaimCh
 	return result.RowsAffected()
 }
 
+const claimChatControllerGenerationCAS = `-- name: ClaimChatControllerGenerationCAS :execrows
+UPDATE sessions
+SET controller_generation = ?1
+WHERE id = ?2
+  AND session_mode = 'chat'
+  AND is_terminated = 0
+  AND controller_generation = ?3
+`
+
+type ClaimChatControllerGenerationCASParams struct {
+	ControllerGeneration         string
+	ID                           domain.SessionID
+	ExpectedControllerGeneration string
+}
+
+// Replacement ownership is a compare-and-set against the generation the caller
+// observed. An unconditional write would let two replacements race and publish
+// two controllers for one session.
+func (q *Queries) ClaimChatControllerGenerationCAS(ctx context.Context, arg ClaimChatControllerGenerationCASParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimChatControllerGenerationCAS, arg.ControllerGeneration, arg.ID, arg.ExpectedControllerGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const commitClientRequestSession = `-- name: CommitClientRequestSession :execrows
 UPDATE sessions SET client_request_committed = 1 WHERE id = ? AND client_request_id <> ''
 `

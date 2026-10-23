@@ -133,3 +133,43 @@ func (s *Store) inTxDB(ctx context.Context, what string, fn func(*gen.Queries, g
 	}
 	return tx.Commit()
 }
+
+// inImmediateTx runs a durable ownership transition with BEGIN IMMEDIATE. The
+// Chat controller claim and the Stop intent both read facts (generation,
+// running rows, queue cutoff) and then write them as one decision; a deferred
+// transaction could observe a state that another writer changes before the
+// first write acquires the database lock.
+//
+// The caller must hold writeMu. A provider-event projection already owns a
+// transaction on the single writer connection, so composability there falls
+// back to that transaction.
+func (s *Store) inImmediateTx(ctx context.Context, what string, fn func(*gen.Queries) error) error {
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		if err := fn(q); err != nil {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		return nil
+	}
+	conn, err := s.writeDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open %s connection: %w", what, err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin immediate %s: %w", what, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+		}
+	}()
+	if err := fn(gen.New(conn)); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit %s: %w", what, err)
+	}
+	committed = true
+	return nil
+}

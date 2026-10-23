@@ -146,6 +146,17 @@ UPDATE sessions
 SET controller_generation = ?
 WHERE id = ? AND session_mode = 'chat';
 
+-- name: ClaimChatControllerGenerationCAS :execrows
+-- Replacement ownership is a compare-and-set against the generation the caller
+-- observed. An unconditional write would let two replacements race and publish
+-- two controllers for one session.
+UPDATE sessions
+SET controller_generation = sqlc.arg(controller_generation)
+WHERE id = sqlc.arg(id)
+  AND session_mode = 'chat'
+  AND is_terminated = 0
+  AND controller_generation = sqlc.arg(expected_controller_generation);
+
 -- name: ActivateConversationBranchSession :execrows
 -- The branch and its native-history checkpoint have the same owner. A fork or
 -- branch activation cannot retain the previous native conversation's hook facts.
