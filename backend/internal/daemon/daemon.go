@@ -243,10 +243,14 @@ func Run() error {
 	// /healthz probe; a run-file left by a crashed/hard-killed/reused-PID
 	// predecessor is treated as stale and overwritten when the new server starts.
 	if live, err := runfile.CheckStale(cfg.RunFilePath); err != nil {
-		// The data-directory lock already proves this process owns the state.
-		// A corrupt or unreadable handshake is discoverability data, not a second
-		// ownership check; it will be replaced when the listener publishes.
-		log.Warn("run-file is unreadable; data-directory lock remains authoritative", "err", err)
+		if !errors.Is(err, runfile.ErrMalformed) {
+			// The lock proves ownership, but an unreadable/invalid run-file path
+			// would still leave startup unable to publish its handshake. Fail
+			// before opening or migrating SQLite.
+			return fmt.Errorf("inspect run-file: %w", err)
+		}
+		// Malformed JSON is safe to replace while this process owns the lock.
+		log.Warn("run-file is malformed; data-directory lock remains authoritative", "err", err)
 	} else if live != nil && runFileOwnerServing(&http.Client{Timeout: staleProbeTimeout}, config.LoopbackHost, live) {
 		return fmt.Errorf("daemon already running (pid %d, port %d); refusing to start", live.PID, live.Port)
 	}

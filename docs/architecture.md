@@ -626,6 +626,22 @@ A conflicting daemon exits before opening its store, publishing a run-file,
 removing a socket, or binding a listener. It prints that another daemon owns the
 data directory. The existing daemon remains reachable.
 
+The same `daemon.lock` is used by direct maintenance writers. `ao import` holds it
+for the entire import, including `--dry-run`, before checking the run-file or
+opening SQLite. `running.json` remains discovery/compatibility data: malformed
+JSON can be replaced while the lock is owned, while an access/path/I/O error
+that prevents publishing the handshake stops startup before SQLite is opened.
+No cooperating process may delete or replace `daemon.lock` while its owner holds
+the kernel lock.
+
+The lock applies to daemons and direct main-database writers. The daemon's
+read-only source store used by development import (`OpenReadOnly`) does not take
+it and never migrates or writes. Provider-owned databases (for example OpenCode)
+are outside this lock. Any future writer of the main `ao.db` must acquire the
+same lock; it must not rely on `running.json`.
+
+This delivery still does not preserve or adopt queued turns.
+
 ---
 
 ## Persistence and CDC

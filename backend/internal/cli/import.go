@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/datadirlock"
 	"github.com/aoagents/agent-orchestrator/backend/internal/legacyimport"
 	"github.com/aoagents/agent-orchestrator/backend/internal/runfile"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
@@ -22,6 +24,10 @@ type importOptions struct {
 	yes    bool
 	json   bool
 }
+
+// importAfterLock is a test seam for proving that import holds the data-dir
+// lock for the whole operation. Production leaves it nil.
+var importAfterLock func()
 
 func newImportCommand(ctx *commandContext) *cobra.Command {
 	var opts importOptions
@@ -45,16 +51,39 @@ func newImportCommand(ctx *commandContext) *cobra.Command {
 	return cmd
 }
 
-func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) error {
+func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) (retErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
 
-	// The daemon is the sole writer; refuse to open the store underneath a live
-	// one. A stale run-file (dead PID) is treated as safe.
+	// Import is a direct SQLite writer. Take the same kernel lock as the daemon
+	// before any run-file inspection or store open, and hold it for the whole
+	// import (including dry-run, which still opens/migrates the store).
+	dataDirLock, err := datadirlock.Acquire(datadirlock.Path(cfg.DataDir))
+	if err != nil {
+		if errors.Is(err, datadirlock.ErrLocked) {
+			return usageError{fmt.Errorf("the AO data directory %s is in use by another process; stop the daemon with `ao stop` before importing", cfg.DataDir)}
+		}
+		return fmt.Errorf("acquire data directory lock: %w", err)
+	}
+	defer func() {
+		if closeErr := dataDirLock.Close(); closeErr != nil && retErr == nil {
+			retErr = fmt.Errorf("release data directory lock: %w", closeErr)
+		}
+	}()
+	if importAfterLock != nil {
+		importAfterLock()
+	}
+
+	// running.json is discovery/compatibility only now; the kernel lock is the
+	// authority. Malformed JSON is safe to replace under this ownership, but an
+	// access/path/I/O error still means the handshake cannot be inspected.
 	if live, err := runfile.CheckStale(cfg.RunFilePath); err != nil {
-		return fmt.Errorf("inspect run-file: %w", err)
+		if !errors.Is(err, runfile.ErrMalformed) {
+			return fmt.Errorf("inspect run-file: %w", err)
+		}
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: run-file is malformed; continuing under data-directory lock\n")
 	} else if live != nil {
 		return usageError{fmt.Errorf("the AO daemon is running (pid %d); stop it first with `ao stop` before importing", live.PID)}
 	}
@@ -103,8 +132,9 @@ func (c *commandContext) runImport(cmd *cobra.Command, opts importOptions) error
 
 // executeImport opens the rewrite store, runs the import, and closes the store.
 // It is the one CLI path that opens the database directly: the import is a
-// one-time bootstrap that must run with the daemon stopped (guarded by the
-// caller), so it cannot go through the daemon's loopback API.
+// one-time bootstrap that must run with the daemon stopped. The caller holds
+// the same daemon data-directory lock for the entire operation, so it cannot
+// race a daemon or another import; it cannot go through the loopback API.
 func (c *commandContext) executeImport(ctx context.Context, cfg config.Config, opts legacyimport.Options) (legacyimport.Report, error) {
 	store, err := sqlite.Open(cfg.DataDir)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -237,6 +238,28 @@ func (h *e2eLockHolder) release(t *testing.T) {
 	}
 }
 
+func TestRunfileAccessErrorFailsBeforeStore(t *testing.T) {
+	dataDir := t.TempDir()
+	runDir := filepath.Join(dataDir, "run-directory")
+	if err := os.Mkdir(runDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	port := freePort(t)
+	failed := runDaemonCommand(t, dataDir, runDir, port)
+	if failed.exitCode == 0 {
+		t.Fatalf("startup with a directory run-file path unexpectedly succeeded:\n%s", failed.output)
+	}
+	assertNoAODatabaseOrDiscovery(t, dataDir)
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 300*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("failed startup opened a listener")
+	}
+	// The failed startup released the lock; a corrected path can start.
+	next := startDaemon(t, dataDir)
+	next.stop()
+}
+
 func TestDaemonStartupFailureReleasesDataDirLock(t *testing.T) {
 	dataDir := t.TempDir()
 	badParent := filepath.Join(dataDir, "not-a-directory")
@@ -249,10 +272,21 @@ func TestDaemonStartupFailureReleasesDataDirLock(t *testing.T) {
 	if failed.exitCode == 0 {
 		t.Fatalf("startup with unwritable run-file unexpectedly succeeded:\n%s", failed.output)
 	}
-	// The failed startup must release the lock even though it may have opened and
-	// migrated SQLite after acquiring it.
+	// Access errors must fail before SQLite or any listener/socket is opened.
+	assertNoAODatabaseOrDiscovery(t, dataDir)
 	next := startDaemon(t, dataDir)
 	next.stop()
+}
+
+func assertNoAODatabaseOrDiscovery(t *testing.T, dataDir string) {
+	t.Helper()
+	for _, name := range []string{"ao.db", "ao.db-wal", "ao.db-shm", "running.json", "supervise.sock", "browser.sock"} {
+		if _, err := os.Stat(filepath.Join(dataDir, name)); err == nil {
+			t.Fatalf("startup failure created %s", filepath.Join(dataDir, name))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat %s: %v", filepath.Join(dataDir, name), err)
+		}
+	}
 }
 
 type daemonCommandResult struct {

@@ -16,6 +16,22 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/processalive"
 )
 
+// ErrMalformed identifies a handshake whose JSON content could not be decoded.
+// Access, path, and I/O errors are deliberately not classified as malformed.
+var ErrMalformed = errors.New("run-file is malformed")
+
+// MalformedError preserves the original JSON decode cause while classifying it
+// as malformed handshake content.
+type MalformedError struct {
+	cause error
+}
+
+func (e *MalformedError) Error() string { return fmt.Sprintf("parse run-file: %v", e.cause) }
+func (e *MalformedError) Unwrap() error { return e.cause }
+func (e *MalformedError) Is(target error) bool {
+	return target == ErrMalformed
+}
+
 // Info is the on-disk handshake payload.
 type Info struct {
 	// PID is the daemon process id.
@@ -89,7 +105,7 @@ func Read(path string) (*Info, error) {
 	}
 	var info Info
 	if err := json.Unmarshal(data, &info); err != nil {
-		return nil, fmt.Errorf("parse run-file: %w", err)
+		return nil, &MalformedError{cause: err}
 	}
 	return &info, nil
 }

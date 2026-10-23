@@ -1,6 +1,8 @@
 package runfile
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -185,5 +187,67 @@ func TestCheckStaleNoFile(t *testing.T) {
 	}
 	if live != nil {
 		t.Errorf("CheckStale with no file = %+v, want nil", live)
+	}
+	if errors.Is(err, ErrMalformed) {
+		t.Fatal("missing run-file was classified as malformed")
+	}
+}
+
+func TestReadMalformedIsTypedAndPreservesJSONCause(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "running.json")
+	if err := os.WriteFile(path, []byte(`{"pid":not-json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Read(path)
+	if err == nil {
+		t.Fatal("Read malformed succeeded")
+	}
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("Read error = %v, want ErrMalformed", err)
+	}
+	var syntaxErr *json.SyntaxError
+	if !errors.As(err, &syntaxErr) {
+		t.Fatalf("Read error lost original JSON cause: %T %v", err, err)
+	}
+}
+
+func TestCheckStaleMalformedIsTyped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "running.json")
+	if err := os.WriteFile(path, []byte(`not-json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := CheckStale(path)
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("CheckStale error = %v, want ErrMalformed", err)
+	}
+}
+
+func TestReadAccessFailureIsNotMalformed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run-dir")
+	if err := os.Mkdir(path, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Read(path)
+	if err == nil {
+		t.Fatal("Read directory succeeded")
+	}
+	if errors.Is(err, ErrMalformed) {
+		t.Fatalf("directory read error was classified as malformed: %v", err)
+	}
+	_, err = CheckStale(path)
+	if err == nil || errors.Is(err, ErrMalformed) {
+		t.Fatalf("CheckStale directory error = %v, want non-malformed error", err)
+	}
+}
+
+func TestReadParentFileIsNotMalformed(t *testing.T) {
+	base := t.TempDir()
+	parent := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Read(filepath.Join(parent, "running.json"))
+	if err == nil || errors.Is(err, ErrMalformed) {
+		t.Fatalf("invalid-parent read error = %v, want non-malformed error", err)
 	}
 }
