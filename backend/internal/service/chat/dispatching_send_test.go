@@ -30,6 +30,23 @@ func (s *probeStore) AppendUserMessage(ctx context.Context, conversationID strin
 	return created, err
 }
 
+func (s *probeStore) AppendUserMessageFenced(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	generation, expectedStopEpisode string,
+	msg domain.ConversationMessage,
+	turnID string,
+	now time.Time,
+) (bool, error) {
+	created, err := s.Store.AppendUserMessageFenced(
+		ctx, conversationID, session, generation, expectedStopEpisode, msg, turnID, now)
+	if s.afterAppend != nil {
+		s.afterAppend()
+	}
+	return created, err
+}
+
 // newProbeHarness is the shared harness plus a snapshot reader, so the test can read
 // what a client would be told at a precise moment of a send.
 func newProbeHarness(t *testing.T) (*harness, *probeStore) {

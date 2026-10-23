@@ -157,6 +157,16 @@ WHERE id = sqlc.arg(id)
   AND is_terminated = 0
   AND controller_generation = sqlc.arg(expected_controller_generation);
 
+-- name: ClaimChatControllerGenerationCASIncludingTerminated :execrows
+-- Lifecycle spawn/handoff may revive a terminated target row; the generation
+-- CAS still has to prove the owner the caller observed. The surrounding
+-- publication transaction is what writes the non-terminated lifecycle record.
+UPDATE sessions
+SET controller_generation = sqlc.arg(controller_generation)
+WHERE id = sqlc.arg(id)
+  AND session_mode = 'chat'
+  AND controller_generation = sqlc.arg(expected_controller_generation);
+
 -- name: ActivateConversationBranchSession :execrows
 -- The branch and its native-history checkpoint have the same owner. A fork or
 -- branch activation cannot retain the previous native conversation's hook facts.

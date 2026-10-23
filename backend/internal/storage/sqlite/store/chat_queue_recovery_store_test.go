@@ -10,6 +10,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	storepkg "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 func openChatStoreWithRawDB(t *testing.T) (*sqlite.Store, *sql.DB) {
@@ -76,7 +77,7 @@ func TestRecordStopIntentAndCancelQueuedIsAtomicAndPreservesPostCutoff(t *testin
 	seedQueuedTurn(t, s, session, conversation.ID, "turn-stop-2", "generation-old")
 
 	intent, err := s.RecordStopIntentAndCancelQueued(
-		ctx, conversation.ID, domain.ChatStopReasonUserStop, "episode-1", testNow)
+		ctx, conversation.ID, session.ID, "", domain.ChatStopReasonUserStop, "episode-1", testNow)
 	if err != nil {
 		t.Fatalf("record stop: %v", err)
 	}
@@ -93,7 +94,7 @@ func TestRecordStopIntentAndCancelQueuedIsAtomicAndPreservesPostCutoff(t *testin
 	// with its own, later cutoff.
 	seedQueuedTurn(t, s, session, conversation.ID, "turn-after-stop", "generation-old")
 	second, err := s.RecordStopIntentAndCancelQueued(
-		ctx, conversation.ID, domain.ChatStopReasonUserStop, "episode-2", testNow.Add(time.Minute))
+		ctx, conversation.ID, session.ID, "", domain.ChatStopReasonUserStop, "episode-2", testNow.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("record second stop: %v", err)
 	}
@@ -120,7 +121,7 @@ BEGIN
 END;`)
 
 	if _, err := s.RecordStopIntentAndCancelQueued(
-		ctx, conversation.ID, domain.ChatStopReasonUserStop, "episode-failed", testNow); err == nil {
+		ctx, conversation.ID, session.ID, "", domain.ChatStopReasonUserStop, "episode-failed", testNow); err == nil {
 		t.Fatal("stop succeeded despite injected cancellation failure")
 	}
 	if got := turnState(t, s, "turn-rollback"); got != domain.TurnStateQueued {
@@ -412,5 +413,63 @@ func TestClaimAndAdoptExcludesOtherSessionConversationAndPromotion(t *testing.T)
 	}
 	if got := turnGeneration(t, raw, "turn-other"); got != "other-generation" {
 		t.Fatalf("other generation = %q, want untouched", got)
+	}
+}
+
+func TestDispatchTransitionRefusesCancelledQueuedTurn(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "turn-cancel-dispatch", "generation-old")
+	if err := s.CancelQueuedTurnByID(ctx, conversation.ID, "turn-cancel-dispatch", testNow); err != nil {
+		t.Fatalf("cancel queued: %v", err)
+	}
+	if err := s.MarkTurnDispatching(ctx, "turn-cancel-dispatch"); !errors.Is(err, storepkg.ErrTurnDispatchFenced) {
+		t.Fatalf("MarkTurnDispatching error = %v, want ErrTurnDispatchFenced", err)
+	}
+	if got := turnState(t, s, "turn-cancel-dispatch"); got != domain.TurnStateCancelled {
+		t.Fatalf("turn state = %q, want cancelled", got)
+	}
+}
+
+func TestBranchAndQueuePublicationRollsBackOnAdoptionFailure(t *testing.T) {
+	s, raw := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "branch-queue", "generation-old")
+	mustExecRaw(t, raw, `
+CREATE TRIGGER fail_branch_queue_adoption
+BEFORE UPDATE OF controller_generation ON conversation_turns
+WHEN NEW.id = 'branch-queue'
+BEGIN
+    SELECT RAISE(ABORT, 'injected branch adoption failure');
+END;`)
+	branch := domain.ConversationBranch{
+		ID: "branch-atomic", ConversationID: conversation.ID, SessionID: session.ID,
+		ProviderConversationID: "thread-atomic", ParentBranchID: conversation.ActiveBranchID,
+		ForkAfterSequence: conversation.LatestSequence, ProviderScopeID: "branch-atomic",
+		CreatedAt: testNow,
+	}
+	if err := s.CreateAndActivateConversationBranchAndAdoptQueued(
+		ctx, session.ID, branch, "generation-old", "generation-new", testNow); err == nil {
+		t.Fatal("branch publication succeeded despite injected adoption failure")
+	}
+	gotConversation, err := s.ConversationForSession(ctx, session.ID)
+	if err != nil || gotConversation.ActiveBranchID != conversation.ActiveBranchID {
+		t.Fatalf("active branch after rollback = %+v err=%v", gotConversation, err)
+	}
+	if _, err := s.ConversationBranch(ctx, conversation.ID, branch.ID); !errors.Is(err, domain.ErrNoConversationBranch) {
+		t.Fatalf("branch after rollback error = %v, want ErrNoConversationBranch", err)
+	}
+	rec, found, err := s.GetSession(ctx, session.ID)
+	if err != nil || !found || rec.Metadata.ControllerGeneration != "generation-old" {
+		t.Fatalf("generation after rollback = %q found=%v err=%v", rec.Metadata.ControllerGeneration, found, err)
+	}
+	if got := turnState(t, s, "branch-queue"); got != domain.TurnStateQueued {
+		t.Fatalf("queued state after rollback = %q, want queued", got)
+	}
+	facts, err := s.ConversationQueueFacts(ctx, conversation.ID)
+	if err != nil || facts.QueueRecoveryRequired {
+		t.Fatalf("hold after rollback = %+v err=%v", facts, err)
 	}
 }

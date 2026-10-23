@@ -4944,6 +4944,8 @@ type failFirstQueueCancellationStore struct {
 func (s *failFirstQueueCancellationStore) RecordStopIntentAndCancelQueued(
 	ctx context.Context,
 	conversationID string,
+	session domain.SessionID,
+	reviewID string,
 	reason domain.ChatStopReason,
 	episodeID string,
 	now time.Time,
@@ -4955,7 +4957,7 @@ func (s *failFirstQueueCancellationStore) RecordStopIntentAndCancelQueued(
 	if call == 1 {
 		return domain.ChatStopIntent{}, errors.New("injected queue cancellation failure")
 	}
-	return s.Store.RecordStopIntentAndCancelQueued(ctx, conversationID, reason, episodeID, now)
+	return s.Store.RecordStopIntentAndCancelQueued(ctx, conversationID, session, reviewID, reason, episodeID, now)
 }
 
 func (s *failFirstQueueCancellationStore) callCount() int {

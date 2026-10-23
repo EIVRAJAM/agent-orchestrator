@@ -105,6 +105,31 @@ func (q *Queries) ClaimChatControllerGenerationCAS(ctx context.Context, arg Clai
 	return result.RowsAffected()
 }
 
+const claimChatControllerGenerationCASIncludingTerminated = `-- name: ClaimChatControllerGenerationCASIncludingTerminated :execrows
+UPDATE sessions
+SET controller_generation = ?1
+WHERE id = ?2
+  AND session_mode = 'chat'
+  AND controller_generation = ?3
+`
+
+type ClaimChatControllerGenerationCASIncludingTerminatedParams struct {
+	ControllerGeneration         string
+	ID                           domain.SessionID
+	ExpectedControllerGeneration string
+}
+
+// Lifecycle spawn/handoff may revive a terminated target row; the generation
+// CAS still has to prove the owner the caller observed. The surrounding
+// publication transaction is what writes the non-terminated lifecycle record.
+func (q *Queries) ClaimChatControllerGenerationCASIncludingTerminated(ctx context.Context, arg ClaimChatControllerGenerationCASIncludingTerminatedParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimChatControllerGenerationCASIncludingTerminated, arg.ControllerGeneration, arg.ID, arg.ExpectedControllerGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const commitClientRequestSession = `-- name: CommitClientRequestSession :execrows
 UPDATE sessions SET client_request_committed = 1 WHERE id = ? AND client_request_id <> ''
 `

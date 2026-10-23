@@ -320,14 +320,8 @@ func (s *Service) settleOrphanedWork(
 	ctx context.Context,
 	session domain.SessionID,
 	conversationID string,
-	settleRunning bool,
 ) {
 	now := s.now()
-	if settleRunning {
-		if err := s.store.SettleOrphanedRunningTurns(ctx, session, now); err != nil {
-			s.log.Error("chat start: settle orphaned running turns", "session", session, "error", err)
-		}
-	}
 	// An approval left pending can never be answered: the provider call it was
 	// blocking died with the process that was holding it.
 	if err := s.store.FailPendingApprovals(ctx, conversationID, now); err != nil {
@@ -845,7 +839,6 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	} else if generation == "" {
 		generation = s.newID()
 	}
-	queueRecoveryRequired := false
 	if providerBoundaryID == "" {
 		if owner.Kind == domain.ConversationOwnerReview {
 			claimed, claimErr := s.store.ClaimReviewChatController(ctx, owner.ID, conv.ProviderConversationID(), generation, s.now())
@@ -888,12 +881,10 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 				RecoveryRequired: !firstOrPreController,
 				Now:              s.now(),
 			}
-			adopted, claimErr := s.store.ClaimChatControllerGenerationAndAdoptQueued(ctx, claim)
-			if claimErr != nil {
+			if _, claimErr := s.store.ClaimChatControllerGenerationAndAdoptQueued(ctx, claim); claimErr != nil {
 				_ = cleanupUnpublishedConversation(conv, cfg.ProviderConversationID == "")
 				return nil, fmt.Errorf("claim chat controller and adopt queue: %w", claimErr)
 			}
-			queueRecoveryRequired = claim.RecoveryRequired && adopted > 0
 		}
 	}
 	if liveReconnect {
@@ -933,18 +924,15 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	if !liveReconnect && cfg.ProviderHandoff == nil &&
 		owner.Kind != domain.ConversationOwnerReview &&
 		!queuedBeforeFirstController && !preserveUndispatchedQueue {
-		// The ordinary no-boundary claim already settled running rows atomically
-		// with adoption. A pending provider boundary or an in-process replacement
-		// still needs the explicit running-only settlement here.
-		s.settleOrphanedWork(ctx, cfg.SessionID, conversation.ID, providerBoundaryID != "")
+		// Running settlement belongs to the publication transaction: the ordinary
+		// no-boundary claim or the provider-boundary branch commit. Settling here
+		// would leave a failed running row even if that commit rolled back.
+		s.settleOrphanedWork(ctx, cfg.SessionID, conversation.ID)
 	}
 	// A fresh generation for a replacement, so events from the controller this
 	// one replaced can be told apart. Live reconnect reuses the existing epoch.
 	controller := newController(
 		cfg.SessionID, owner, conversation, generation, cfg.Harness, conv, s.store, s.activity, s.log, s.newID, s.now, s.onAccountChanged, s.onCodexCapacityChanged, s.reader)
-	// Install the hold before the controller can be published or start its
-	// projector: there is no window in which a restored queue can auto-drain.
-	controller.setQueueRecoveryRequired(queueRecoveryRequired)
 	var commitProviderHistory func(context.Context) error
 	if liveReconnect {
 		providerTurnID := controller.restoreLiveTurnOwnership(liveRows.Turns)
@@ -1043,7 +1031,7 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 					// Settle the retired owner's work in the publication transaction.
 					// A failed replay must leave it untouched; a successful handoff
 					// must not dispatch its queue into an independent native context.
-					if err := s.store.SettleRetiredSessionTurns(commitCtx, handoff.PreviousSessionID, s.now()); err != nil {
+					if err := s.store.SettleRetiredSessionTurns(commitCtx, handoff.PreviousSessionID, conversation.ID, s.now()); err != nil {
 						return err
 					}
 					if err := s.store.FailPendingApprovals(commitCtx, conversation.ID, s.now()); err != nil {
@@ -1077,7 +1065,21 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			if owner.Kind == domain.ConversationOwnerReview {
 				err = s.store.CreateAndActivateReviewConversationBranch(ctx, owner.ID, *providerBoundary, generation, s.now())
 			} else {
-				err = s.store.CreateAndActivateConversationBranch(ctx, cfg.SessionID, *providerBoundary, generation, s.now())
+				expectedGeneration := sessionRecord.Metadata.ControllerGeneration
+				if s.sessions != nil {
+					current, found, readErr := s.sessions.GetSession(ctx, cfg.SessionID)
+					if readErr != nil {
+						_ = cleanupUnpublishedConversation(conv, false)
+						return nil, fmt.Errorf("read chat session before boundary claim: %w", readErr)
+					}
+					if !found {
+						_ = cleanupUnpublishedConversation(conv, false)
+						return nil, ports.ErrSessionNotFound
+					}
+					expectedGeneration = current.Metadata.ControllerGeneration
+				}
+				err = s.store.CreateAndActivateConversationBranchAndAdoptQueued(
+					ctx, cfg.SessionID, *providerBoundary, expectedGeneration, generation, s.now())
 			}
 			if err != nil {
 				_ = cleanupUnpublishedConversation(conv, false)
@@ -1091,6 +1093,16 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			return nil, fmt.Errorf("commit chat controller: provider boundary %s was not activated", providerBoundary.ID)
 		}
 	}
+	// Read the hold after every publication transaction, including live
+	// reconnect and provider-boundary activation. Installing it here is the last
+	// fallible step before registry publication and projector start, so no
+	// terminal event can drain a preserved head while memory still says false.
+	queueFacts, factsErr := s.store.ConversationQueueFacts(ctx, conversation.ID)
+	if factsErr != nil {
+		_ = cleanupUnpublishedConversation(conv, false)
+		return nil, fmt.Errorf("read queue recovery hold before publishing controller: %w", factsErr)
+	}
+	controller.setQueueRecoveryRequired(queueFacts.QueueRecoveryRequired)
 	if commit.Conversation.ID != "" {
 		// The controller has not been published and its projector has not started,
 		// so this is the one safe point where the activation-mutated cache fields
@@ -1596,7 +1608,7 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		if s.store != nil {
 			if conversation, convErr := s.store.ConversationForSession(ctx, id); convErr == nil {
 				if _, recordErr := s.store.RecordStopIntentAndCancelQueued(
-					ctx, conversation.ID, domain.ChatStopReasonSessionTerminated, s.newID(), s.now(),
+					ctx, conversation.ID, id, "", domain.ChatStopReasonSessionTerminated, s.newID(), s.now(),
 				); recordErr != nil {
 					stopErr = errors.Join(stopErr, fmt.Errorf("record terminated chat queue: %w", recordErr))
 				}

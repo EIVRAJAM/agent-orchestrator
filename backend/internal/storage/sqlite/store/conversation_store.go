@@ -42,6 +42,14 @@ var ErrNoQueuedTurn = domain.ErrNoQueuedTurn
 // owns it. The caller must not contact the provider after this outcome.
 var ErrQueuedTurnNotAvailable = errors.New("queued turn is not available for promotion")
 
+// ErrChatIntakeClosed means a Send observed a Stop episode that changed before
+// its append committed. No turn was created and the provider must not be called.
+var ErrChatIntakeClosed = errors.New("chat intake was closed by a newer stop episode")
+
+// ErrTurnDispatchFenced means the queued row was settled or interrupted before
+// the dispatch transition. The provider must not be called.
+var ErrTurnDispatchFenced = errors.New("turn is no longer queued for dispatch")
+
 type conversationCreateOptions struct {
 	id            string
 	scope         domain.ConversationScope
@@ -579,6 +587,52 @@ func (s *Store) CreateAndActivateConversationBranch(
 	})
 }
 
+// CreateAndActivateConversationBranchAndAdoptQueued is the provider-boundary
+// fallback used when no ControllerReady callback is available. Branch
+// activation, generation CAS, target settlement and queued adoption commit
+// together; a failure leaves the previous branch active and the queue untouched.
+func (s *Store) CreateAndActivateConversationBranchAndAdoptQueued(
+	ctx context.Context,
+	sessionID domain.SessionID,
+	branch domain.ConversationBranch,
+	expectedGeneration, generation string,
+	now time.Time,
+) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	return s.inImmediateTx(ctx, "create and activate conversation branch with queue recovery", func(q *gen.Queries) error {
+		if err := insertAndActivateConversationBranchTx(ctx, q, branch, now); err != nil {
+			return err
+		}
+		rows, err := q.ClaimChatControllerGenerationCAS(ctx, gen.ClaimChatControllerGenerationCASParams{
+			ControllerGeneration:         generation,
+			ID:                           sessionID,
+			ExpectedControllerGeneration: expectedGeneration,
+		})
+		if err != nil {
+			return fmt.Errorf("claim Chat controller generation: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("claim Chat controller generation: session %s changed", sessionID)
+		}
+		sessionRows, err := q.ActivateConversationBranchSession(ctx, gen.ActivateConversationBranchSessionParams{
+			ProviderConversationID: branch.ProviderConversationID,
+			ControllerGeneration:   generation,
+			UpdatedAt:              now,
+			ID:                     sessionID,
+		})
+		if err != nil {
+			return fmt.Errorf("move session controller: %w", err)
+		}
+		if sessionRows != 1 {
+			return fmt.Errorf("move session controller: live chat session %s not found", sessionID)
+		}
+		_, err = settleAndAdoptQueuedTx(ctx, q, sessionID, branch.ConversationID, generation, now)
+		return err
+	})
+}
+
 // CreateAndActivateReviewConversationBranch publishes a fresh provider branch
 // with the review's controller generation. Reviewer Chat does not own the
 // worker session controller, so its boundary must claim the review row.
@@ -610,6 +664,48 @@ func (s *Store) CreateAndActivateReviewConversationBranch(
 		}
 		return nil
 	})
+}
+
+// settleAndAdoptQueuedTx is the shared owner-scoped queue transition used when
+// a new controller becomes durable while a provider boundary is being
+// published. It settles only running work of the target session/conversation
+// and adopts only its safe queued rows.
+func settleAndAdoptQueuedTx(
+	ctx context.Context,
+	q *gen.Queries,
+	sessionID domain.SessionID,
+	conversationID, generation string,
+	now time.Time,
+) (int, error) {
+	if err := q.FailOrphanedConversationActivitiesForConversation(ctx,
+		gen.FailOrphanedConversationActivitiesForConversationParams{
+			UpdatedAt: now, ConversationID: conversationID, HandledBySessionID: sessionID,
+		}); err != nil {
+		return 0, fmt.Errorf("fail orphaned activities before adoption: %w", err)
+	}
+	if err := q.SettleOrphanedRunningTurnsForConversation(ctx,
+		gen.SettleOrphanedRunningTurnsForConversationParams{
+			CompletedAt:        sql.NullTime{Time: now, Valid: true},
+			ConversationID:     conversationID,
+			HandledBySessionID: sessionID,
+		}); err != nil {
+		return 0, fmt.Errorf("settle orphaned running turns before adoption: %w", err)
+	}
+	rows, err := q.AdoptQueuedConversationTurnsForController(ctx,
+		gen.AdoptQueuedConversationTurnsForControllerParams{
+			ControllerGeneration: generation,
+			ConversationID:       conversationID,
+			HandledBySessionID:   sessionID,
+		})
+	if err != nil {
+		return 0, fmt.Errorf("adopt queued turns for %s: %w", conversationID, err)
+	}
+	if rows > 0 {
+		if err := q.SetConversationQueueRecoveryRequired(ctx, conversationID); err != nil {
+			return 0, fmt.Errorf("record queue recovery hold for %s: %w", conversationID, err)
+		}
+	}
+	return int(rows), nil
 }
 
 func insertAndActivateConversationBranchTx(ctx context.Context, q *gen.Queries, branch domain.ConversationBranch, now time.Time) error {
@@ -747,21 +843,31 @@ func (s *Store) commitChatSpawn(
 		if rows != 1 {
 			return fmt.Errorf("move conversation head: conversation %s not found", branch.ConversationID)
 		}
+		// Publish the new generation, settle the target's unresolved running
+		// turn, and adopt its safe queued rows in the same transaction that moves
+		// the branch. The previous generation is read from the transaction, not
+		// from a stale caller snapshot.
+		rows, err = q.ClaimChatControllerGenerationCASIncludingTerminated(ctx, gen.ClaimChatControllerGenerationCASIncludingTerminatedParams{
+			ControllerGeneration:         rec.Metadata.ControllerGeneration,
+			ID:                           rec.ID,
+			ExpectedControllerGeneration: owner.ControllerGeneration,
+		})
+		if err != nil {
+			return fmt.Errorf("claim Chat controller generation: %w", err)
+		}
+		if rows != 1 {
+			return fmt.Errorf("claim Chat controller generation: session %s changed", rec.ID)
+		}
+		if _, err := settleAndAdoptQueuedTx(
+			ctx, q, rec.ID, branch.ConversationID, rec.Metadata.ControllerGeneration, rec.UpdatedAt,
+		); err != nil {
+			return err
+		}
 		if prepare != nil {
-			// Provider-event projection is fenced by controller generation. Stage
-			// that generation only inside this transaction, after the new branch is
-			// active, so the replay lands in the new provider namespace while the
-			// terminated target remains unavailable to every concurrent reader.
-			rows, err := q.ClaimChatControllerGeneration(ctx, gen.ClaimChatControllerGenerationParams{
-				ControllerGeneration: rec.Metadata.ControllerGeneration,
-				ID:                   rec.ID,
-			})
-			if err != nil {
-				return fmt.Errorf("stage Chat controller generation: %w", err)
-			}
-			if rows != 1 {
-				return fmt.Errorf("stage Chat controller generation: Chat session %s not found", rec.ID)
-			}
+			// Provider-event projection is fenced by controller generation. The
+			// generation was staged above, after the new branch became active, so
+			// the replay lands in the new provider namespace while the terminated
+			// target remains unavailable to every concurrent reader.
 			txCtx := context.WithValue(ctx, conversationProjectionTxKey{}, q)
 			if err := prepare(txCtx); err != nil {
 				return fmt.Errorf("project native provider history: %w", err)
@@ -1133,13 +1239,28 @@ func (s *Store) AppendUserMessage(
 	turnID string,
 	now time.Time,
 ) (created bool, err error) {
-	return s.appendUserMessage(ctx, conversationID, session, "", generation, msg, turnID, "", now)
+	return s.appendUserMessage(ctx, conversationID, session, "", generation, msg, turnID, "", "", false, now)
+}
+
+// AppendUserMessageFenced records a primary-session message only if the durable
+// Stop episode the sender observed is still current. The check and insert share
+// one transaction, so a Stop that wins before the append leaves no turn behind.
+func (s *Store) AppendUserMessageFenced(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	generation, expectedStopEpisode string,
+	msg domain.ConversationMessage,
+	turnID string,
+	now time.Time,
+) (created bool, err error) {
+	return s.appendUserMessage(ctx, conversationID, session, "", generation, msg, turnID, "", expectedStopEpisode, true, now)
 }
 
 // AppendReviewUserMessage preserves the worker session needed for lifecycle
 // projection while recording the typed reviewer that owns the turn.
 func (s *Store) AppendReviewUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error) {
-	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, "", now)
+	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, "", "", false, now)
 }
 
 // AppendRetryUserMessage records a retry and its source as one transaction.
@@ -1155,12 +1276,26 @@ func (s *Store) AppendRetryUserMessage(
 	retryOfTurnID string,
 	now time.Time,
 ) (created bool, err error) {
-	return s.appendUserMessage(ctx, conversationID, session, "", generation, msg, turnID, retryOfTurnID, now)
+	return s.appendUserMessage(ctx, conversationID, session, "", generation, msg, turnID, retryOfTurnID, "", false, now)
+}
+
+// AppendRetryUserMessageFenced is the primary-session retry append with the
+// same durable Stop-episode fence as AppendUserMessageFenced.
+func (s *Store) AppendRetryUserMessageFenced(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	generation, expectedStopEpisode string,
+	msg domain.ConversationMessage,
+	turnID, retryOfTurnID string,
+	now time.Time,
+) (created bool, err error) {
+	return s.appendUserMessage(ctx, conversationID, session, "", generation, msg, turnID, retryOfTurnID, expectedStopEpisode, true, now)
 }
 
 // AppendReviewRetryUserMessage atomically persists a retry for a reviewer chat.
 func (s *Store) AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error) {
-	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, retryOfTurnID, now)
+	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, retryOfTurnID, "", false, now)
 }
 
 func (s *Store) appendUserMessage(
@@ -1172,6 +1307,8 @@ func (s *Store) appendUserMessage(
 	msg domain.ConversationMessage,
 	turnID string,
 	retryOfTurnID string,
+	expectedStopEpisode string,
+	fenced bool,
 	now time.Time,
 ) (created bool, err error) {
 	s.writeMu.Lock()
@@ -1235,6 +1372,21 @@ func (s *Store) appendUserMessage(
 	}
 
 	err = s.inTx(ctx, "append user message", func(q *gen.Queries) error {
+		if fenced && reviewID == "" {
+			accepted, checkErr := q.ConversationAcceptsTurnAppend(ctx,
+				gen.ConversationAcceptsTurnAppendParams{
+					ConversationID:       conversationID,
+					SessionID:            session,
+					ControllerGeneration: generation,
+					StopEpisodeID:        expectedStopEpisode,
+				})
+			if checkErr != nil {
+				return fmt.Errorf("check chat intake fence: %w", checkErr)
+			}
+			if accepted == 0 {
+				return ErrChatIntakeClosed
+			}
+		}
 		sequence, err := q.NextConversationSequence(ctx, gen.NextConversationSequenceParams{
 			UpdatedAt: now,
 			ID:        conversationID,
@@ -1444,10 +1596,14 @@ func (s *Store) AppendImportedUserMessage(
 func (s *Store) MarkTurnDispatching(ctx context.Context, turnID string) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
-	if err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{
+	rows, err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{
 		ID: turnID,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("mark turn %s dispatching: %w", turnID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: %s", ErrTurnDispatchFenced, turnID)
 	}
 	return nil
 }
@@ -1464,11 +1620,15 @@ func (s *Store) BindTurnToProvider(ctx context.Context, turnID, providerTurnID s
 	}); err != nil {
 		return fmt.Errorf("bind turn %s to provider turn %s: %w", turnID, providerTurnID, err)
 	}
-	if err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{
+	rows, err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{
 		StartedAt: sql.NullTime{Time: now, Valid: true},
 		ID:        turnID,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("mark turn %s started: %w", turnID, err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("%w: %s", ErrTurnDispatchFenced, turnID)
 	}
 	return nil
 }
@@ -1611,37 +1771,74 @@ func terminalActivityStatus(state domain.TurnState) domain.ActivityStatus {
 	}
 }
 
-// SettleOrphanedRunningTurns marks anything a dead controller left running.
-// Queued turns never crossed the provider boundary and are deliberately
-// preserved: they are the durable evidence that the user's work is still safe.
-func (s *Store) SettleOrphanedRunningTurns(ctx context.Context, session domain.SessionID, now time.Time) error {
+// SettleOrphanedRunningTurnsForConversation is the owner-scoped startup form:
+// it settles only the running turns handled by the named session in this
+// conversation and leaves another conversation and review turns untouched.
+func (s *Store) SettleOrphanedRunningTurnsForConversation(
+	ctx context.Context,
+	session domain.SessionID,
+	conversationID string,
+	now time.Time,
+) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
-	if err := q.FailOrphanedConversationActivities(ctx,
-		gen.FailOrphanedConversationActivitiesParams{
+	if err := q.FailOrphanedConversationActivitiesForConversation(ctx,
+		gen.FailOrphanedConversationActivitiesForConversationParams{
 			UpdatedAt:          now,
+			ConversationID:     conversationID,
 			HandledBySessionID: session,
 		}); err != nil {
-		return fmt.Errorf("settle orphaned activities for %s: %w", session, err)
+		return fmt.Errorf("settle orphaned activities for %s on %s: %w", session, conversationID, err)
 	}
-	if err := q.SettleOrphanedRunningTurns(ctx,
-		gen.SettleOrphanedRunningTurnsParams{
+	if err := q.SettleOrphanedRunningTurnsForConversation(ctx,
+		gen.SettleOrphanedRunningTurnsForConversationParams{
 			CompletedAt:        sql.NullTime{Time: now, Valid: true},
+			ConversationID:     conversationID,
 			HandledBySessionID: session,
 		}); err != nil {
-		return fmt.Errorf("settle orphaned running turns for %s: %w", session, err)
+		return fmt.Errorf("settle orphaned running turns for %s on %s: %w", session, conversationID, err)
 	}
 	return nil
 }
 
-// SettleRetiredSessionTurns settles both queued and running work for a session
-// that an explicit native provider handoff retires. The predecessor's queue
-// cannot cross into the target provider's independent context.
-func (s *Store) SettleRetiredSessionTurns(ctx context.Context, session domain.SessionID, now time.Time) error {
-	q, unlock := s.conversationWriter(ctx)
-	defer unlock()
+// SettleRetiredSessionTurns settles both queued and running work, and the
+// activities belonging to those turns, for a session that an explicit native
+// provider handoff retires. The predecessor's queue cannot cross into the
+// target provider's independent context. The conversation/session/review scope
+// leaves the target, other conversations and reviewer work untouched.
+func (s *Store) SettleRetiredSessionTurns(
+	ctx context.Context,
+	session domain.SessionID,
+	conversationID string,
+	now time.Time,
+) error {
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return settleRetiredSessionTurns(ctx, q, session, conversationID, now)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, "settle retired Chat session turns", func(q *gen.Queries) error {
+		return settleRetiredSessionTurns(ctx, q, session, conversationID, now)
+	})
+}
+
+func settleRetiredSessionTurns(
+	ctx context.Context,
+	q *gen.Queries,
+	session domain.SessionID,
+	conversationID string,
+	now time.Time,
+) error {
+	if err := q.FailRetiredConversationActivities(ctx, gen.FailRetiredConversationActivitiesParams{
+		UpdatedAt:          now,
+		ConversationID:     conversationID,
+		HandledBySessionID: session,
+	}); err != nil {
+		return fmt.Errorf("settle retired session activities for %s: %w", session, err)
+	}
 	if err := q.SettleRetiredConversationTurns(ctx, gen.SettleRetiredConversationTurnsParams{
 		CompletedAt:        sql.NullTime{Time: now, Valid: true},
+		ConversationID:     conversationID,
 		HandledBySessionID: session,
 	}); err != nil {
 		return fmt.Errorf("settle retired session turns for %s: %w", session, err)
@@ -1722,14 +1919,17 @@ func (s *Store) ClaimChatControllerGenerationAndAdoptQueued(
 		if claim.SettleRunning {
 			if err := q.FailOrphanedConversationActivitiesForConversation(ctx,
 				gen.FailOrphanedConversationActivitiesForConversationParams{
-					UpdatedAt: claim.Now, ConversationID: claim.ConversationID,
+					UpdatedAt:          claim.Now,
+					ConversationID:     claim.ConversationID,
+					HandledBySessionID: claim.SessionID,
 				}); err != nil {
 				return fmt.Errorf("fail orphaned activities before adoption: %w", err)
 			}
 			if err := q.SettleOrphanedRunningTurnsForConversation(ctx,
 				gen.SettleOrphanedRunningTurnsForConversationParams{
-					CompletedAt:    sql.NullTime{Time: claim.Now, Valid: true},
-					ConversationID: claim.ConversationID,
+					CompletedAt:        sql.NullTime{Time: claim.Now, Valid: true},
+					ConversationID:     claim.ConversationID,
+					HandledBySessionID: claim.SessionID,
 				}); err != nil {
 				return fmt.Errorf("settle orphaned running turns before adoption: %w", err)
 			}
@@ -1782,9 +1982,10 @@ func (s *Store) ClaimChatControllerGenerationAndAdoptQueued(
 // therefore scoped through turns handled by this session, not current ownership
 // of the conversation.
 //
-// Startup deliberately uses SettleOrphanedRunningTurns and FailPending*
-// directly: no controller owns the abandoned generation then, and that repair
-// must remain unconditional while queued rows stay preserved.
+// Startup deliberately uses SettleOrphanedRunningTurnsForConversation and
+// FailPending* directly: no controller owns the abandoned generation then, and
+// that repair must remain scoped to the current owner while queued rows stay
+// preserved.
 func (s *Store) CleanupOwnedControllerWork(
 	ctx context.Context,
 	session domain.SessionID,
@@ -1821,18 +2022,21 @@ func cleanupOwnedControllerWork(
 	if owner.ControllerGeneration != generation {
 		return false, nil
 	}
-	if err := q.FailOrphanedConversationActivities(ctx,
-		gen.FailOrphanedConversationActivitiesParams{
-			UpdatedAt: now, HandledBySessionID: session,
-		}); err != nil {
-		return false, fmt.Errorf("settle orphaned activities for %s: %w", session, err)
-	}
-	if err := q.SettleOrphanedRunningTurns(ctx,
-		gen.SettleOrphanedRunningTurnsParams{
-			CompletedAt:        sql.NullTime{Time: now, Valid: true},
+	if err := q.FailOrphanedConversationActivitiesForConversation(ctx,
+		gen.FailOrphanedConversationActivitiesForConversationParams{
+			UpdatedAt:          now,
+			ConversationID:     conversationID,
 			HandledBySessionID: session,
 		}); err != nil {
-		return false, fmt.Errorf("settle orphaned running turns for %s: %w", session, err)
+		return false, fmt.Errorf("settle orphaned activities for %s on %s: %w", session, conversationID, err)
+	}
+	if err := q.SettleOrphanedRunningTurnsForConversation(ctx,
+		gen.SettleOrphanedRunningTurnsForConversationParams{
+			CompletedAt:        sql.NullTime{Time: now, Valid: true},
+			ConversationID:     conversationID,
+			HandledBySessionID: session,
+		}); err != nil {
+		return false, fmt.Errorf("settle orphaned running turns for %s on %s: %w", session, conversationID, err)
 	}
 	if err := q.FailPendingConversationRequestsForSession(ctx,
 		gen.FailPendingConversationRequestsForSessionParams{
@@ -2417,6 +2621,19 @@ func (s *Store) ConversationQueueFacts(ctx context.Context, conversationID strin
 	}, nil
 }
 
+// ConversationStopEpisode returns the durable Stop episode a sender must echo
+// back in its append transaction. An empty value means no Stop has committed.
+func (s *Store) ConversationStopEpisode(ctx context.Context, conversationID string) (string, error) {
+	episode, err := s.qr.SelectConversationStopEpisode(ctx, conversationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", domain.ErrNoConversation
+	}
+	if err != nil {
+		return "", fmt.Errorf("read stop episode for %s: %w", conversationID, err)
+	}
+	return episode, nil
+}
+
 // ClearChatQueueRecovery drops the manual-resume hold when no queued work
 // remains. It never cancels or dispatches a turn.
 func (s *Store) ClearChatQueueRecovery(ctx context.Context, conversationID string) error {
@@ -2557,6 +2774,8 @@ func (s *Store) CompleteQueuedTurnPromotion(
 func (s *Store) RecordStopIntentAndCancelQueued(
 	ctx context.Context,
 	conversationID string,
+	session domain.SessionID,
+	reviewID string,
 	reason domain.ChatStopReason,
 	episodeID string,
 	now time.Time,
@@ -2571,25 +2790,37 @@ func (s *Store) RecordStopIntentAndCancelQueued(
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	err := s.inImmediateTx(ctx, "record chat stop intent and cancel queued turns", func(q *gen.Queries) error {
-		cutoff, err := q.SelectMaxQueuedConversationTurnRowID(ctx, conversationID)
+		cutoff, err := q.SelectMaxQueuedConversationTurnRowID(ctx,
+			gen.SelectMaxQueuedConversationTurnRowIDParams{
+				ConversationID:     conversationID,
+				HandledBySessionID: session,
+				ReviewID:           reviewID,
+			})
 		if err != nil {
 			return fmt.Errorf("read queue cutoff for %s: %w", conversationID, err)
 		}
 		intent.CutoffRowID = cutoff
-		if err := q.RecordConversationStopIntent(ctx, gen.RecordConversationStopIntentParams{
-			StopReason:      string(reason),
-			StopEpisodeID:   episodeID,
-			StopIntentAt:    sql.NullTime{Time: now, Valid: true},
-			StopCutoffRowid: cutoff,
-			ID:              conversationID,
-		}); err != nil {
-			return fmt.Errorf("record stop intent for %s: %w", conversationID, err)
+		// Reviewer Chat keeps its separate lifecycle. Its cancellation still
+		// uses the owner-scoped cutoff below, but it must not write the
+		// conversation-wide stop facts reserved for the primary controller.
+		if reviewID == "" {
+			if err := q.RecordConversationStopIntent(ctx, gen.RecordConversationStopIntentParams{
+				StopReason:      string(reason),
+				StopEpisodeID:   episodeID,
+				StopIntentAt:    sql.NullTime{Time: now, Valid: true},
+				StopCutoffRowid: cutoff,
+				ID:              conversationID,
+			}); err != nil {
+				return fmt.Errorf("record stop intent for %s: %w", conversationID, err)
+			}
 		}
 		cancelled, err := q.CancelQueuedConversationTurnsThroughRowID(ctx,
 			gen.CancelQueuedConversationTurnsThroughRowIDParams{
-				CompletedAt:    sql.NullTime{Time: now, Valid: true},
-				ConversationID: conversationID,
-				CutoffRowid:    cutoff,
+				CompletedAt:        sql.NullTime{Time: now, Valid: true},
+				ConversationID:     conversationID,
+				HandledBySessionID: session,
+				ReviewID:           reviewID,
+				CutoffRowid:        cutoff,
 			})
 		if err != nil {
 			return fmt.Errorf("cancel queued turns through %d for %s: %w", cutoff, conversationID, err)

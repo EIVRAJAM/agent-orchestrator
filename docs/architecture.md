@@ -676,6 +676,22 @@ recovery hold together. The provider is not published as the session owner and
 no queued row can dispatch from the transaction. IDs, `requested_at`, rowid
 ordering, promotion state, and retry links are untouched.
 
+A fresh provider boundary or branch uses the same transaction discipline. The
+branch is inserted and activated, the generation CAS runs against the owner read
+inside that transaction, running work for the target session is settled, and
+the target's safe queued rows are adopted. No branch can become active while its
+queue still points at the previous generation. The lifecycle `CommitChatSpawn`
+and `CommitChatSpawnPrepared` paths carry this transition; the fallback path
+without a ControllerReady callback uses
+`CreateAndActivateConversationBranchAndAdoptQueued`. A failed callback or
+publication rolls all of it back.
+
+`Service.Start` reads `queue_recovery_required` from the durable conversation
+after every publication path and installs it on the controller before registry
+publication or projector start. That includes live reconnect. The restored
+running turn is not treated as a reason to clear the hold; only an explicit
+resume, empty queue, or cancellation can do that.
+
 `queue_recovery_required` is an operational hold, not a display status. The
 snapshot derives `controller_recovery_required` while a queued head exists; the
 new controller cannot auto-drain it. `resume-queue` releases exactly one named
@@ -699,6 +715,24 @@ commits before provider interruption, so a crash either leaves no Stop intent
 or leaves the complete cancellation. A clean daemon shutdown uses `Close`, not a
 user Stop, and does not cancel queued work.
 
+A Send also carries an intake fence. It captures `stop_episode_id` before it
+starts recording the prompt and the append transaction re-checks that episode
+together with the session's non-terminated state, ownership, and controller
+generation. If Stop commits while the Send is paused before the insert, the
+append returns `ErrChatIntakeClosed` and creates no row. If the append wins, the
+turn is inside the Stop cutoff and is interrupted. The queued-to-running
+transition is itself conditional on the row still being `queued` (or already
+`running`), so a settlement that wins before `MarkTurnDispatching` cannot result
+in a provider call.
+
+Every new queue operation is owner-scoped by conversation, `handled_by_session_id`,
+and the expected `handled_by_review_id` state. Primary operations require
+`handled_by_review_id IS NULL`; review cleanup keeps its separate path. A Stop or
+claim for one worker session does not consume another session's queue in a shared
+project conversation or a reviewer's turns. Retiring a predecessor also settles
+its running activities in the same transaction, scoped to that conversation,
+session, and non-review owner; target and reviewer activities remain untouched.
+
 Live reconnect is not a replacement claim. It reuses the durable
 `controller_generation`, restores only the provider-bound session it can
 reattach, settles only unbound running rows, and does not adopt queued work or
@@ -706,9 +740,9 @@ rotate the generation. A native provider handoff is an explicit ownership
 transfer to a different provider context: it retires the predecessor Session
 and settles both its queued and running accepted work because neither belongs in
 the target context. That is intentionally separate from crash recovery.
-Reviewer Chat keeps its separate controller/review cleanup path; the shared Stop
-operation also records the cutoff for a review conversation when its controller
-is explicitly interrupted.
+Reviewer Chat keeps its separate controller/review cleanup path. Its Stop path
+uses the owner-scoped cutoff to cancel review turns but does not write the
+primary conversation-wide Stop facts or adopt review work into the worker queue.
 
 There is no scheduler, automatic recovery, automatic retry, backoff,
 rate-limit classification, SQLite lease, heartbeat, or force unlock in this

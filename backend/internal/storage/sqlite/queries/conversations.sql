@@ -649,10 +649,13 @@ UPDATE conversation_turns
 SET provider_turn_id = ?, started_at = COALESCE(started_at, ?)
 WHERE id = ?;
 
--- name: MarkConversationTurnStarted :exec
+-- The state predicate is the durable dispatch fence: a Stop that settled this
+-- queued row between append and dispatch must win, and the provider must not be
+-- called. execrows lets the store refuse the dispatch.
+-- name: MarkConversationTurnStarted :execrows
 UPDATE conversation_turns
 SET state = 'running', started_at = COALESCE(started_at, ?)
-WHERE id = ?;
+WHERE id = ? AND state IN ('queued', 'running');
 
 -- name: SettleConversationTurn :exec
 UPDATE conversation_turns
@@ -694,34 +697,9 @@ WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   AND turn_id = sqlc.arg(turn_id)
   AND kind = 'plan';
 
--- The same invariant applies when startup discovers work abandoned by a dead
--- controller. This runs before SettleOrphanedRunningTurns while their turn
--- states still identify the affected rows. Queued turns have no running
--- activity: they never crossed the provider boundary.
--- name: FailOrphanedConversationActivities :exec
-UPDATE conversation_activities
-SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
-WHERE status = 'running'
-  AND turn_id IN (
-      SELECT id FROM conversation_turns
-      WHERE handled_by_session_id = sqlc.arg(handled_by_session_id)
-        AND state = 'running'
-  );
-
--- Restart reconciliation: a turn left running by a dead controller is not
--- evidence the work finished, so it is settled honestly rather than silently
--- completed. Queued rows are deliberately absent: they never crossed the
--- provider boundary and are durable evidence that the work is still safe.
--- name: SettleOrphanedRunningTurns :exec
-UPDATE conversation_turns
-SET state = 'failed',
-    error_message = 'controller ended before the turn completed',
-    completed_at = ?
-WHERE handled_by_session_id = ? AND state = 'running';
-
 -- Controller claim is conversation-scoped: an unrelated project/session
--- conversation handled by the same session must not be settled by this
--- replacement.
+-- conversation or a review turn handled by the same worker session must not be
+-- settled by this replacement.
 -- name: FailOrphanedConversationActivitiesForConversation :exec
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
@@ -730,6 +708,8 @@ WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   AND turn_id IN (
       SELECT id FROM conversation_turns
       WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+        AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+        AND conversation_turns.handled_by_review_id IS NULL
         AND conversation_turns.state = 'running'
   );
 
@@ -739,6 +719,8 @@ SET state = 'failed',
     error_message = 'controller ended before the turn completed',
     completed_at = sqlc.arg(completed_at)
 WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND conversation_turns.handled_by_review_id IS NULL
   AND conversation_turns.state = 'running';
 
 -- A native provider handoff retires the predecessor session and continues in a
@@ -749,8 +731,27 @@ WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
 UPDATE conversation_turns
 SET state = 'failed',
     error_message = 'session was retired during provider handoff',
-    completed_at = ?
-WHERE handled_by_session_id = ? AND state IN ('queued', 'running');
+    completed_at = sqlc.arg(completed_at)
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND conversation_turns.handled_by_review_id IS NULL
+  AND conversation_turns.state IN ('queued', 'running');
+
+-- The activities belonging to those retired turns must settle in the same
+-- transaction. The target, other sessions, other conversations and reviews are
+-- excluded by the same owner scope as the turn settlement above.
+-- name: FailRetiredConversationActivities :exec
+UPDATE conversation_activities
+SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND status = 'running'
+  AND conversation_activities.turn_id IN (
+      SELECT conversation_turns.id FROM conversation_turns
+      WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+        AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+        AND conversation_turns.handled_by_review_id IS NULL
+        AND conversation_turns.state IN ('queued', 'running')
+  );
 
 -- Reviewer Chat has its own controller generation on review, separate from
 -- the worker session. Settle only turns owned by that review conversation.
@@ -886,6 +887,8 @@ WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
   AND conversation_turns.rowid <= COALESCE((
       SELECT MAX(conversation_turns.rowid) FROM conversation_turns
       WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+        AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+        AND conversation_turns.handled_by_review_id IS NULL
   ), 0);
 
 -- The durable recovery hold is set only when queued turns were actually
@@ -904,6 +907,11 @@ WHERE conversations.id = sqlc.arg(id)
   AND NOT EXISTS (
       SELECT 1 FROM conversation_turns
       WHERE conversation_turns.conversation_id = sqlc.arg(id)
+        AND conversation_turns.handled_by_session_id = (
+            SELECT conversations.current_session_id FROM conversations
+            WHERE conversations.id = sqlc.arg(id)
+        )
+        AND conversation_turns.handled_by_review_id IS NULL
         AND conversation_turns.state = 'queued'
   );
 
@@ -914,6 +922,11 @@ WHERE conversations.id = sqlc.arg(id)
 SELECT CAST(COALESCE(MAX(rowid), 0) AS INTEGER) AS cutoff_rowid
 FROM conversation_turns
 WHERE conversation_id = sqlc.arg(conversation_id)
+  AND handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND (
+      (sqlc.arg(review_id) = '' AND handled_by_review_id IS NULL)
+      OR handled_by_review_id = sqlc.arg(review_id)
+  )
   AND state = 'queued';
 
 -- name: RecordConversationStopIntent :exec
@@ -929,8 +942,34 @@ WHERE id = sqlc.arg(id);
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = sqlc.arg(completed_at)
 WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND (
+      (sqlc.arg(review_id) = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = sqlc.arg(review_id)
+  )
   AND conversation_turns.state = 'queued'
   AND conversation_turns.rowid <= CAST(sqlc.arg(cutoff_rowid) AS INTEGER);
+
+-- Send captures the durable Stop episode before it begins its append work. The
+-- append transaction compares this value again, so a Stop that commits while a
+-- Send is paused before the insert wins and the Send creates no turn.
+-- name: SelectConversationStopEpisode :one
+SELECT stop_episode_id
+FROM conversations
+WHERE id = sqlc.arg(id);
+
+-- The same durable fence also verifies that the handling session still owns the
+-- conversation and the controller generation observed by the sender is live.
+-- name: ConversationAcceptsTurnAppend :one
+SELECT CAST(COUNT(*) AS INTEGER) AS accepted
+FROM sessions AS s
+JOIN conversations AS c ON c.id = sqlc.arg(conversation_id)
+WHERE s.id = sqlc.arg(session_id)
+  AND s.session_mode = 'chat'
+  AND s.is_terminated = 0
+  AND s.controller_generation = sqlc.arg(controller_generation)
+  AND c.current_session_id = s.id
+  AND c.stop_episode_id = sqlc.arg(stop_episode_id);
 
 -- Overwrite the turn's changed-file summary. The provider re-sends the whole diff
 -- on every update, so the latest payload is the complete answer and there is
