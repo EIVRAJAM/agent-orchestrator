@@ -91,6 +91,12 @@ func TestOpenCodeV2ACPProviderHelper(t *testing.T) {
 				continue
 			}
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", request.ID)
+		case "session/prompt":
+			if os.Getenv("AO_TEST_OPENCODE_V2_ACP_PROMPT_ERROR") == "1" {
+				_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error","data":{"error":"Rate limit exceeded. Please try again later."}}}`+"\n", request.ID)
+				continue
+			}
+			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", request.ID)
 		default:
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{}}`+"\n", request.ID)
 		}
@@ -153,6 +159,78 @@ func TestLaunchesOpenCodeACPWithTheBuiltInModeAdvertisedAtStartup(t *testing.T) 
 	}
 	if !strings.Contains(string(data), "session/set_mode:build\n") {
 		t.Fatalf("v2 approval mode was not applied through ACP:\n%s", data)
+	}
+}
+
+func TestOpenCodeV2ACPInternalErrorEvidence(t *testing.T) {
+	_, _ = writeOpenCodeACPExecutable(t, "2.0.0")
+	t.Setenv("AO_TEST_OPENCODE_V2_ACP_PROMPT_ERROR", "1")
+	driver := New(opencodev2.New(), nil)
+	if driver.Harness() != domain.HarnessOpenCodeV2 {
+		t.Fatalf("harness = %q", driver.Harness())
+	}
+	conversation, err := driver.Start(context.Background(), ports.ChatStartConfig{
+		SessionID: "v2-evidence", DataDir: t.TempDir(), WorkspacePath: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = conversation.(ports.ChatProviderTerminator).Terminate() }()
+	awaitOpenCodeACPReady(t, conversation.Events())
+
+	ref, err := conversation.SendTurn(context.Background(), ports.ChatUserMessage{Text: "hello"})
+	if err != nil {
+		t.Fatalf("SendTurn: %v", err)
+	}
+	if err := conversation.(ports.ChatDeferredTurnStarter).StartDeferredTurn(ref.ProviderTurnID); err != nil {
+		t.Fatalf("StartDeferredTurn: %v", err)
+	}
+	var completed ports.ChatEvent
+	for {
+		event := nextOpenCodeACPEvent(t, conversation.Events())
+		if event.Kind == ports.ChatEventTurnCompleted {
+			completed = event
+			break
+		}
+	}
+	if completed.TurnState != domain.TurnStateFailed || completed.Err == nil {
+		t.Fatalf("completion = %#v, want failed with provider error", completed)
+	}
+	evidence, ok := ports.ProviderErrorEvidenceOf(completed.Err)
+	if !ok || evidence.Class != domain.ProviderErrorProviderInternal ||
+		evidence.Protocol != "acp" || evidence.Harness != string(domain.HarnessOpenCodeV2) ||
+		evidence.Operation != "session/prompt" ||
+		evidence.Code == nil || *evidence.Code != -32603 ||
+		evidence.DataShape["error"] != "string" {
+		t.Fatalf("evidence = (%+v, %v)", evidence, ok)
+	}
+	encoded, _ := json.Marshal(evidence)
+	if strings.Contains(string(encoded), "Rate limit exceeded") {
+		t.Fatalf("sensitive data.error entered v2 evidence: %s", encoded)
+	}
+	if evidence.Class == "rate_limited" || evidence.Class == "transient" {
+		t.Fatalf("v2 prose produced %q", evidence.Class)
+	}
+}
+
+func awaitOpenCodeACPReady(t *testing.T, events <-chan ports.ChatEvent) {
+	t.Helper()
+	for {
+		event := nextOpenCodeACPEvent(t, events)
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerReady {
+			return
+		}
+	}
+}
+
+func nextOpenCodeACPEvent(t *testing.T, events <-chan ports.ChatEvent) ports.ChatEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ACP event")
+		return ports.ChatEvent{}
 	}
 }
 

@@ -308,7 +308,13 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	if strings.TrimSpace(msg.Text) == "" {
 		// There is no keystroke concept here: an empty message is a caller bug,
 		// not a way to nudge the agent.
-		return ports.ChatTurnRef{}, fmt.Errorf("%w: chat message text is empty", ports.ErrTurnNotDelivered)
+		return ports.ChatTurnRef{}, ports.WithProviderError(
+			fmt.Errorf("%w: chat message text is empty", ports.ErrTurnNotDelivered),
+			domain.ProviderErrorEvidence{
+				Class: domain.ProviderErrorNotDelivered, Protocol: "codex",
+				Harness: string(domain.HarnessCodex), Operation: "turn/start",
+			},
+		)
 	}
 
 	c.sendMu.Lock()
@@ -349,13 +355,16 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 // controller treats the delivery as uncertain.
 func classifySendTurnError(err error) error {
 	var rpcErr *rpcError
-	if errors.As(err, &rpcErr) {
-		return fmt.Errorf("%w: %w", ports.ErrTurnRejected, err)
+	var classified error
+	switch {
+	case errors.As(err, &rpcErr):
+		classified = fmt.Errorf("%w: %w", ports.ErrTurnRejected, err)
+	case errors.Is(err, errConnClosedBeforeWrite):
+		classified = fmt.Errorf("%w: %w", ports.ErrTurnNotDelivered, err)
+	default:
+		classified = err
 	}
-	if errors.Is(err, errConnClosedBeforeWrite) {
-		return fmt.Errorf("%w: %w", ports.ErrTurnNotDelivered, err)
-	}
-	return err
+	return ports.WithProviderError(classified, codexSendErrorEvidence(err))
 }
 
 // applyTurnSettings folds the caller's per-turn choices into a turn/start payload.

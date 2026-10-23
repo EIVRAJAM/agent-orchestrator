@@ -484,6 +484,158 @@ calls back into the service. So there is no cycle and no inversion.
   write to `ErrTurnNotDelivered`, and leaves EOF/close-after-write/timeout/
   cancellation/undecodable ambiguous; empty text is a local definitive error.
 
+## Provider failure taxonomy and local evidence
+
+This delivery adds diagnostics, not a recovery policy. It does not add a scheduler,
+automatic canary, cold-start adoption, process lock, or controller lease. A
+failed or recovered turn still holds the queue exactly as described above, and
+`ao session resume-queue` is still the only way to release one held turn.
+
+### Demonstrated classes
+
+The durable vocabulary has only classes backed by a structured signal:
+
+| Class | Evidence |
+| --- | --- |
+| `auth_required` | ACP JSON-RPC `-32000`, or Codex `CodexErrorInfo=unauthorized` |
+| `rejected` | An explicit Codex `turn/start` RPC error response |
+| `not_delivered` | A local empty message, a connection refused before the first write, or an ACP deferred start that provably did not cross the boundary |
+| `uncertain` | EOF, timeout, cancellation after a write, an unreadable response, or a late connection close |
+| `interrupted` | A deliberate local interrupt |
+| `provider_internal` | ACP JSON-RPC `-32603`; other structured codes remain `unknown` until demonstrated |
+| `unknown` | A demonstrated provider failure that does not match a narrower class, including Codex errors not proven ambiguous and other ACP request codes |
+
+There is deliberately **no `rate_limited` and no `transient` class**. Prose such as
+"rate limit exceeded", "try again", or "timeout" is never classified with string
+matching. An RPC rejection carrying that prose remains `rejected`; an ACP
+`RequestError` carrying it remains `provider_internal` only for `-32603`, or
+`unknown` otherwise. Codex EOF/timeout/cancellation/close-after-write and
+unreadable-response boundaries are the demonstrated `uncertain` cases; every
+other Codex send error remains `unknown`. A future scheduler would need a stable
+structured temporal signal (or an explicit product decision), not a text
+heuristic.
+
+`ErrTurnNotDelivered` means only that the instruction did not reach the provider.
+It says nothing about temporary availability and is not a retry signal.
+
+### Sanitized archive
+
+The existing local provider-event archive is the only persistence route:
+`conversation_provider_events.payload_json` under `AO_DATA_DIR`. There is no new
+table, migration, telemetry exporter, network call, or second event file.
+
+Classified terminal events gain one structured block:
+
+```json
+{
+  "providerError": {
+    "class": "provider_internal",
+    "protocol": "acp",
+    "harness": "opencode",
+    "operation": "session/prompt",
+    "code": -32603,
+    "dataShape": { "error": "string" },
+    "eventId": "validated-host-event-id"
+  }
+}
+```
+
+`dataShape` contains only allowlisted field names and JSON types. It never contains
+a `data` value, a nested body, an array item, or a blob. Its bound is explicit: at
+most the three allowlisted names (`error`, `eventId`, and the relay's
+`ao.persistentEventId`), one known relay wrapper level, and no recursive copy.
+`eventId` is copied only for ACP and only when it matches the exact AO-owned relay
+shape `acp-host:<64 lowercase hex>:<decimal sequence>`; arbitrary printable
+provider ids, whitespace/control characters, Unicode, and values over 256 bytes
+are rejected. The block contains no provider message, prompt, response text, path,
+token, cookie, credential, email, or raw `RequestError.Error()`. The `harness`
+identifies the adapter family (`opencode`, `opencode-v2`, `codex`, etc.).
+
+For a `SendTurn`/deferred-start failure with evidence, the same archive receives a
+`provider.error` row through `ProjectProviderEvent` with a no-op projection. It
+does not create a synthetic timeline event, settle a turn, or advance the queue:
+
+```json
+{
+  "kind": "provider.error",
+  "turnId": "ao-internal-turn-id",
+  "providerError": {
+    "class": "not_delivered",
+    "protocol": "codex",
+    "harness": "codex",
+    "operation": "turn/start"
+  },
+  "error": "not_delivered"
+}
+```
+
+`turnId` is AO's internal turn id. The diagnostic row deliberately has **no**
+`providerTurnId`: the provider never produced one, and writing a fake value there
+would make the row look like dispatch acceptance. For classified events, the
+archive's raw `error` field is the class; the existing visible `error_message` on
+the durable turn still carries the provider's message. Unclassified events retain
+their previous archive behavior.
+
+### Closed sanitization boundary
+
+The archive boundary does not trust adapter-built evidence. Before serializing,
+both terminal events and `provider.error` rows pass through the same closed
+sanitizer:
+
+- class must be one of the seven demonstrated classes, otherwise `unknown`;
+- protocol must be `codex` or `acp`, otherwise omitted;
+- the protocol–harness pair must be in the explicit closed allowlist:
+  `codex` + `codex`; `acp` + `claude-code`, `opencode`, `opencode-v2`, `droid`,
+  `kimi`, `kimchi`, `pi`, `cursor`, `omp`, `qwen`, `deepseek-harness`,
+  `command-code`, or `agy`. Any other pair, including ACP + Unreal/Gemini or
+  Codex + an ACP harness, is omitted;
+- operation is limited to `turn/start`, `turn/error`, and `session/prompt` and the
+  protocol's allowed operations, otherwise omitted;
+- `dataShape` is rebuilt from `error`, `eventId`, and `ao.persistentEventId`, with
+  at most three entries and only the documented type names; unknown keys/types are
+  dropped and no values are copied;
+- `eventId` is retained only for `acp` and only when it matches the exact
+  AO-owned relay shape `acp-host:<64 lowercase hex>:<decimal sequence>`. A
+  printable but arbitrary provider id is not trusted;
+- code remains the structured integer.
+
+### Settlement before diagnostic archival
+
+Evidence is best effort and never precedes a durable transition that the safety
+policy requires:
+
+- definitive `SendTurn` failure: memory cleanup, `SettleTurnByID(failed)`, then
+  archive; the row is failed with `completed_at` before the diagnostic write;
+- deferred `ErrDeferredTurnNotStarted`: clear `pendingTurnID`,
+  `SettleTurnByID(failed)`, then archive;
+- ambiguous eager/deferred failure: keep the row running/unbound, pending binding
+  and one-shot hold, archive without settling, and do not retry or drain.
+
+A crash after the durable settle but before the diagnostic archive can therefore
+lose only the diagnostic row, never the turn transition.
+
+### OpenCode representative case
+
+The repository has no original frame from the reported OpenCode incident. Tests
+use a clearly synthetic representative `-32603` frame with
+`data.error = "Rate limit exceeded. Please try again later."`; it is not claimed
+as forensic evidence. The tests prove that:
+
+- it is `provider_internal` (never `rate_limited` or `transient`);
+- `data.error` is absent from the structured evidence;
+- `dataShape.error` is `"string"`;
+- OpenCode and OpenCode v2 keep the same ACP semantics;
+- no automatic retry or queue decision is made.
+
+### Separation from behavior
+
+The class is diagnostic evidence only. It does not change whether a turn settles
+as failed/running/interrupted, whether a queue drains, whether a held queue can be
+resumed, or how Start/Stop/handoff/live reconnect work. Existing regression tests
+(`TestFailedPrimaryTurnHoldsQueuedWork`,
+`TestRecoveredPrimaryTurnHoldsQueuedWork`, the uncertain-delivery tests, and the
+`resume-queue` tests) must keep passing unchanged.
+
 ## Out of scope
 
 - Preserving `queued` rows across a cold start (Option B).

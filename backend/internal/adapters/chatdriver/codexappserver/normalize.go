@@ -670,7 +670,13 @@ func normalizeNotification(n notification, now time.Time) []ports.ChatEvent {
 		}
 		return []ports.ChatEvent{{
 			Kind: ports.ChatEventError,
-			Err:  fmt.Errorf("provider error: %s", truncateForLog(n.Params)),
+			Err: ports.WithProviderError(
+				fmt.Errorf("provider error: %s", truncateForLog(n.Params)),
+				domain.ProviderErrorEvidence{
+					Class: domain.ProviderErrorUnknown, Protocol: "codex",
+					Harness: string(domain.HarnessCodex), Operation: "turn/error",
+				},
+			),
 		}}
 
 	default:
@@ -708,7 +714,8 @@ func codexProviderFailure(turnErr codexproto.TurnError) error {
 	if strings.TrimSpace(turnErr.Message) == "" && strings.TrimSpace(detail) == "" && cause == nil {
 		return nil
 	}
-	return ports.NewChatProviderFailure(turnErr.Message, detail, cause)
+	failure := ports.NewChatProviderFailure(turnErr.Message, detail, cause)
+	return ports.WithProviderError(failure, codexTurnFailureEvidence(turnErr))
 }
 
 // turnIDFallback reads a top-level turnId, which some builds send instead of
