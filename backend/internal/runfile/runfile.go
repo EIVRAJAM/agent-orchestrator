@@ -28,6 +28,8 @@ type MalformedError struct {
 
 func (e *MalformedError) Error() string { return fmt.Sprintf("parse run-file: %v", e.cause) }
 func (e *MalformedError) Unwrap() error { return e.cause }
+
+// Is reports whether target is ErrMalformed.
 func (e *MalformedError) Is(target error) bool {
 	return target == ErrMalformed
 }
