@@ -94,12 +94,11 @@ func SafeProviderEventID(value string) (string, bool) {
 		return "", false
 	}
 	parts := strings.Split(strings.TrimPrefix(value, prefix), ":")
-	if len(parts) != 2 || len(parts[0]) != 64 || len(parts[1]) == 0 || len(parts[1]) > 20 {
+	if len(parts) != 2 || len(parts[0]) != 64 || parts[1] == "" || len(parts[1]) > 20 {
 		return "", false
 	}
 	for i := 0; i < len(parts[0]); i++ {
-		c := parts[0][i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if !isLowerHex(parts[0][i]) {
 			return "", false
 		}
 	}
@@ -109,6 +108,10 @@ func SafeProviderEventID(value string) (string, bool) {
 		}
 	}
 	return value, true
+}
+
+func isLowerHex(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 }
 
 var providerErrorClasses = map[domain.ProviderErrorClass]struct{}{
