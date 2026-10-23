@@ -31,6 +31,84 @@ func TestSafeProviderEventIDOnlyAcceptsRelayShape(t *testing.T) {
 	}
 }
 
+func TestSanitizeProviderErrorEvidenceClosesProtocolHarnessAllowlist(t *testing.T) {
+	accepted := []struct {
+		name     string
+		protocol string
+		harness  domain.AgentHarness
+		op       string
+	}{
+		{"codex/codex", "codex", domain.HarnessCodex, "turn/start"},
+		{"acp/claude-code", "acp", domain.HarnessClaudeCode, "session/prompt"},
+		{"acp/opencode", "acp", domain.HarnessOpenCode, "session/prompt"},
+		{"acp/opencode-v2", "acp", domain.HarnessOpenCodeV2, "session/prompt"},
+		{"acp/droid", "acp", domain.HarnessDroid, "session/prompt"},
+		{"acp/kimi", "acp", domain.HarnessKimi, "session/prompt"},
+		{"acp/kimchi", "acp", domain.HarnessKimchi, "session/prompt"},
+		{"acp/pi", "acp", domain.HarnessPi, "session/prompt"},
+		{"acp/cursor", "acp", domain.HarnessCursor, "session/prompt"},
+		{"acp/omp", "acp", domain.HarnessOMP, "session/prompt"},
+		{"acp/qwen", "acp", domain.HarnessQwen, "session/prompt"},
+		{"acp/deepseek-harness", "acp", domain.HarnessDeepSeek, "session/prompt"},
+		{"acp/command-code", "acp", domain.HarnessCommandCode, "session/prompt"},
+		{"acp/agy", "acp", domain.HarnessAgy, "session/prompt"},
+	}
+	for _, test := range accepted {
+		t.Run(test.name, func(t *testing.T) {
+			got := SanitizeProviderErrorEvidence(domain.ProviderErrorEvidence{
+				Class: domain.ProviderErrorProviderInternal, Protocol: test.protocol,
+				Harness: string(test.harness), Operation: test.op,
+			})
+			if got.Protocol != test.protocol || got.Harness != string(test.harness) || got.Operation != test.op {
+				t.Fatalf("sanitized evidence = %+v, want protocol=%q harness=%q operation=%q",
+					got, test.protocol, test.harness, test.op)
+			}
+		})
+	}
+
+	rejected := []struct {
+		name     string
+		protocol string
+		harness  domain.AgentHarness
+		op       string
+	}{
+		{"acp/codex", "acp", domain.HarnessCodex, "session/prompt"},
+		{"acp/unreal", "acp", domain.HarnessUnreal, "session/prompt"},
+		{"acp/gemini", "acp", domain.HarnessGemini, "session/prompt"},
+		{"acp/aider", "acp", domain.HarnessAider, "session/prompt"},
+		{"acp/invented", "acp", "invented-harness", "session/prompt"},
+		{"codex/opencode", "codex", domain.HarnessOpenCode, "turn/start"},
+		{"codex/opencode-v2", "codex", domain.HarnessOpenCodeV2, "turn/start"},
+		{"codex/unreal", "codex", domain.HarnessUnreal, "turn/start"},
+		{"unreal/unreal", "unreal", domain.HarnessUnreal, "session/prompt"},
+	}
+	for _, test := range rejected {
+		t.Run(test.name, func(t *testing.T) {
+			got := SanitizeProviderErrorEvidence(domain.ProviderErrorEvidence{
+				Class: domain.ProviderErrorProviderInternal, Protocol: test.protocol,
+				Harness: string(test.harness), Operation: test.op,
+			})
+			wantProtocol := ""
+			if test.protocol == "codex" || test.protocol == "acp" {
+				wantProtocol = test.protocol
+			}
+			if got.Protocol != wantProtocol {
+				t.Fatalf("protocol = %q, want %q", got.Protocol, wantProtocol)
+			}
+			if got.Harness != "" {
+				t.Fatalf("rejected harness %q survived", got.Harness)
+			}
+			encoded, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), string(test.harness)) {
+				t.Fatalf("rejected harness %q appeared in JSON: %s", test.harness, encoded)
+			}
+		})
+	}
+}
+
 func TestSanitizeProviderErrorEvidenceClosesTheBoundary(t *testing.T) {
 	validEventID := "acp-host:" + strings.Repeat("b", 64) + ":2"
 	hostile := domain.ProviderErrorEvidence{

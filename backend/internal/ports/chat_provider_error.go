@@ -7,10 +7,11 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
 
-// providerError carries sanitized diagnostic evidence without changing the
-// wrapped error's message, identity, or errors.Is/errors.As behavior. The
-// controller projects the evidence into the existing provider-event archive;
-// policy continues to use the original typed errors.
+// providerError carries candidate diagnostic evidence without changing the
+// wrapped error's message, identity, or errors.Is/errors.As behavior. Adapters
+// are not the trust boundary: the evidence is sanitized only immediately before
+// it is written to conversation_provider_events. Policy continues to use the
+// original typed errors.
 type providerError struct {
 	evidence domain.ProviderErrorEvidence
 	err      error
@@ -19,10 +20,12 @@ type providerError struct {
 func (e *providerError) Error() string { return e.err.Error() }
 func (e *providerError) Unwrap() error { return e.err }
 
-// WithProviderError attaches sanitized evidence to an existing error. If the
-// error already carries evidence, non-empty fields are merged so a later layer
-// (for example a validated ACP event id) can refine the classification without
-// losing the adapter's result.
+// WithProviderError attaches candidate diagnostic evidence to an existing
+// error. It does not sanitize: adapters may refine the candidate, and the
+// mandatory sanitization happens once at the provider-event archive boundary.
+// If the error already carries evidence, non-empty fields are merged so a later
+// layer (for example a validated ACP event id or harness) can refine the
+// classification without losing the adapter's result.
 func WithProviderError(err error, evidence domain.ProviderErrorEvidence) error {
 	if err == nil {
 		return nil
@@ -36,8 +39,10 @@ func WithProviderError(err error, evidence domain.ProviderErrorEvidence) error {
 	return &providerError{evidence: evidence, err: err}
 }
 
-// ProviderErrorEvidenceOf returns the sanitized evidence attached to err, if
-// any. It follows the normal error chain and never interprets prose.
+// ProviderErrorEvidenceOf returns the candidate evidence attached to err, if
+// any. It follows the normal error chain and never interprets prose. It does not
+// sanitize, because later layers must still be able to add a validated harness
+// or event id before the single archive boundary sanitizes the final record.
 func ProviderErrorEvidenceOf(err error) (domain.ProviderErrorEvidence, bool) {
 	var providerErr *providerError
 	if !errors.As(err, &providerErr) {
@@ -132,6 +137,36 @@ var providerErrorOperations = map[string]map[string]struct{}{
 	"acp":   {"session/prompt": {}},
 }
 
+// providerErrorHarnesses is the closed protocol-to-harness relation. It lists
+// only harnesses with a real driver at this commit:
+//
+//   - codexappserver for codex;
+//   - claudeacp, opencodeacp, opencodev2acp, droidacp, kimiacp, kimchiacp,
+//     piacp, cursoracp, ompacp, qwenacp, deepseekharnessacp, commandcodeacp,
+//     agyacp for acp.
+//
+// geminiacp contains only a live test, and Unreal uses unrealchat, not ACP.
+var providerErrorHarnesses = map[string]map[domain.AgentHarness]struct{}{
+	"codex": {
+		domain.HarnessCodex: {},
+	},
+	"acp": {
+		domain.HarnessClaudeCode:  {},
+		domain.HarnessOpenCode:    {},
+		domain.HarnessOpenCodeV2:  {},
+		domain.HarnessDroid:       {},
+		domain.HarnessKimi:        {},
+		domain.HarnessKimchi:      {},
+		domain.HarnessPi:          {},
+		domain.HarnessCursor:      {},
+		domain.HarnessOMP:         {},
+		domain.HarnessQwen:        {},
+		domain.HarnessDeepSeek:    {},
+		domain.HarnessCommandCode: {},
+		domain.HarnessAgy:         {},
+	},
+}
+
 const providerErrorMaxDataShapeFields = 3
 
 // SanitizeProviderErrorEvidence is the closed boundary applied before writing
@@ -152,12 +187,8 @@ func SanitizeProviderErrorEvidence(evidence domain.ProviderErrorEvidence) domain
 		sanitized.Protocol = protocol
 	}
 
-	if protocol != "" && evidence.Harness != "" {
-		harness := domain.AgentHarness(evidence.Harness)
-		pertinent := harness.IsKnown() &&
-			((protocol == "codex" && harness == domain.HarnessCodex) ||
-				(protocol == "acp" && harness != domain.HarnessCodex))
-		if pertinent {
+	if harnesses, ok := providerErrorHarnesses[protocol]; ok {
+		if _, ok := harnesses[domain.AgentHarness(evidence.Harness)]; ok {
 			sanitized.Harness = evidence.Harness
 		}
 	}

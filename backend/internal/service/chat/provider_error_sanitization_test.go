@@ -119,6 +119,45 @@ func TestTerminalProviderEvidenceIsSanitizedAtTheArchiveBoundary(t *testing.T) {
 	assertNoHostileEvidence(t, payload)
 }
 
+func TestArchiveDropsKnownHarnessWithoutAnACPAdapter(t *testing.T) {
+	h := newHarness(t)
+	h.conv.sendErr = ports.WithProviderError(
+		fmt.Errorf("%w: known non-ACP harness", ports.ErrTurnNotDelivered),
+		domain.ProviderErrorEvidence{
+			Class: domain.ProviderErrorProviderInternal, Protocol: "acp",
+			Harness: string(domain.HarnessUnreal), Operation: "session/prompt",
+		},
+	)
+	if _, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+		Text: "root", ClientMessageID: "known-non-acp-harness", Origin: domain.MessageOriginHuman,
+	}); err == nil {
+		t.Fatal("definitive SendTurn failure was reported as success")
+	}
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateFailed
+	})
+	if snapshot.Turns[0].State != domain.TurnStateFailed {
+		t.Fatalf("turn state = %q, want failed", snapshot.Turns[0].State)
+	}
+
+	events, err := h.st.ProviderEventsSince(context.Background(), h.ctrl.ConversationID(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := findProviderEvent(t, events, "provider.error")
+	providerError, ok := payload["providerError"].(map[string]any)
+	if !ok || providerError["class"] != "provider_internal" || providerError["protocol"] != "acp" {
+		t.Fatalf("providerError = %#v", payload)
+	}
+	if _, present := providerError["harness"]; present {
+		t.Fatalf("non-ACP harness survived: %#v", providerError)
+	}
+	encoded, _ := json.Marshal(payload)
+	if strings.Contains(string(encoded), string(domain.HarnessUnreal)) {
+		t.Fatalf("unreal-agent appeared in payload: %s", encoded)
+	}
+}
+
 func TestDispatchProviderEvidenceIsSanitizedAtTheArchiveBoundary(t *testing.T) {
 	h := newHarness(t)
 	h.conv.sendErr = ports.WithProviderError(

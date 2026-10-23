@@ -584,8 +584,11 @@ sanitizer:
 
 - class must be one of the seven demonstrated classes, otherwise `unknown`;
 - protocol must be `codex` or `acp`, otherwise omitted;
-- harness must be a known `domain.AgentHarness` pertinent to the protocol,
-  otherwise omitted;
+- the protocol–harness pair must be in the explicit closed allowlist:
+  `codex` + `codex`; `acp` + `claude-code`, `opencode`, `opencode-v2`, `droid`,
+  `kimi`, `kimchi`, `pi`, `cursor`, `omp`, `qwen`, `deepseek-harness`,
+  `command-code`, or `agy`. Any other pair, including ACP + Unreal/Gemini or
+  Codex + an ACP harness, is omitted;
 - operation is limited to `turn/start`, `turn/error`, and `session/prompt` and the
   protocol's allowed operations, otherwise omitted;
 - `dataShape` is rebuilt from `error`, `eventId`, and `ao.persistentEventId`, with

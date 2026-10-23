@@ -32,9 +32,11 @@ const (
 	ProviderErrorUnknown ProviderErrorClass = "unknown"
 )
 
-// ProviderErrorEvidence is the sanitized, durable diagnostic attached to a
-// provider failure. It contains no message, prompt, response, path, credential,
-// arbitrary data value, or raw provider error string.
+// ProviderErrorEvidence is candidate diagnostic evidence attached to a provider
+// failure. It is not trusted or durable until ports.SanitizeProviderErrorEvidence
+// runs at the conversation_provider_events archive boundary. Producers must
+// never copy a message, prompt, response, path, credential, arbitrary data
+// value, or raw provider error string into it.
 //
 // DataShape holds only allowlisted field names mapped to their JSON type. The
 // provider's actual data values must never be copied here.
