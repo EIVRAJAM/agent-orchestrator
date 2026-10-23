@@ -22,6 +22,7 @@ boundaries.
 
 - [Mental model](#mental-model)
 - [System overview](#system-overview)
+- [Data-directory ownership](#data-directory-ownership)
 - [Core architectural principles](#core-architectural-principles)
 - [Component architecture](#component-architecture)
 - [Data flows](#data-flows)
@@ -588,6 +589,42 @@ sequenceDiagram
         Dispatch->>Chat: Enqueue native provider turn
     end
 ```
+
+---
+
+## Data-directory ownership
+
+Exactly one daemon process may own one `AO_DATA_DIR` at a time. The daemon
+resolves the directory, creates it as needed, and takes a non-blocking
+kernel-backed exclusive lock on `AO_DATA_DIR/daemon.lock` before opening SQLite,
+writing `running.json`, removing or binding the supervisor socket/browser socket,
+or starting any listener or background service. The open descriptor/handle stays
+alive for the daemon's lifetime and is closed only after the existing graceful
+shutdown has stopped workers and writes. A crash closes it at the OS level.
+
+The lock file may remain after a crash, and it contains only minimal diagnostic
+metadata (PID, acquisition time, metadata version). A new process can acquire the
+same path whenever no process holds the kernel lock, regardless of the file's
+existence or contents. The daemon never deletes a lock file merely because it
+looks stale, and never overrides a lock based on PID, `/healthz`, timestamps, or
+`running.json`.
+
+Ownership invariants:
+
+1. Only one daemon can own an `AO_DATA_DIR`.
+2. The kernel lock is the authority for exclusion.
+3. `running.json` is discovery and supervision, not exclusion.
+4. SQLite WAL permits multiple processes to open the same database; it does not
+   confer daemon ownership.
+5. A residual `daemon.lock` does not imply that an owner exists.
+6. The daemon never breaks a lock based on PID, health, or timestamps.
+7. This delivery does not change queue settlement or preservation.
+8. Preservation/adoption of queued turns will be a later delivery built on this
+   single-owner guarantee.
+
+A conflicting daemon exits before opening its store, publishing a run-file,
+removing a socket, or binding a listener. It prints that another daemon owns the
+data directory. The existing daemon remains reachable.
 
 ---
 

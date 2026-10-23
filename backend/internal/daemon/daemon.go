@@ -36,6 +36,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/browserruntime"
 	"github.com/aoagents/agent-orchestrator/backend/internal/codexops"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/datadirlock"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/supervisor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
@@ -187,6 +188,23 @@ func Run() error {
 	if cwd, err := os.Getwd(); err == nil {
 		cfg.StartupWorkingDirectory = cwd
 	}
+	// Own the data directory before touching any durable or discoverable daemon
+	// state. The kernel-held lock is the authority; running.json, /healthz, the
+	// supervisor socket and the HTTP port are discovery/supervision only.
+	dataDirLock, err := datadirlock.Acquire(datadirlock.Path(cfg.DataDir))
+	if err != nil {
+		if errors.Is(err, datadirlock.ErrLocked) {
+			return fmt.Errorf("daemon data directory %s is already owned by another daemon: %w", cfg.DataDir, err)
+		}
+		return fmt.Errorf("acquire daemon data directory lock: %w", err)
+	}
+	defer func() {
+		if closeErr := dataDirLock.Close(); closeErr != nil {
+			// A lock-release failure must never replace the daemon's primary
+			// startup/shutdown error.
+			_, _ = fmt.Fprintf(os.Stderr, "daemon: release data directory lock: %v\n", closeErr)
+		}
+	}()
 	if err := stabilizeWorkingDirectory(cfg.DataDir); err != nil {
 		return err
 	}
@@ -225,7 +243,10 @@ func Run() error {
 	// /healthz probe; a run-file left by a crashed/hard-killed/reused-PID
 	// predecessor is treated as stale and overwritten when the new server starts.
 	if live, err := runfile.CheckStale(cfg.RunFilePath); err != nil {
-		return fmt.Errorf("inspect run-file: %w", err)
+		// The data-directory lock already proves this process owns the state.
+		// A corrupt or unreadable handshake is discoverability data, not a second
+		// ownership check; it will be replaced when the listener publishes.
+		log.Warn("run-file is unreadable; data-directory lock remains authoritative", "err", err)
 	} else if live != nil && runFileOwnerServing(&http.Client{Timeout: staleProbeTimeout}, config.LoopbackHost, live) {
 		return fmt.Errorf("daemon already running (pid %d, port %d); refusing to start", live.PID, live.Port)
 	}
