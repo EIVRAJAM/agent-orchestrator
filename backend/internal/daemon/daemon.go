@@ -36,6 +36,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/browserruntime"
 	"github.com/aoagents/agent-orchestrator/backend/internal/codexops"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/datadirlock"
 	"github.com/aoagents/agent-orchestrator/backend/internal/daemon/supervisor"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd"
@@ -187,6 +188,23 @@ func Run() error {
 	if cwd, err := os.Getwd(); err == nil {
 		cfg.StartupWorkingDirectory = cwd
 	}
+	// Own the data directory before touching any durable or discoverable daemon
+	// state. The kernel-held lock is the authority; running.json, /healthz, the
+	// supervisor socket and the HTTP port are discovery/supervision only.
+	dataDirLock, err := datadirlock.Acquire(datadirlock.Path(cfg.DataDir))
+	if err != nil {
+		if errors.Is(err, datadirlock.ErrLocked) {
+			return fmt.Errorf("daemon data directory %s is already owned by another daemon: %w", cfg.DataDir, err)
+		}
+		return fmt.Errorf("acquire daemon data directory lock: %w", err)
+	}
+	defer func() {
+		if closeErr := dataDirLock.Close(); closeErr != nil {
+			// A lock-release failure must never replace the daemon's primary
+			// startup/shutdown error.
+			_, _ = fmt.Fprintf(os.Stderr, "daemon: release data directory lock: %v\n", closeErr)
+		}
+	}()
 	if err := stabilizeWorkingDirectory(cfg.DataDir); err != nil {
 		return err
 	}
@@ -225,7 +243,14 @@ func Run() error {
 	// /healthz probe; a run-file left by a crashed/hard-killed/reused-PID
 	// predecessor is treated as stale and overwritten when the new server starts.
 	if live, err := runfile.CheckStale(cfg.RunFilePath); err != nil {
-		return fmt.Errorf("inspect run-file: %w", err)
+		if !errors.Is(err, runfile.ErrMalformed) {
+			// The lock proves ownership, but an unreadable/invalid run-file path
+			// would still leave startup unable to publish its handshake. Fail
+			// before opening or migrating SQLite.
+			return fmt.Errorf("inspect run-file: %w", err)
+		}
+		// Malformed JSON is safe to replace while this process owns the lock.
+		log.Warn("run-file is malformed; data-directory lock remains authoritative", "err", err)
 	} else if live != nil && runFileOwnerServing(&http.Client{Timeout: staleProbeTimeout}, config.LoopbackHost, live) {
 		return fmt.Errorf("daemon already running (pid %d, port %d); refusing to start", live.PID, live.Port)
 	}
