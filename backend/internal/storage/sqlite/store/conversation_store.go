@@ -50,6 +50,10 @@ var ErrChatIntakeClosed = errors.New("chat intake was closed by a newer stop epi
 // the dispatch transition. The provider must not be called.
 var ErrTurnDispatchFenced = errors.New("turn is no longer queued for dispatch")
 
+// ErrChatOwnershipLost means the caller's conversation owner or controller
+// generation is no longer current. No mutation from that caller is permitted.
+var ErrChatOwnershipLost = errors.New("chat conversation ownership changed")
+
 type conversationCreateOptions struct {
 	id            string
 	scope         domain.ConversationScope
@@ -602,6 +606,22 @@ func (s *Store) CreateAndActivateConversationBranchAndAdoptQueued(
 	defer s.writeMu.Unlock()
 
 	return s.inImmediateTx(ctx, "create and activate conversation branch with queue recovery", func(q *gen.Queries) error {
+		conversation, err := q.SelectConversationByID(ctx, branch.ConversationID)
+		if err != nil {
+			return fmt.Errorf("select conversation before branch publication: %w", err)
+		}
+		if conversation.CurrentSessionID == nil || *conversation.CurrentSessionID != sessionID ||
+			conversation.CurrentReviewID.Valid ||
+			conversation.ActiveBranchID != branch.ParentBranchID {
+			return ErrChatOwnershipLost
+		}
+		owned, err := conversationOwnedBy(ctx, q, branch.ConversationID, sessionID, "", expectedGeneration)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
 		if err := insertAndActivateConversationBranchTx(ctx, q, branch, now); err != nil {
 			return err
 		}
@@ -1263,6 +1283,21 @@ func (s *Store) AppendReviewUserMessage(ctx context.Context, conversationID stri
 	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, "", "", false, now)
 }
 
+// AppendReviewUserMessageFenced records reviewer work only while the review
+// conversation still belongs to that review, the review controller generation
+// is current, the review is open, and the reviewed Stop episode is unchanged.
+func (s *Store) AppendReviewUserMessageFenced(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, expectedStopEpisode string,
+	msg domain.ConversationMessage,
+	turnID string,
+	now time.Time,
+) (bool, error) {
+	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, "", expectedStopEpisode, true, now)
+}
+
 // AppendRetryUserMessage records a retry and its source as one transaction.
 // Idempotency is owned by the explicit retry relation, not by caller-controlled
 // client message ids.
@@ -1296,6 +1331,20 @@ func (s *Store) AppendRetryUserMessageFenced(
 // AppendReviewRetryUserMessage atomically persists a retry for a reviewer chat.
 func (s *Store) AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error) {
 	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, retryOfTurnID, "", false, now)
+}
+
+// AppendReviewRetryUserMessageFenced is the reviewer equivalent of the durable
+// Stop-episode append fence.
+func (s *Store) AppendReviewRetryUserMessageFenced(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, expectedStopEpisode string,
+	msg domain.ConversationMessage,
+	turnID, retryOfTurnID string,
+	now time.Time,
+) (bool, error) {
+	return s.appendUserMessage(ctx, conversationID, session, reviewID, generation, msg, turnID, retryOfTurnID, expectedStopEpisode, true, now)
 }
 
 func (s *Store) appendUserMessage(
@@ -1372,14 +1421,27 @@ func (s *Store) appendUserMessage(
 	}
 
 	err = s.inTx(ctx, "append user message", func(q *gen.Queries) error {
-		if fenced && reviewID == "" {
-			accepted, checkErr := q.ConversationAcceptsTurnAppend(ctx,
-				gen.ConversationAcceptsTurnAppendParams{
-					ConversationID:       conversationID,
-					SessionID:            session,
-					ControllerGeneration: generation,
-					StopEpisodeID:        expectedStopEpisode,
-				})
+		if fenced {
+			var accepted int64
+			var checkErr error
+			if reviewID == "" {
+				accepted, checkErr = q.ConversationAcceptsTurnAppend(ctx,
+					gen.ConversationAcceptsTurnAppendParams{
+						ConversationID:       conversationID,
+						SessionID:            session,
+						ControllerGeneration: generation,
+						StopEpisodeID:        expectedStopEpisode,
+					})
+			} else {
+				accepted, checkErr = q.ConversationAcceptsReviewTurnAppend(ctx,
+					gen.ConversationAcceptsReviewTurnAppendParams{
+						ConversationID:       conversationID,
+						ReviewID:             sql.NullString{String: reviewID, Valid: true},
+						SessionID:            session,
+						ControllerGeneration: generation,
+						StopEpisodeID:        expectedStopEpisode,
+					})
+			}
 			if checkErr != nil {
 				return fmt.Errorf("check chat intake fence: %w", checkErr)
 			}
@@ -1590,14 +1652,170 @@ func (s *Store) AppendImportedUserMessage(
 	return nil
 }
 
-// MarkTurnDispatching removes a turn from automatic queue replay before any
-// provider call. If the later provider-ID binding fails, delivery is uncertain
-// but the prompt cannot be sent a second time by a reconnected controller.
+// conversationOwnedBy verifies the live owner and controller generation inside
+// the same transaction as a mutation. It is intentionally not a Go-side check:
+// a rebind between a read and a write must not let a stale controller mutate B.
+func conversationOwnedBy(
+	ctx context.Context,
+	q *gen.Queries,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation string,
+) (bool, error) {
+	if reviewID == "" {
+		owned, err := q.ConversationOwnedByPrimarySession(ctx,
+			gen.ConversationOwnedByPrimarySessionParams{
+				ConversationID:       conversationID,
+				SessionID:            &session,
+				ControllerGeneration: generation,
+			})
+		if err != nil {
+			return false, fmt.Errorf("check primary conversation ownership: %w", err)
+		}
+		return owned > 0, nil
+	}
+	owned, err := q.ConversationOwnedByReview(ctx, gen.ConversationOwnedByReviewParams{
+		ConversationID:       conversationID,
+		ReviewID:             sql.NullString{String: reviewID, Valid: true},
+		SessionID:            session,
+		ControllerGeneration: generation,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check review conversation ownership: %w", err)
+	}
+	return owned > 0, nil
+}
+
+// conversationMutationTx composes an owner check and a mutation inside the
+// existing provider-event transaction when there is one; otherwise it opens the
+// normal store transaction under the single writer lock.
+func (s *Store) conversationMutationTx(ctx context.Context, what string, fn func(*gen.Queries) error) error {
+	if q, ok := ctx.Value(conversationProjectionTxKey{}).(*gen.Queries); ok && q != nil {
+		return fn(q)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, what, fn)
+}
+
+// ClaimQueuedTurnForDispatch is the exclusive eager claim. It is deliberately
+// narrower than a generic "mark started": only queued -> running is accepted.
+func (s *Store) ClaimQueuedTurnForDispatch(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID string,
+	now time.Time,
+) (bool, error) {
+	var claimed bool
+	err := s.conversationMutationTx(ctx, "claim queued chat turn for dispatch", func(q *gen.Queries) error {
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
+		rows, err := q.ClaimQueuedConversationTurnForDispatch(ctx,
+			gen.ClaimQueuedConversationTurnForDispatchParams{
+				Now:                  sql.NullTime{Time: now, Valid: true},
+				ID:                   turnID,
+				ConversationID:       conversationID,
+				ControllerGeneration: generation,
+			})
+		if err != nil {
+			return fmt.Errorf("claim turn %s for dispatch: %w", turnID, err)
+		}
+		if rows == 0 {
+			return ErrTurnDispatchFenced
+		}
+		claimed = true
+		return nil
+	})
+	return claimed, err
+}
+
+// BindPreparedDeferredTurn atomically changes a prepared queued turn to running,
+// writes its provider id and started_at, and refuses if Stop already settled it.
+func (s *Store) BindPreparedDeferredTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) (bool, error) {
+	var bound bool
+	err := s.conversationMutationTx(ctx, "bind prepared deferred chat turn", func(q *gen.Queries) error {
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
+		rows, err := q.BindPreparedDeferredConversationTurn(ctx,
+			gen.BindPreparedDeferredConversationTurnParams{
+				ProviderTurnID:       providerTurnID,
+				StartedAt:            sql.NullTime{Time: now, Valid: true},
+				ID:                   turnID,
+				ConversationID:       conversationID,
+				ControllerGeneration: generation,
+			})
+		if err != nil {
+			return fmt.Errorf("bind deferred turn %s: %w", turnID, err)
+		}
+		if rows == 0 {
+			return ErrTurnDispatchFenced
+		}
+		bound = true
+		return nil
+	})
+	return bound, err
+}
+
+// BindClaimedEagerTurn writes the provider id of an already-claimed running turn.
+// It never changes queued -> running, and a Stop or ownership loss fails it.
+func (s *Store) BindClaimedEagerTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) error {
+	return s.conversationMutationTx(ctx, "bind claimed eager chat turn", func(q *gen.Queries) error {
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
+		rows, err := q.BindClaimedEagerConversationTurn(ctx,
+			gen.BindClaimedEagerConversationTurnParams{
+				ProviderTurnID:       providerTurnID,
+				StartedAt:            sql.NullTime{Time: now, Valid: true},
+				ID:                   turnID,
+				ConversationID:       conversationID,
+				ControllerGeneration: generation,
+			})
+		if err != nil {
+			return fmt.Errorf("bind eager turn %s: %w", turnID, err)
+		}
+		if rows == 0 {
+			return ErrTurnDispatchFenced
+		}
+		return nil
+	})
+}
+
+// MarkTurnDispatching is a test/setup strict queued -> running claim. Production
+// dispatch uses ClaimQueuedTurnForDispatch with owner and generation fencing.
 func (s *Store) MarkTurnDispatching(ctx context.Context, turnID string) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
-	rows, err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{
-		ID: turnID,
+	rows, err := q.MarkQueuedConversationTurnRunning(ctx, gen.MarkQueuedConversationTurnRunningParams{
+		StartedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+		ID:        turnID,
 	})
 	if err != nil {
 		return fmt.Errorf("mark turn %s dispatching: %w", turnID, err)
@@ -1608,24 +1826,20 @@ func (s *Store) MarkTurnDispatching(ctx context.Context, turnID string) error {
 	return nil
 }
 
-// BindTurnToProvider records the provider's turn id once a send is accepted and
-// marks the turn running.
+// BindTurnToProvider is retained as a test/setup compatibility helper. It is an
+// atomic queued -> running bind, not a generic production bind. Production uses
+// BindPreparedDeferredTurn or BindClaimedEagerTurn.
 func (s *Store) BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
-	if err := q.BindConversationTurnProviderID(ctx, gen.BindConversationTurnProviderIDParams{
-		ProviderTurnID: providerTurnID,
-		StartedAt:      sql.NullTime{Time: now, Valid: true},
-		ID:             turnID,
-	}); err != nil {
-		return fmt.Errorf("bind turn %s to provider turn %s: %w", turnID, providerTurnID, err)
-	}
-	rows, err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{
-		StartedAt: sql.NullTime{Time: now, Valid: true},
-		ID:        turnID,
-	})
+	rows, err := q.BindConversationTurnProviderIDForQueuedTurn(ctx,
+		gen.BindConversationTurnProviderIDForQueuedTurnParams{
+			ProviderTurnID: providerTurnID,
+			StartedAt:      sql.NullTime{Time: now, Valid: true},
+			ID:             turnID,
+		})
 	if err != nil {
-		return fmt.Errorf("mark turn %s started: %w", turnID, err)
+		return fmt.Errorf("bind turn %s to provider turn %s: %w", turnID, providerTurnID, err)
 	}
 	if rows == 0 {
 		return fmt.Errorf("%w: %s", ErrTurnDispatchFenced, turnID)
@@ -1902,6 +2116,14 @@ func (s *Store) ClaimChatControllerGenerationAndAdoptQueued(
 			return fmt.Errorf("%w: expected %q, found %q",
 				domain.ErrChatControllerGenerationChanged,
 				claim.ExpectedGeneration, session.ControllerGeneration)
+		}
+		owned, ownershipErr := conversationOwnedBy(
+			ctx, q, claim.ConversationID, claim.SessionID, "", claim.ExpectedGeneration)
+		if ownershipErr != nil {
+			return ownershipErr
+		}
+		if !owned {
+			return ErrChatOwnershipLost
 		}
 
 		running, countErr := q.CountRunningConversationTurnsForSession(ctx,
@@ -2775,7 +2997,7 @@ func (s *Store) RecordStopIntentAndCancelQueued(
 	ctx context.Context,
 	conversationID string,
 	session domain.SessionID,
-	reviewID string,
+	reviewID, generation string,
 	reason domain.ChatStopReason,
 	episodeID string,
 	now time.Time,
@@ -2790,6 +3012,13 @@ func (s *Store) RecordStopIntentAndCancelQueued(
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	err := s.inImmediateTx(ctx, "record chat stop intent and cancel queued turns", func(q *gen.Queries) error {
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
 		cutoff, err := q.SelectMaxQueuedConversationTurnRowID(ctx,
 			gen.SelectMaxQueuedConversationTurnRowIDParams{
 				ConversationID:     conversationID,
@@ -2800,19 +3029,33 @@ func (s *Store) RecordStopIntentAndCancelQueued(
 			return fmt.Errorf("read queue cutoff for %s: %w", conversationID, err)
 		}
 		intent.CutoffRowID = cutoff
-		// Reviewer Chat keeps its separate lifecycle. Its cancellation still
-		// uses the owner-scoped cutoff below, but it must not write the
-		// conversation-wide stop facts reserved for the primary controller.
+		var rows int64
 		if reviewID == "" {
-			if err := q.RecordConversationStopIntent(ctx, gen.RecordConversationStopIntentParams{
-				StopReason:      string(reason),
-				StopEpisodeID:   episodeID,
-				StopIntentAt:    sql.NullTime{Time: now, Valid: true},
-				StopCutoffRowid: cutoff,
-				ID:              conversationID,
-			}); err != nil {
-				return fmt.Errorf("record stop intent for %s: %w", conversationID, err)
-			}
+			rows, err = q.RecordPrimaryConversationStopIntent(ctx,
+				gen.RecordPrimaryConversationStopIntentParams{
+					StopReason:       string(reason),
+					StopEpisodeID:    episodeID,
+					StopIntentAt:     sql.NullTime{Time: now, Valid: true},
+					StopCutoffRowid:  cutoff,
+					ID:               conversationID,
+					CurrentSessionID: &session,
+				})
+		} else {
+			rows, err = q.RecordReviewConversationStopIntent(ctx,
+				gen.RecordReviewConversationStopIntentParams{
+					StopReason:      string(reason),
+					StopEpisodeID:   episodeID,
+					StopIntentAt:    sql.NullTime{Time: now, Valid: true},
+					StopCutoffRowid: cutoff,
+					ID:              conversationID,
+					ReviewID:        sql.NullString{String: reviewID, Valid: true},
+				})
+		}
+		if err != nil {
+			return fmt.Errorf("record stop intent for %s: %w", conversationID, err)
+		}
+		if rows != 1 {
+			return ErrChatOwnershipLost
 		}
 		cancelled, err := q.CancelQueuedConversationTurnsThroughRowID(ctx,
 			gen.CancelQueuedConversationTurnsThroughRowIDParams{

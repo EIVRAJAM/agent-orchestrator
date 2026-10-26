@@ -27,6 +27,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 const (
@@ -73,14 +74,17 @@ type Store interface {
 	AppendUserMessage(ctx context.Context, conversationID string, session domain.SessionID, generation string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
 	AppendUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
 	AppendReviewUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
+	AppendReviewUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
 	ConversationMessageByClientID(ctx context.Context, conversationID, clientMessageID string) (domain.ConversationMessage, bool, error)
 	ConversationMessages(ctx context.Context, conversationID string) ([]domain.ConversationMessage, error)
 	AppendRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	AppendRetryUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
+	AppendReviewRetryUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	ConversationStopEpisode(ctx context.Context, conversationID string) (string, error)
-	MarkTurnDispatching(ctx context.Context, turnID string) error
-	BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error
+	ClaimQueuedTurnForDispatch(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID string, now time.Time) (bool, error)
+	BindPreparedDeferredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) (bool, error)
+	BindClaimedEagerTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) error
 	SettleTurn(ctx context.Context, conversationID, providerTurnID string, state domain.TurnState, errMessage string, now time.Time) error
 	SettleTurnByID(ctx context.Context, turnID string, state domain.TurnState, errMessage string, now time.Time) error
 	SettleOrphanedRunningTurnsForConversation(ctx context.Context, session domain.SessionID, conversationID string, now time.Time) error
@@ -118,7 +122,7 @@ type Store interface {
 	CancelQueuedTurns(ctx context.Context, conversationID string, cutoff, now time.Time) error
 	CancelAllQueuedTurns(ctx context.Context, conversationID string, now time.Time) error
 	CancelQueuedTurnByID(ctx context.Context, conversationID, turnID string, now time.Time) error
-	RecordStopIntentAndCancelQueued(ctx context.Context, conversationID string, session domain.SessionID, reviewID string, reason domain.ChatStopReason, episodeID string, now time.Time) (domain.ChatStopIntent, error)
+	RecordStopIntentAndCancelQueued(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, reason domain.ChatStopReason, episodeID string, now time.Time) (domain.ChatStopIntent, error)
 	ClearChatQueueRecovery(ctx context.Context, conversationID string) error
 	QueuedTurnMessage(ctx context.Context, conversationID, turnID string) (domain.ConversationMessage, error)
 	QueuedEditDelivery(ctx context.Context, conversationID, clientMessageID string) (string, bool, error)
@@ -1567,7 +1571,7 @@ func (c *Controller) sendLocked(
 	if c.reviewID == "" {
 		created, err = c.store.AppendUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.generation, expectedStopEpisode, record, turnID, now)
 	} else {
-		created, err = c.store.AppendReviewUserMessage(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, record, turnID, now)
+		created, err = c.store.AppendReviewUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, expectedStopEpisode, record, turnID, now)
 	}
 	if err != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("record user message: %w", err)
@@ -1714,7 +1718,7 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	if c.reviewID == "" {
 		created, err = c.store.AppendRetryUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.generation, expectedStopEpisode, retryMessage, newTurnID, turnID, now)
 	} else {
-		created, err = c.store.AppendReviewRetryUserMessage(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, retryMessage, newTurnID, turnID, now)
+		created, err = c.store.AppendReviewRetryUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, expectedStopEpisode, retryMessage, newTurnID, turnID, now)
 	}
 	if err != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("record retried message: %w", err)
@@ -1946,8 +1950,10 @@ func (c *Controller) dispatchTurn(
 	// A pre-claimed turn (explicit resume) already made that move with a
 	// conditional compare-and-set, so it is not marked again here.
 	if !hasDeferredStart && !preClaimed {
-		if err := c.store.MarkTurnDispatching(ctx, turnID); err != nil {
-			return domain.ConversationTurn{}, fmt.Errorf("mark turn dispatching: %w", err)
+		if _, err := c.store.ClaimQueuedTurnForDispatch(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, c.now(),
+		); err != nil {
+			return domain.ConversationTurn{}, fmt.Errorf("claim turn dispatching: %w", err)
 		}
 	}
 
@@ -2021,22 +2027,39 @@ func (c *Controller) dispatchTurn(
 		c.mu.Unlock()
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
+	var bindErr error
+	switch {
+	case hasDeferredStart && !preClaimed:
+		_, bindErr = c.store.BindPreparedDeferredTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, ref.ProviderTurnID, c.now(),
+		)
+	default:
+		// Eager already claimed queued -> running. A deferred explicit resume
+		// preclaimed through ClaimQueuedTurnForResume; both only need the provider
+		// id attached to the running row.
+		bindErr = c.store.BindClaimedEagerTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, ref.ProviderTurnID, c.now(),
+		)
+	}
+	if bindErr != nil {
 		if hasDeferredStart {
-			// Deferred: the provider never received the prompt, so no boundary was
-			// crossed. Discard the prepared turn and settle the row failed; the
-			// caller clears the one-shot because there is nothing in flight.
+			// Deferred: the provider never received the prompt. A Stop/ownership
+			// fence means the queued row is already terminal; do not settle it or
+			// start the prepared turn.
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
-				c.log.Error("failed to settle deferred turn after bind error", "error", settleErr)
-			}
 			c.mu.Lock()
 			if c.dispatchingTurnID == turnID {
 				c.dispatchingTurnID = ""
 			}
 			c.mu.Unlock()
-			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+			if errors.Is(bindErr, store.ErrTurnDispatchFenced) || errors.Is(bindErr, store.ErrChatOwnershipLost) {
+				return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
+			}
+			if settleErr := c.store.SettleTurnByID(
+				ctx, turnID, domain.TurnStateFailed, bindErr.Error(), c.now()); settleErr != nil {
+				c.log.Error("failed to settle deferred turn after bind error", "error", settleErr)
+			}
+			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
 		}
 		// Eager: SendTurn already crossed the provider boundary, so the provider
 		// may have accepted and run the instruction even though AO could not record
@@ -2048,7 +2071,7 @@ func (c *Controller) dispatchTurn(
 		c.mu.Lock()
 		c.pendingTurnID = ref.ProviderTurnID
 		c.mu.Unlock()
-		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, err)
+		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, bindErr)
 	}
 
 	c.mu.Lock()
@@ -2688,7 +2711,7 @@ func (c *Controller) interruptForHandoff(ctx context.Context) error {
 // unambiguously post-stop.
 func (c *Controller) recordStopIntentLocked(ctx context.Context, reason domain.ChatStopReason) error {
 	intent, err := c.store.RecordStopIntentAndCancelQueued(
-		ctx, c.conversation.ID, c.sessionID, c.reviewID, reason, c.newID(), c.now())
+		ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, reason, c.newID(), c.now())
 	if err != nil {
 		return fmt.Errorf("record %s stop intent: %w", reason, err)
 	}
@@ -3360,7 +3383,7 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 		if event.ProviderTurnID != "" {
 			rootConversation := event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID()
 			if dispatchingTurnID != "" && rootConversation {
-				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
+				if err := c.store.BindClaimedEagerTurn(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
 					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
 				}
 				// A late TurnStarted is the only correlation a driver can offer after

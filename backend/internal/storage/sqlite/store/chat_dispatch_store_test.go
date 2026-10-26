@@ -1,0 +1,230 @@
+package store_test
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	storepkg "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
+)
+
+func TestClaimQueuedTurnForDispatchIsExclusive(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "dispatch-claim", "generation-old")
+
+	claimed, err := s.ClaimQueuedTurnForDispatch(
+		ctx, conversation.ID, session.ID, "", "generation-old", "dispatch-claim", testNow)
+	if err != nil || !claimed {
+		t.Fatalf("first dispatch claim = %v, %v", claimed, err)
+	}
+	second, err := s.ClaimQueuedTurnForDispatch(
+		ctx, conversation.ID, session.ID, "", "generation-old", "dispatch-claim", testNow)
+	if !errors.Is(err, storepkg.ErrTurnDispatchFenced) || second {
+		t.Fatalf("second dispatch claim = %v, %v, want ErrTurnDispatchFenced", second, err)
+	}
+	if got := turnState(t, s, "dispatch-claim"); got != domain.TurnStateRunning {
+		t.Fatalf("turn state = %q, want running", got)
+	}
+}
+
+func TestBindPreparedDeferredIsAtomicAndStopFenced(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "deferred-bind", "generation-old")
+
+	if err := s.CancelQueuedTurnByID(ctx, conversation.ID, "deferred-bind", testNow); err != nil {
+		t.Fatalf("cancel deferred turn: %v", err)
+	}
+	bound, err := s.BindPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "deferred-bind", "provider-deferred", testNow)
+	if !errors.Is(err, storepkg.ErrTurnDispatchFenced) || bound {
+		t.Fatalf("deferred bind after Stop = %v, %v, want ErrTurnDispatchFenced", bound, err)
+	}
+	turn, err := s.TurnByID(ctx, "deferred-bind")
+	if err != nil {
+		t.Fatalf("read turn: %v", err)
+	}
+	if turn.State != domain.TurnStateCancelled || turn.ProviderTurnID != "" || turn.StartedAt != nil {
+		t.Fatalf("fenced deferred turn = %+v, want cancelled/unbound/unstarted", turn)
+	}
+
+	seedQueuedTurn(t, s, session, conversation.ID, "deferred-win", "generation-old")
+	bound, err = s.BindPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "deferred-win", "provider-deferred-win", testNow)
+	if err != nil || !bound {
+		t.Fatalf("deferred bind = %v, %v", bound, err)
+	}
+	turn, err = s.TurnByID(ctx, "deferred-win")
+	if err != nil {
+		t.Fatalf("read winning turn: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "provider-deferred-win" || turn.StartedAt == nil {
+		t.Fatalf("deferred winner = %+v, want running with provider id and started_at", turn)
+	}
+}
+
+func TestBindClaimedEagerRequiresRunningAndRefusesRebind(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "eager-bind", "generation-old")
+
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-bind", "provider-eager", testNow); !errors.Is(err, storepkg.ErrTurnDispatchFenced) {
+		t.Fatalf("eager bind before claim = %v, want ErrTurnDispatchFenced", err)
+	}
+	if claimed, err := s.ClaimQueuedTurnForDispatch(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-bind", testNow); err != nil || !claimed {
+		t.Fatalf("claim eager turn = %v, %v", claimed, err)
+	}
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-bind", "provider-eager", testNow); err != nil {
+		t.Fatalf("bind claimed eager turn: %v", err)
+	}
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-bind", "provider-eager-2", testNow); !errors.Is(err, storepkg.ErrTurnDispatchFenced) {
+		t.Fatalf("second eager bind = %v, want ErrTurnDispatchFenced", err)
+	}
+	turn, err := s.TurnByID(ctx, "eager-bind")
+	if err != nil || turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "provider-eager" {
+		t.Fatalf("eager turn = %+v err=%v", turn, err)
+	}
+}
+
+func TestDeferredBindRollsBackAllFieldsOnFault(t *testing.T) {
+	s, raw := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "deferred-fault", "generation-old")
+	mustExecRaw(t, raw, `
+CREATE TRIGGER fail_deferred_bind
+BEFORE UPDATE OF provider_turn_id ON conversation_turns
+WHEN NEW.id = 'deferred-fault'
+BEGIN
+    SELECT RAISE(ABORT, 'injected deferred bind failure');
+END;`)
+	if _, err := s.BindPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "deferred-fault", "provider-fault", testNow); err == nil {
+		t.Fatal("deferred bind succeeded despite injected failure")
+	}
+	turn, err := s.TurnByID(ctx, "deferred-fault")
+	if err != nil {
+		t.Fatalf("read faulted turn: %v", err)
+	}
+	if turn.State != domain.TurnStateQueued || turn.ProviderTurnID != "" || turn.StartedAt != nil {
+		t.Fatalf("faulted deferred turn = %+v, want queued/unbound/unstarted", turn)
+	}
+}
+
+func TestConcurrentDispatchClaimHasOneWinner(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "concurrent-claim", "generation-old")
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.ClaimQueuedTurnForDispatch(
+				ctx, conversation.ID, session.ID, "", "generation-old", "concurrent-claim", testNow)
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	successes, fenced := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, storepkg.ErrTurnDispatchFenced):
+			fenced++
+		default:
+			t.Fatalf("concurrent claim error = %v", err)
+		}
+	}
+	if successes != 1 || fenced != 1 {
+		t.Fatalf("concurrent claims = %d success, %d fenced; want 1/1", successes, fenced)
+	}
+}
+
+func TestOwnerLostFencesDispatchAndStop(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	seedProject(t, st, "owner-lost")
+	first := newScopedChatSession(t, st, "owner-lost", "gen-a")
+	second := newScopedChatSession(t, st, "owner-lost", "gen-b")
+	conversation, err := st.CreateConversation(ctx, "owner-lost-conversation", domain.ConversationScopeProject, "owner-lost", first.ID, testNow)
+	if err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	seedScopedQueued(t, st, conversation.ID, first, "owner-queued", "gen-a")
+	// A->B rebind.
+	if _, err := st.CreateProjectConversationWithContextReset(ctx, "rebind-placeholder", "owner-lost", second.ID,
+		domain.ConversationActivity{}, testNow.Add(time.Minute)); err != nil {
+		t.Fatalf("rebind conversation: %v", err)
+	}
+	if _, err := st.ClaimChatControllerGenerationAndAdoptQueued(ctx, domain.ChatControllerClaim{
+		SessionID: first.ID, ConversationID: conversation.ID,
+		ExpectedGeneration: "gen-a", Generation: "gen-a-next",
+		AdoptQueued: true, RecoveryRequired: true, SettleRunning: true, Now: testNow,
+	}); !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("stale claim error = %v, want ErrChatOwnershipLost", err)
+	}
+	if _, err := st.RecordStopIntentAndCancelQueued(ctx, conversation.ID, first.ID, "", "gen-a",
+		domain.ChatStopReasonUserStop, "stale-stop", testNow); !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("stale stop error = %v, want ErrChatOwnershipLost", err)
+	}
+	if got := turnState(t, st, "owner-queued"); got != domain.TurnStateQueued {
+		t.Fatalf("stale owner changed queued state to %q", got)
+	}
+	facts, err := st.ConversationQueueFacts(ctx, conversation.ID)
+	if err != nil || facts.QueueRecoveryRequired {
+		t.Fatalf("stale owner changed hold = %+v err=%v", facts, err)
+	}
+}
+
+func TestStaleOwnerCannotPublishProviderBoundary(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	seedProject(t, st, "boundary-stale")
+	first := newScopedChatSession(t, st, "boundary-stale", "gen-a")
+	second := newScopedChatSession(t, st, "boundary-stale", "gen-b")
+	conversation, err := st.CreateConversation(ctx, "boundary-stale-conversation", domain.ConversationScopeProject, "boundary-stale", first.ID, testNow)
+	if err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	seedScopedQueued(t, st, conversation.ID, first, "boundary-stale-queued", "gen-a")
+	branch := domain.ConversationBranch{
+		ID: "stale-boundary", ConversationID: conversation.ID, SessionID: first.ID,
+		ProviderConversationID: "thread-stale", ParentBranchID: conversation.ActiveBranchID,
+		ForkAfterSequence: conversation.LatestSequence, ProviderScopeID: "stale-boundary",
+		CreatedAt: testNow,
+	}
+	if _, err := st.CreateProjectConversationWithContextReset(ctx, "boundary-rebind", "boundary-stale", second.ID,
+		domain.ConversationActivity{}, testNow.Add(time.Minute)); err != nil {
+		t.Fatalf("rebind conversation: %v", err)
+	}
+	if err := st.CreateAndActivateConversationBranchAndAdoptQueued(
+		ctx, first.ID, branch, "gen-a", "gen-a-next", testNow.Add(2*time.Minute)); !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("stale boundary error = %v, want ErrChatOwnershipLost", err)
+	}
+	if _, err := st.ConversationBranch(ctx, conversation.ID, branch.ID); !errors.Is(err, domain.ErrNoConversationBranch) {
+		t.Fatalf("stale boundary branch error = %v, want absent", err)
+	}
+	rec, found, err := st.GetSession(ctx, first.ID)
+	if err != nil || !found || rec.Metadata.ControllerGeneration != "gen-a" {
+		t.Fatalf("stale owner generation = %q found=%v err=%v", rec.Metadata.ControllerGeneration, found, err)
+	}
+	if got := turnState(t, st, "boundary-stale-queued"); got != domain.TurnStateQueued {
+		t.Fatalf("stale boundary queue = %q, want untouched", got)
+	}
+}

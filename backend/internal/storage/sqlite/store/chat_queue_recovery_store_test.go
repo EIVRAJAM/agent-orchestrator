@@ -77,7 +77,7 @@ func TestRecordStopIntentAndCancelQueuedIsAtomicAndPreservesPostCutoff(t *testin
 	seedQueuedTurn(t, s, session, conversation.ID, "turn-stop-2", "generation-old")
 
 	intent, err := s.RecordStopIntentAndCancelQueued(
-		ctx, conversation.ID, session.ID, "", domain.ChatStopReasonUserStop, "episode-1", testNow)
+		ctx, conversation.ID, session.ID, "", "generation-old", domain.ChatStopReasonUserStop, "episode-1", testNow)
 	if err != nil {
 		t.Fatalf("record stop: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestRecordStopIntentAndCancelQueuedIsAtomicAndPreservesPostCutoff(t *testin
 	// with its own, later cutoff.
 	seedQueuedTurn(t, s, session, conversation.ID, "turn-after-stop", "generation-old")
 	second, err := s.RecordStopIntentAndCancelQueued(
-		ctx, conversation.ID, session.ID, "", domain.ChatStopReasonUserStop, "episode-2", testNow.Add(time.Minute))
+		ctx, conversation.ID, session.ID, "", "generation-old", domain.ChatStopReasonUserStop, "episode-2", testNow.Add(time.Minute))
 	if err != nil {
 		t.Fatalf("record second stop: %v", err)
 	}
@@ -121,7 +121,7 @@ BEGIN
 END;`)
 
 	if _, err := s.RecordStopIntentAndCancelQueued(
-		ctx, conversation.ID, session.ID, "", domain.ChatStopReasonUserStop, "episode-failed", testNow); err == nil {
+		ctx, conversation.ID, session.ID, "", "generation-old", domain.ChatStopReasonUserStop, "episode-failed", testNow); err == nil {
 		t.Fatal("stop succeeded despite injected cancellation failure")
 	}
 	if got := turnState(t, s, "turn-rollback"); got != domain.TurnStateQueued {

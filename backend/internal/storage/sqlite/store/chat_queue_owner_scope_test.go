@@ -2,10 +2,12 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	storepkg "github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 func newScopedChatSession(t *testing.T, s interface {
@@ -55,12 +57,13 @@ func seedRunningActivity(t *testing.T, s interface {
 func seedReviewConversation(t *testing.T, s interface {
 	UpsertReview(context.Context, domain.Review) error
 	CreateReviewConversation(context.Context, string, string, domain.ProjectID, domain.SessionID, time.Time) (domain.ConversationRecord, error)
+	ClaimReviewChatController(context.Context, string, string, string, time.Time) (bool, error)
 	AppendReviewUserMessage(context.Context, string, domain.SessionID, string, string, domain.ConversationMessage, string, time.Time) (bool, error)
-}, reviewID string, worker domain.SessionRecord, conversationID, turnID, generation string) domain.ConversationRecord {
+}, reviewID string, harness domain.ReviewerHarness, worker domain.SessionRecord, conversationID, turnID, generation string) domain.ConversationRecord {
 	t.Helper()
 	review := domain.Review{
 		ID: reviewID, SessionID: worker.ID, ProjectID: worker.ProjectID,
-		Harness: domain.ReviewerCodex, CreatedAt: testNow, UpdatedAt: testNow,
+		Harness: harness, CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	if err := s.UpsertReview(context.Background(), review); err != nil {
 		t.Fatalf("UpsertReview: %v", err)
@@ -68,6 +71,9 @@ func seedReviewConversation(t *testing.T, s interface {
 	conversation, err := s.CreateReviewConversation(context.Background(), conversationID, reviewID, worker.ProjectID, worker.ID, testNow)
 	if err != nil {
 		t.Fatalf("CreateReviewConversation: %v", err)
+	}
+	if claimed, err := s.ClaimReviewChatController(context.Background(), reviewID, "provider-"+reviewID, generation, testNow); err != nil || !claimed {
+		t.Fatalf("ClaimReviewChatController: claimed=%v err=%v", claimed, err)
 	}
 	created, err := s.AppendReviewUserMessage(context.Background(), conversation.ID, worker.ID, reviewID, generation,
 		domain.ConversationMessage{
@@ -92,9 +98,9 @@ func TestStopScopeIsPrimaryOwnerOnly(t *testing.T) {
 	}
 	seedScopedQueued(t, s, conversation.ID, primary, "primary-queued", "gen-primary")
 	seedScopedQueued(t, s, conversation.ID, other, "other-queued", "gen-other")
-	reviewConversation := seedReviewConversation(t, s, "scope-review", primary, "scope-review-conversation", "review-queued", "gen-review")
+	reviewConversation := seedReviewConversation(t, s, "scope-review", domain.ReviewerCodex, primary, "scope-review-conversation", "review-queued", "gen-review")
 
-	if _, err := s.RecordStopIntentAndCancelQueued(ctx, conversation.ID, primary.ID, "",
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, conversation.ID, primary.ID, "", "gen-primary",
 		domain.ChatStopReasonUserStop, "primary-stop", testNow); err != nil {
 		t.Fatalf("primary Stop: %v", err)
 	}
@@ -108,7 +114,7 @@ func TestStopScopeIsPrimaryOwnerOnly(t *testing.T) {
 		t.Fatalf("review queued state = %q, want untouched by primary Stop", got)
 	}
 
-	if _, err := s.RecordStopIntentAndCancelQueued(ctx, reviewConversation.ID, primary.ID, "scope-review",
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, reviewConversation.ID, primary.ID, "scope-review", "gen-review",
 		domain.ChatStopReasonUserStop, "review-stop", testNow); err != nil {
 		t.Fatalf("review Stop: %v", err)
 	}
@@ -136,7 +142,7 @@ func TestClaimScopeAdoptsAndSettlesOnlyTargetSession(t *testing.T) {
 	seedScopedQueued(t, s, conversation.ID, other, "other-queued", "gen-other")
 	seedScopedQueued(t, s, conversation.ID, other, "other-running", "gen-other")
 	seedRunningActivity(t, s, conversation.ID, "other-running", "provider-other", "activity-other")
-	reviewConversation := seedReviewConversation(t, s, "claim-scope-review", primary, "claim-scope-review-conversation", "review-running", "gen-review")
+	reviewConversation := seedReviewConversation(t, s, "claim-scope-review", domain.ReviewerCodex, primary, "claim-scope-review-conversation", "review-running", "gen-review")
 	seedRunningActivity(t, s, reviewConversation.ID, "review-running", "provider-review", "activity-review")
 
 	adopted, err := s.ClaimChatControllerGenerationAndAdoptQueued(ctx, domain.ChatControllerClaim{
@@ -210,7 +216,7 @@ func TestRetiredSessionSettlesOwnActivitiesOnly(t *testing.T) {
 	seedRunningActivity(t, s, conversation.ID, "retired-running", "provider-retired", "activity-retired")
 	seedScopedQueued(t, s, conversation.ID, target, "target-running", "gen-target")
 	seedRunningActivity(t, s, conversation.ID, "target-running", "provider-target", "activity-target")
-	reviewConversation := seedReviewConversation(t, s, "retired-review", predecessor, "retired-review-conversation", "review-running", "gen-review")
+	reviewConversation := seedReviewConversation(t, s, "retired-review", domain.ReviewerCodex, predecessor, "retired-review-conversation", "review-running", "gen-review")
 	seedRunningActivity(t, s, reviewConversation.ID, "review-running", "provider-review", "activity-review")
 
 	if err := s.SettleRetiredSessionTurns(ctx, predecessor.ID, conversation.ID, testNow); err != nil {
@@ -294,5 +300,69 @@ END;`)
 	if statuses["activity-retired-fail"] != domain.ActivityStatusRunning ||
 		statuses["activity-target-fail"] != domain.ActivityStatusRunning {
 		t.Fatalf("activities after rollback = %+v, want all running", statuses)
+	}
+}
+
+func TestTwoReviewOwnersHaveIndependentStopEpisodes(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "review-isolation")
+	worker := newScopedChatSession(t, s, "review-isolation", "gen-worker")
+	reviewOne := seedReviewConversation(t, s, "review-one", domain.ReviewerCodex, worker, "review-one-conversation", "review-one-turn", "gen-review-one")
+	reviewTwo := seedReviewConversation(t, s, "review-two", domain.ReviewerClaudeCode, worker, "review-two-conversation", "review-two-turn", "gen-review-two")
+
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, reviewOne.ID, worker.ID, "review-one", "gen-review-one",
+		domain.ChatStopReasonUserStop, "review-one-stop", testNow); err != nil {
+		t.Fatalf("review one Stop: %v", err)
+	}
+	if got := turnState(t, s, "review-one-turn"); got != domain.TurnStateInterrupted {
+		t.Fatalf("review one state = %q, want interrupted", got)
+	}
+	if got := turnState(t, s, "review-two-turn"); got != domain.TurnStateQueued {
+		t.Fatalf("review two state = %q, want untouched", got)
+	}
+	episodeTwo, err := s.ConversationStopEpisode(ctx, reviewTwo.ID)
+	if err != nil || episodeTwo != "" {
+		t.Fatalf("review two episode = %q err=%v, want empty", episodeTwo, err)
+	}
+
+	// A stale review generation cannot append or Stop after replacement.
+	if _, err := s.AppendReviewUserMessageFenced(ctx, reviewTwo.ID, worker.ID, "review-two", "gen-stale", "",
+		domain.ConversationMessage{
+			ID: "stale-review-message", Text: "stale review", Origin: domain.MessageOriginHuman,
+			ClientMessageID: "stale-review-message",
+		}, "stale-review-turn", testNow); !errors.Is(err, storepkg.ErrChatIntakeClosed) {
+		t.Fatalf("stale review append error = %v, want ErrChatIntakeClosed", err)
+	}
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, reviewTwo.ID, worker.ID, "review-two", "gen-stale",
+		domain.ChatStopReasonUserStop, "stale-review-stop", testNow); !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("stale review Stop error = %v, want ErrChatOwnershipLost", err)
+	}
+	if got := turnState(t, s, "review-two-turn"); got != domain.TurnStateQueued {
+		t.Fatalf("stale review changed state = %q", got)
+	}
+}
+
+func TestReviewAppendFenceRejectsChangedEpisode(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "review-episode")
+	worker := newScopedChatSession(t, s, "review-episode", "gen-worker")
+	conversation := seedReviewConversation(t, s, "review-episode", domain.ReviewerCodex, worker, "review-episode-conversation", "review-episode-turn", "gen-review")
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, conversation.ID, worker.ID, "review-episode", "gen-review",
+		domain.ChatStopReasonUserStop, "review-episode-stop", testNow); err != nil {
+		t.Fatalf("review Stop: %v", err)
+	}
+	// Captured before the Stop: the append must observe a changed episode.
+	if _, err := s.AppendReviewUserMessageFenced(ctx, conversation.ID, worker.ID, "review-episode", "gen-review", "",
+		domain.ConversationMessage{
+			ID: "old-episode-message", Text: "old episode", Origin: domain.MessageOriginHuman,
+			ClientMessageID: "old-episode-message",
+		}, "old-episode-turn", testNow.Add(time.Minute)); !errors.Is(err, storepkg.ErrChatIntakeClosed) {
+		t.Fatalf("append with stale review episode error = %v, want ErrChatIntakeClosed", err)
+	}
+	episode, err := s.ConversationStopEpisode(ctx, conversation.ID)
+	if err != nil || episode == "" {
+		t.Fatalf("review Stop episode = %q err=%v, want durable", episode, err)
 	}
 }

@@ -61,7 +61,7 @@ func seedRestartedQueue(t *testing.T, st *sqlite.Store) (domain.ConversationReco
 	if err != nil || !claimed {
 		t.Fatalf("claim head: claimed=%v err=%v", claimed, err)
 	}
-	if err := st.BindTurnToProvider(ctx, "turn-live-head", "provider-live-head", time.Now().UTC()); err != nil {
+	if err := st.BindClaimedEagerTurn(ctx, conversation.ID, testSession, "", "gen-live", "turn-live-head", "provider-live-head", time.Now().UTC()); err != nil {
 		t.Fatalf("bind live head: %v", err)
 	}
 	return conversation, "turn-live-head", "turn-live-next"

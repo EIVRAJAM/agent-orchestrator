@@ -565,14 +565,36 @@ type bindStepStore struct {
 	fail bool
 }
 
-func (s *bindStepStore) BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error {
+func (s *bindStepStore) BindClaimedEagerTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) error {
 	s.mu.Lock()
 	fail := s.fail
 	s.mu.Unlock()
 	if fail {
 		return errors.New("bind unavailable")
 	}
-	return s.Store.BindTurnToProvider(ctx, turnID, providerTurnID, now)
+	return s.Store.BindClaimedEagerTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
+}
+
+func (s *bindStepStore) BindPreparedDeferredTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) (bool, error) {
+	s.mu.Lock()
+	fail := s.fail
+	s.mu.Unlock()
+	if fail {
+		return false, errors.New("bind unavailable")
+	}
+	return s.Store.BindPreparedDeferredTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
 }
 
 func (s *bindStepStore) setFail(fail bool) {

@@ -649,13 +649,67 @@ UPDATE conversation_turns
 SET provider_turn_id = ?, started_at = COALESCE(started_at, ?)
 WHERE id = ?;
 
--- The state predicate is the durable dispatch fence: a Stop that settled this
--- queued row between append and dispatch must win, and the provider must not be
--- called. execrows lets the store refuse the dispatch.
--- name: MarkConversationTurnStarted :execrows
+-- The strict eager claim. A second claim over the same running row must fail:
+-- accepting running here would make dispatch non-exclusive. The owner check is
+-- also required inside the store transaction, not only in Go.
+-- name: ClaimQueuedConversationTurnForDispatch :execrows
 UPDATE conversation_turns
-SET state = 'running', started_at = COALESCE(started_at, ?)
-WHERE id = ? AND state IN ('queued', 'running');
+SET state = 'running', started_at = COALESCE(started_at, sqlc.arg(now))
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = sqlc.arg(controller_generation);
+
+-- Deferred binding is one atomic transition: queued -> running plus provider id
+-- and started_at. It must not expose a partially bound row if Stop wins.
+-- name: BindPreparedDeferredConversationTurn :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    provider_turn_id = sqlc.arg(provider_turn_id),
+    started_at = COALESCE(started_at, sqlc.arg(started_at))
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = sqlc.arg(controller_generation);
+
+-- Eager binding happens only after the strict dispatch claim crossed the
+-- provider boundary. It associates an id with an already-running row and never
+-- claims the row again.
+-- name: BindClaimedEagerConversationTurn :execrows
+UPDATE conversation_turns
+SET provider_turn_id = sqlc.arg(provider_turn_id),
+    started_at = COALESCE(started_at, sqlc.arg(started_at))
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = sqlc.arg(controller_generation);
+
+-- Test/setup compatibility only; production dispatch uses the split operations
+-- above. It is still a strict queued -> running claim, never a running rebind.
+-- name: MarkQueuedConversationTurnRunning :execrows
+UPDATE conversation_turns
+SET state = 'running', started_at = COALESCE(started_at, sqlc.arg(started_at))
+WHERE id = sqlc.arg(id)
+  AND state = 'queued';
+
+-- Test/setup compatibility only; production dispatch uses the split operations
+-- above. It is still a single atomic queued -> running bind, never a rebind of a
+-- running row.
+-- name: BindConversationTurnProviderIDForQueuedTurn :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    provider_turn_id = sqlc.arg(provider_turn_id),
+    started_at = COALESCE(started_at, sqlc.arg(started_at))
+WHERE id = sqlc.arg(id)
+  AND state = 'queued'
+  AND provider_turn_id = '';
 
 -- name: SettleConversationTurn :exec
 UPDATE conversation_turns
@@ -929,14 +983,29 @@ WHERE conversation_id = sqlc.arg(conversation_id)
   )
   AND state = 'queued';
 
--- name: RecordConversationStopIntent :exec
+-- name: RecordPrimaryConversationStopIntent :execrows
 UPDATE conversations
 SET stop_reason = sqlc.arg(stop_reason),
     stop_episode_id = sqlc.arg(stop_episode_id),
     stop_intent_at = sqlc.arg(stop_intent_at),
     stop_cutoff_rowid = sqlc.arg(stop_cutoff_rowid),
     queue_recovery_required = 0
-WHERE id = sqlc.arg(id);
+WHERE conversations.id = sqlc.arg(id)
+  AND conversations.current_session_id = sqlc.arg(current_session_id)
+  AND conversations.current_review_id IS NULL
+  AND conversations.scope IN ('session', 'project');
+
+-- name: RecordReviewConversationStopIntent :execrows
+UPDATE conversations
+SET stop_reason = sqlc.arg(stop_reason),
+    stop_episode_id = sqlc.arg(stop_episode_id),
+    stop_intent_at = sqlc.arg(stop_intent_at),
+    stop_cutoff_rowid = sqlc.arg(stop_cutoff_rowid),
+    queue_recovery_required = 0
+WHERE conversations.id = sqlc.arg(id)
+  AND conversations.scope = 'review'
+  AND conversations.review_id = sqlc.arg(review_id)
+  AND conversations.current_review_id = sqlc.arg(review_id);
 
 -- name: CancelQueuedConversationTurnsThroughRowID :execrows
 UPDATE conversation_turns
@@ -969,7 +1038,52 @@ WHERE s.id = sqlc.arg(session_id)
   AND s.is_terminated = 0
   AND s.controller_generation = sqlc.arg(controller_generation)
   AND c.current_session_id = s.id
+  AND c.current_review_id IS NULL
   AND c.stop_episode_id = sqlc.arg(stop_episode_id);
+
+-- Reviewer Chat has its own controller generation and a conversation that is
+-- owned by review_id/current_review_id, not current_session_id. This is the
+-- equivalent durable append fence for that owner.
+-- name: ConversationAcceptsReviewTurnAppend :one
+SELECT CAST(COUNT(*) AS INTEGER) AS accepted
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = sqlc.arg(conversation_id)
+  AND c.scope = 'review'
+  AND c.review_id = sqlc.arg(review_id)
+  AND c.current_review_id = sqlc.arg(review_id)
+  AND r.id = sqlc.arg(review_id)
+  AND r.session_id = sqlc.arg(session_id)
+  AND r.controller_generation = sqlc.arg(controller_generation)
+  AND r.is_archived = FALSE
+  AND r.interface_mode = 'chat'
+  AND c.stop_episode_id = sqlc.arg(stop_episode_id);
+
+-- Current ownership proofs used by mutation transactions.
+-- name: ConversationOwnedByPrimarySession :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN sessions AS s ON s.id = c.current_session_id
+WHERE c.id = sqlc.arg(conversation_id)
+  AND c.current_session_id = sqlc.arg(session_id)
+  AND c.current_review_id IS NULL
+  AND c.scope IN ('session', 'project')
+  AND s.id = sqlc.arg(session_id)
+  AND s.controller_generation = sqlc.arg(controller_generation);
+
+-- name: ConversationOwnedByReview :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = sqlc.arg(conversation_id)
+  AND c.scope = 'review'
+  AND c.review_id = sqlc.arg(review_id)
+  AND c.current_review_id = sqlc.arg(review_id)
+  AND r.id = sqlc.arg(review_id)
+  AND r.session_id = sqlc.arg(session_id)
+  AND r.controller_generation = sqlc.arg(controller_generation)
+  AND r.is_archived = FALSE
+  AND r.interface_mode = 'chat';
 
 -- Overwrite the turn's changed-file summary. The provider re-sends the whole diff
 -- on every update, so the latest payload is the complete answer and there is

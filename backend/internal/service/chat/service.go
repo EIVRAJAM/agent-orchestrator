@@ -1607,8 +1607,16 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		// Explicit termination still owns that queue and must cancel it durably.
 		if s.store != nil {
 			if conversation, convErr := s.store.ConversationForSession(ctx, id); convErr == nil {
+				generation := ""
+				if s.sessions != nil {
+					if rec, found, readErr := s.sessions.GetSession(ctx, id); readErr != nil {
+						stopErr = errors.Join(stopErr, fmt.Errorf("read terminated session generation: %w", readErr))
+					} else if found {
+						generation = rec.Metadata.ControllerGeneration
+					}
+				}
 				if _, recordErr := s.store.RecordStopIntentAndCancelQueued(
-					ctx, conversation.ID, id, "", domain.ChatStopReasonSessionTerminated, s.newID(), s.now(),
+					ctx, conversation.ID, id, "", generation, domain.ChatStopReasonSessionTerminated, s.newID(), s.now(),
 				); recordErr != nil {
 					stopErr = errors.Join(stopErr, fmt.Errorf("record terminated chat queue: %w", recordErr))
 				}
@@ -1686,7 +1694,7 @@ func (s *Service) StopForOwner(ctx context.Context, owner domain.ConversationOwn
 	if err != nil {
 		return err
 	}
-	err = controller.Terminate(ctx)
+	err = controller.TerminateForStop(ctx, domain.ChatStopReasonUserStop)
 	select {
 	case <-controller.stopped:
 		s.mu.Lock()

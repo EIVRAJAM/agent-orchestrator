@@ -711,19 +711,40 @@ behind the existing head.
   rows through that cutoff.
 
 Rows inserted after the cutoff are new work and survive. The transaction
-commits before provider interruption, so a crash either leaves no Stop intent
-or leaves the complete cancellation. A clean daemon shutdown uses `Close`, not a
-user Stop, and does not cancel queued work.
+verifies current conversation ownership before writing any Stop fact. For the
+primary owner that is `current_session_id` plus live session generation; for a
+review it is `review_id`/`current_review_id` plus the review's live controller
+generation. Review Stop facts live in the review conversation, never in a
+primary conversation. The transaction commits before provider interruption, so
+a crash either leaves no Stop intent or leaves the complete cancellation. A
+clean daemon shutdown uses `Close`, not a user Stop, and does not cancel queued
+work.
 
 A Send also carries an intake fence. It captures `stop_episode_id` before it
 starts recording the prompt and the append transaction re-checks that episode
 together with the session's non-terminated state, ownership, and controller
-generation. If Stop commits while the Send is paused before the insert, the
-append returns `ErrChatIntakeClosed` and creates no row. If the append wins, the
-turn is inside the Stop cutoff and is interrupted. The queued-to-running
-transition is itself conditional on the row still being `queued` (or already
-`running`), so a settlement that wins before `MarkTurnDispatching` cannot result
-in a provider call.
+generation. Reviewer Chat has its own equivalent append fence against its review
+conversation, `review_id`, worker session, review generation, open interface,
+and review Stop episode. If Stop commits while a Send is paused before the
+insert, the append returns `ErrChatIntakeClosed` and creates no row. If the
+append wins, the turn is inside the Stop cutoff and is interrupted.
+
+Dispatch has three distinct durable transitions:
+
+- **Eager claim** — strictly `queued -> running` before `SendTurn`; a second
+  claim over the same running row is `ErrTurnDispatchFenced`.
+- **Deferred bind** — a single `queued -> running` plus provider-id and
+  `started_at` transaction before `StartDeferredTurn`. A Stop that already
+  interrupted the queued row leaves it untouched, discards the prepared turn,
+  and never starts the provider.
+- **Eager bind** — after `SendTurn`, attaches the provider id only to the
+  already-running row. Failure remains uncertain delivery and never requeues or
+  retries the prompt.
+
+There is no generic production bind that mixes these boundaries. The same
+transaction also verifies that the conversation's current primary or review
+owner is still the caller; a Stop, claim, branch publication, or dispatch after
+a rebind fails without changing the new owner's rows, hold, or episode.
 
 Every new queue operation is owner-scoped by conversation, `handled_by_session_id`,
 and the expected `handled_by_review_id` state. Primary operations require

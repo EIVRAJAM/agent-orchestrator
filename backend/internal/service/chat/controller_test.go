@@ -227,7 +227,8 @@ func (c *nativeHistoryConversation) historyReads() int {
 
 type deferredConversation struct {
 	*fakeConversation
-	start func(string) error
+	start   func(string) error
+	discard func(string)
 }
 
 type stuckConversation struct {
@@ -257,7 +258,11 @@ func (f *deferredConversation) StartDeferredTurn(providerTurnID string) error {
 	return f.start(providerTurnID)
 }
 
-func (f *deferredConversation) DiscardDeferredTurn(string) {}
+func (f *deferredConversation) DiscardDeferredTurn(providerTurnID string) {
+	if f.discard != nil {
+		f.discard(providerTurnID)
+	}
+}
 
 func newFakeConversation() *fakeConversation {
 	return &fakeConversation{
@@ -3286,7 +3291,7 @@ func TestStaleControllerEventsDoNotReachTheTimeline(t *testing.T) {
 		ProviderItemID: "stale-message",
 		Delta:          "must not survive",
 	})
-	if err := h.svc.Stop(ctx, testSession); err != nil {
+	if err := h.svc.Stop(ctx, testSession); err != nil && !errors.Is(err, store.ErrChatOwnershipLost) {
 		t.Fatalf("stop stale controller: %v", err)
 	}
 
@@ -4945,7 +4950,7 @@ func (s *failFirstQueueCancellationStore) RecordStopIntentAndCancelQueued(
 	ctx context.Context,
 	conversationID string,
 	session domain.SessionID,
-	reviewID string,
+	reviewID, generation string,
 	reason domain.ChatStopReason,
 	episodeID string,
 	now time.Time,
@@ -4957,7 +4962,7 @@ func (s *failFirstQueueCancellationStore) RecordStopIntentAndCancelQueued(
 	if call == 1 {
 		return domain.ChatStopIntent{}, errors.New("injected queue cancellation failure")
 	}
-	return s.Store.RecordStopIntentAndCancelQueued(ctx, conversationID, session, reviewID, reason, episodeID, now)
+	return s.Store.RecordStopIntentAndCancelQueued(ctx, conversationID, session, reviewID, generation, reason, episodeID, now)
 }
 
 func (s *failFirstQueueCancellationStore) callCount() int {
