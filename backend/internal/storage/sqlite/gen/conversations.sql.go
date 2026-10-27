@@ -978,8 +978,38 @@ type ConversationOwnedByPrimarySessionParams struct {
 }
 
 // Current ownership proofs used by mutation transactions.
+// Cleanup ownership can survive is_terminated=1 / archived review, but it must
+// still prove the conversation has not moved to another owner.
 func (q *Queries) ConversationOwnedByPrimarySession(ctx context.Context, arg ConversationOwnedByPrimarySessionParams) (int64, error) {
 	row := q.db.QueryRowContext(ctx, conversationOwnedByPrimarySession, arg.ConversationID, arg.SessionID, arg.ControllerGeneration)
+	var owned int64
+	err := row.Scan(&owned)
+	return owned, err
+}
+
+const conversationOwnedByPrimarySessionActive = `-- name: ConversationOwnedByPrimarySessionActive :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN sessions AS s ON s.id = c.current_session_id
+WHERE c.id = ?1
+  AND c.current_session_id = ?2
+  AND c.current_review_id IS NULL
+  AND c.scope IN ('session', 'project')
+  AND s.id = ?2
+  AND s.session_mode = 'chat'
+  AND s.is_terminated = 0
+  AND s.controller_generation = ?3
+`
+
+type ConversationOwnedByPrimarySessionActiveParams struct {
+	ConversationID       string
+	SessionID            *domain.SessionID
+	ControllerGeneration string
+}
+
+// Active dispatch ownership additionally requires a live Chat session.
+func (q *Queries) ConversationOwnedByPrimarySessionActive(ctx context.Context, arg ConversationOwnedByPrimarySessionActiveParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationOwnedByPrimarySessionActive, arg.ConversationID, arg.SessionID, arg.ControllerGeneration)
 	var owned int64
 	err := row.Scan(&owned)
 	return owned, err
@@ -996,8 +1026,6 @@ WHERE c.id = ?1
   AND r.id = ?2
   AND r.session_id = ?3
   AND r.controller_generation = ?4
-  AND r.is_archived = FALSE
-  AND r.interface_mode = 'chat'
 `
 
 type ConversationOwnedByReviewParams struct {
@@ -1009,6 +1037,40 @@ type ConversationOwnedByReviewParams struct {
 
 func (q *Queries) ConversationOwnedByReview(ctx context.Context, arg ConversationOwnedByReviewParams) (int64, error) {
 	row := q.db.QueryRowContext(ctx, conversationOwnedByReview,
+		arg.ConversationID,
+		arg.ReviewID,
+		arg.SessionID,
+		arg.ControllerGeneration,
+	)
+	var owned int64
+	err := row.Scan(&owned)
+	return owned, err
+}
+
+const conversationOwnedByReviewActive = `-- name: ConversationOwnedByReviewActive :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = ?1
+  AND c.scope = 'review'
+  AND c.review_id = ?2
+  AND c.current_review_id = ?2
+  AND r.id = ?2
+  AND r.session_id = ?3
+  AND r.controller_generation = ?4
+  AND r.is_archived = FALSE
+  AND r.interface_mode = 'chat'
+`
+
+type ConversationOwnedByReviewActiveParams struct {
+	ConversationID       string
+	ReviewID             sql.NullString
+	SessionID            domain.SessionID
+	ControllerGeneration string
+}
+
+func (q *Queries) ConversationOwnedByReviewActive(ctx context.Context, arg ConversationOwnedByReviewActiveParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationOwnedByReviewActive,
 		arg.ConversationID,
 		arg.ReviewID,
 		arg.SessionID,
@@ -1737,6 +1799,49 @@ func (q *Queries) InsertReviewConversationTurn(ctx context.Context, arg InsertRe
 		arg.RequestedAt,
 	)
 	return err
+}
+
+const interruptClaimedUndeliveredTurn = `-- name: InterruptClaimedUndeliveredTurn :execrows
+UPDATE conversation_turns
+SET state = 'interrupted',
+    error_message = '',
+    completed_at = ?1
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.handled_by_session_id = ?4
+  AND (
+      (?5 = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = ?5
+  )
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.controller_generation = ?6
+`
+
+type InterruptClaimedUndeliveredTurnParams struct {
+	CompletedAt          sql.NullTime
+	ID                   string
+	ConversationID       string
+	HandledBySessionID   domain.SessionID
+	ReviewID             interface{}
+	ControllerGeneration string
+}
+
+// A dispatch that claimed a turn but had not yet called the provider can settle
+// it as interrupted when Stop wins admission. It must have no provider id.
+func (q *Queries) InterruptClaimedUndeliveredTurn(ctx context.Context, arg InterruptClaimedUndeliveredTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, interruptClaimedUndeliveredTurn,
+		arg.CompletedAt,
+		arg.ID,
+		arg.ConversationID,
+		arg.HandledBySessionID,
+		arg.ReviewID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const interruptRolledBackQueuedTurns = `-- name: InterruptRolledBackQueuedTurns :exec

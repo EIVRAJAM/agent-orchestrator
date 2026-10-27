@@ -54,6 +54,11 @@ var ErrTurnDispatchFenced = errors.New("turn is no longer queued for dispatch")
 // generation is no longer current. No mutation from that caller is permitted.
 var ErrChatOwnershipLost = errors.New("chat conversation ownership changed")
 
+// ErrTurnProviderIDConflict means an eager bind tried to replace a turn's
+// already-recorded provider id. Even a repeated bind is idempotent only for the
+// exact same id.
+var ErrTurnProviderIDConflict = errors.New("chat turn already has a different provider id")
+
 type conversationCreateOptions struct {
 	id            string
 	scope         domain.ConversationScope
@@ -615,7 +620,7 @@ func (s *Store) CreateAndActivateConversationBranchAndAdoptQueued(
 			conversation.ActiveBranchID != branch.ParentBranchID {
 			return ErrChatOwnershipLost
 		}
-		owned, err := conversationOwnedBy(ctx, q, branch.ConversationID, sessionID, "", expectedGeneration)
+		owned, err := conversationOwnedBy(ctx, q, branch.ConversationID, sessionID, "", expectedGeneration, true)
 		if err != nil {
 			return err
 		}
@@ -1661,25 +1666,52 @@ func conversationOwnedBy(
 	conversationID string,
 	session domain.SessionID,
 	reviewID, generation string,
+	active bool,
 ) (bool, error) {
 	if reviewID == "" {
-		owned, err := q.ConversationOwnedByPrimarySession(ctx,
-			gen.ConversationOwnedByPrimarySessionParams{
-				ConversationID:       conversationID,
-				SessionID:            &session,
-				ControllerGeneration: generation,
-			})
+		var (
+			owned int64
+			err   error
+		)
+		if active {
+			owned, err = q.ConversationOwnedByPrimarySessionActive(ctx,
+				gen.ConversationOwnedByPrimarySessionActiveParams{
+					ConversationID:       conversationID,
+					SessionID:            &session,
+					ControllerGeneration: generation,
+				})
+		} else {
+			owned, err = q.ConversationOwnedByPrimarySession(ctx,
+				gen.ConversationOwnedByPrimarySessionParams{
+					ConversationID:       conversationID,
+					SessionID:            &session,
+					ControllerGeneration: generation,
+				})
+		}
 		if err != nil {
 			return false, fmt.Errorf("check primary conversation ownership: %w", err)
 		}
 		return owned > 0, nil
 	}
-	owned, err := q.ConversationOwnedByReview(ctx, gen.ConversationOwnedByReviewParams{
-		ConversationID:       conversationID,
-		ReviewID:             sql.NullString{String: reviewID, Valid: true},
-		SessionID:            session,
-		ControllerGeneration: generation,
-	})
+	var (
+		owned int64
+		err   error
+	)
+	if active {
+		owned, err = q.ConversationOwnedByReviewActive(ctx, gen.ConversationOwnedByReviewActiveParams{
+			ConversationID:       conversationID,
+			ReviewID:             sql.NullString{String: reviewID, Valid: true},
+			SessionID:            session,
+			ControllerGeneration: generation,
+		})
+	} else {
+		owned, err = q.ConversationOwnedByReview(ctx, gen.ConversationOwnedByReviewParams{
+			ConversationID:       conversationID,
+			ReviewID:             sql.NullString{String: reviewID, Valid: true},
+			SessionID:            session,
+			ControllerGeneration: generation,
+		})
+	}
 	if err != nil {
 		return false, fmt.Errorf("check review conversation ownership: %w", err)
 	}
@@ -1709,7 +1741,7 @@ func (s *Store) ClaimQueuedTurnForDispatch(
 ) (bool, error) {
 	var claimed bool
 	err := s.conversationMutationTx(ctx, "claim queued chat turn for dispatch", func(q *gen.Queries) error {
-		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation, true)
 		if err != nil {
 			return err
 		}
@@ -1746,7 +1778,7 @@ func (s *Store) BindPreparedDeferredTurn(
 ) (bool, error) {
 	var bound bool
 	err := s.conversationMutationTx(ctx, "bind prepared deferred chat turn", func(q *gen.Queries) error {
-		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation, true)
 		if err != nil {
 			return err
 		}
@@ -1783,12 +1815,32 @@ func (s *Store) BindClaimedEagerTurn(
 	now time.Time,
 ) error {
 	return s.conversationMutationTx(ctx, "bind claimed eager chat turn", func(q *gen.Queries) error {
-		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation, true)
 		if err != nil {
 			return err
 		}
 		if !owned {
 			return ErrChatOwnershipLost
+		}
+		turn, err := q.SelectConversationTurnByID(ctx, turnID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %s", ErrTurnDispatchFenced, turnID)
+		}
+		if err != nil {
+			return fmt.Errorf("read eager turn %s: %w", turnID, err)
+		}
+		if turn.ConversationID != conversationID || turn.HandledBySessionID != session ||
+			turn.HandledByReviewID.Valid != (reviewID != "") || turn.HandledByReviewID.String != reviewID ||
+			turn.ControllerGeneration != generation ||
+			turn.State != domain.TurnStateRunning || turn.RolledBackAt.Valid {
+			return fmt.Errorf("%w: %s", ErrTurnDispatchFenced, turnID)
+		}
+		if turn.ProviderTurnID == providerTurnID {
+			return nil
+		}
+		if turn.ProviderTurnID != "" {
+			return fmt.Errorf("%w: turn %s has %q, attempted %q",
+				ErrTurnProviderIDConflict, turnID, turn.ProviderTurnID, providerTurnID)
 		}
 		rows, err := q.BindClaimedEagerConversationTurn(ctx,
 			gen.BindClaimedEagerConversationTurnParams{
@@ -1806,6 +1858,43 @@ func (s *Store) BindClaimedEagerTurn(
 		}
 		return nil
 	})
+}
+
+// InterruptClaimedUndeliveredTurn settles a running turn that never received a
+// provider id when Stop wins admission. The owner may already be terminated, but
+// the conversation must still belong to it.
+func (s *Store) InterruptClaimedUndeliveredTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID string,
+	now time.Time,
+) (bool, error) {
+	var settled bool
+	err := s.conversationMutationTx(ctx, "interrupt claimed undelivered chat turn", func(q *gen.Queries) error {
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation, false)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
+		rows, err := q.InterruptClaimedUndeliveredTurn(ctx,
+			gen.InterruptClaimedUndeliveredTurnParams{
+				CompletedAt:          sql.NullTime{Time: now, Valid: true},
+				ID:                   turnID,
+				ConversationID:       conversationID,
+				HandledBySessionID:   session,
+				ReviewID:             reviewID,
+				ControllerGeneration: generation,
+			})
+		if err != nil {
+			return fmt.Errorf("interrupt claimed undelivered turn %s: %w", turnID, err)
+		}
+		settled = rows > 0
+		return nil
+	})
+	return settled, err
 }
 
 // MarkTurnDispatching is a test/setup strict queued -> running claim. Production
@@ -2118,7 +2207,7 @@ func (s *Store) ClaimChatControllerGenerationAndAdoptQueued(
 				claim.ExpectedGeneration, session.ControllerGeneration)
 		}
 		owned, ownershipErr := conversationOwnedBy(
-			ctx, q, claim.ConversationID, claim.SessionID, "", claim.ExpectedGeneration)
+			ctx, q, claim.ConversationID, claim.SessionID, "", claim.ExpectedGeneration, true)
 		if ownershipErr != nil {
 			return ownershipErr
 		}
@@ -3012,7 +3101,7 @@ func (s *Store) RecordStopIntentAndCancelQueued(
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	err := s.inImmediateTx(ctx, "record chat stop intent and cancel queued turns", func(q *gen.Queries) error {
-		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation)
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation, false)
 		if err != nil {
 			return err
 		}

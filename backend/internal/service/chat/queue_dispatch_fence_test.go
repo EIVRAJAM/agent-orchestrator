@@ -20,7 +20,9 @@ type dispatchFenceHookStore struct {
 	chatsvc.Store
 	mu             sync.Mutex
 	beforeClaim    func()
+	afterClaim     func()
 	beforeEager    func()
+	afterEager     func()
 	beforeDeferred func()
 	afterDeferred  func()
 }
@@ -37,10 +39,14 @@ func (s *dispatchFenceHookStore) ClaimQueuedTurnForDispatch(
 	reviewID, generation, turnID string, now time.Time,
 ) (bool, error) {
 	s.mu.Lock()
-	hook := s.beforeClaim
+	before, after := s.beforeClaim, s.afterClaim
 	s.mu.Unlock()
-	s.hook(hook)()
-	return s.Store.ClaimQueuedTurnForDispatch(ctx, conversationID, session, reviewID, generation, turnID, now)
+	s.hook(before)()
+	claimed, err := s.Store.ClaimQueuedTurnForDispatch(ctx, conversationID, session, reviewID, generation, turnID, now)
+	if claimed && err == nil {
+		s.hook(after)()
+	}
+	return claimed, err
 }
 
 func (s *dispatchFenceHookStore) BindPreparedDeferredTurn(
@@ -61,10 +67,14 @@ func (s *dispatchFenceHookStore) BindClaimedEagerTurn(
 	reviewID, generation, turnID, providerTurnID string, now time.Time,
 ) error {
 	s.mu.Lock()
-	hook := s.beforeEager
+	before, after := s.beforeEager, s.afterEager
 	s.mu.Unlock()
-	s.hook(hook)()
-	return s.Store.BindClaimedEagerTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
+	s.hook(before)()
+	err := s.Store.BindClaimedEagerTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
+	if err == nil {
+		s.hook(after)()
+	}
+	return err
 }
 
 func TestEagerDispatchClaimLosesToStopBeforeProvider(t *testing.T) {
@@ -296,5 +306,215 @@ func TestReviewAppendWinsThenStopCancelsAndFencesDispatch(t *testing.T) {
 	}
 	if len(snapshot.Turns) != 1 || snapshot.Turns[0].State != domain.TurnStateInterrupted {
 		t.Fatalf("review turns after Stop = %+v, want one interrupted", snapshot.Turns)
+	}
+}
+
+type earlyTurnStartedConversation struct {
+	*fakeConversation
+	returnID string
+}
+
+func (c *earlyTurnStartedConversation) SendTurn(_ context.Context, msg ports.ChatUserMessage) (ports.ChatTurnRef, error) {
+	c.mu.Lock()
+	c.sendCalls++
+	c.sent = append(c.sent, msg)
+	onSend := c.onSend
+	c.mu.Unlock()
+	if onSend != nil {
+		onSend("provider-event-id")
+	}
+	return ports.ChatTurnRef{ProviderTurnID: c.returnID}, nil
+}
+
+func TestEarlyTurnStartedBindsBeforeSendTurnReturns(t *testing.T) {
+	conv := newFakeConversation()
+	hook := &dispatchFenceHookStore{}
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		hook.Store = st
+		return hook
+	})
+	bound := make(chan struct{})
+	var once sync.Once
+	hook.afterEager = func() { once.Do(func() { close(bound) }) }
+	conv.onSend = func(id string) {
+		conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: id})
+		<-bound
+	}
+	turn, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+		Text: "early provider started", ClientMessageID: "early-turn-started",
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "provider-turn-1" {
+		t.Fatalf("turn = %+v, want running with provider-turn-1", turn)
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(context.Background(), h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if len(snapshot.Turns) != 1 || snapshot.Turns[0].ProviderTurnID != "provider-turn-1" ||
+		snapshot.Turns[0].State != domain.TurnStateRunning {
+		t.Fatalf("turns = %+v, want one running turn", snapshot.Turns)
+	}
+	if got := conv.sendCallCount(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestEarlyTurnStartedWithDifferentReturnedIDIsUncertain(t *testing.T) {
+	base := newFakeConversation()
+	conv := &earlyTurnStartedConversation{fakeConversation: base, returnID: "provider-different"}
+	hook := &dispatchFenceHookStore{}
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		hook.Store = st
+		return hook
+	})
+	bound := make(chan struct{})
+	var once sync.Once
+	hook.afterEager = func() { once.Do(func() { close(bound) }) }
+	conv.onSend = func(id string) {
+		conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: id})
+		<-bound
+	}
+	if _, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+		Text: "conflicting early provider id", ClientMessageID: "early-turn-conflict",
+	}); err == nil {
+		t.Fatal("Send succeeded despite conflicting early provider id")
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(context.Background(), h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if len(snapshot.Turns) != 1 || snapshot.Turns[0].ProviderTurnID != "provider-event-id" {
+		t.Fatalf("turns = %+v, want the archived provider-event-id preserved", snapshot.Turns)
+	}
+	if got := conv.sendCallCount(); got != 1 {
+		t.Fatalf("provider calls = %d, want 1", got)
+	}
+}
+
+func TestStopAfterEagerClaimPreventsSendTurn(t *testing.T) {
+	hook := &dispatchFenceHookStore{}
+	h := newHarnessWithConversationAndStore(t, nil, func(st *sqlite.Store) chatsvc.Store {
+		hook.Store = st
+		return hook
+	})
+	claimed, release := make(chan struct{}), make(chan struct{})
+	hook.afterClaim = func() { close(claimed); <-release }
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+			Text: "stop after claim", ClientMessageID: "stop-after-claim",
+		})
+		result <- err
+	}()
+	<-claimed
+	if err := h.svc.Stop(context.Background(), testSession); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	close(release)
+	if err := <-result; !errors.Is(err, chatsvc.ErrProviderDispatchStopped) {
+		t.Fatalf("Send error = %v, want ErrProviderDispatchStopped", err)
+	}
+	if got := h.conv.sendCallCount(); got != 0 {
+		t.Fatalf("provider calls = %d, want 0", got)
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(context.Background(), h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+	if len(snapshot.Turns) != 1 {
+		t.Fatalf("turns = %d, want one", len(snapshot.Turns))
+	}
+	turn := snapshot.Turns[0]
+	if turn.State != domain.TurnStateInterrupted || turn.ProviderTurnID != "" || turn.CompletedAt == nil {
+		t.Fatalf("turn after Stop admission = %+v, want interrupted/unbound/completed", turn)
+	}
+}
+
+func TestStopAfterManualClaimPreventsDeferredProviderStart(t *testing.T) {
+	commit := &claimStepStore{}
+	conv := &deferredConversation{fakeConversation: newFakeConversation()}
+	startCalls := 0
+	conv.start = func(string) error { startCalls++; return nil }
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		commit.Store = st
+		return commit
+	})
+	first, _ := queueTwoBehindFailingRoot(t, h, conv.emit)
+	startCalls = 0
+	beforeSendCalls := conv.sendCallCount()
+	claimed, release := make(chan struct{}), make(chan struct{})
+	commit.setHooks(nil, func() { close(claimed); <-release })
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
+		result <- err
+	}()
+	<-claimed
+	if err := h.ctrl.TerminateForStop(context.Background(), domain.ChatStopReasonSessionTerminated); err != nil {
+		t.Fatalf("TerminateForStop: %v", err)
+	}
+	close(release)
+	if err := <-result; err == nil {
+		t.Fatal("deferred resume succeeded after Stop")
+	}
+	if got := conv.sendCallCount(); got != beforeSendCalls {
+		t.Fatalf("SendTurn calls = %d, want no new call after %d", got, beforeSendCalls)
+	}
+	if startCalls != 0 {
+		t.Fatalf("StartDeferredTurn calls = %d, want 0", startCalls)
+	}
+	turn, err := h.st.TurnByID(context.Background(), first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateInterrupted || turn.ProviderTurnID != "" || turn.CompletedAt == nil {
+		t.Fatalf("deferred resumed turn after Stop = %+v, want interrupted/unbound/completed", turn)
+	}
+}
+
+type blockingSendConversation struct {
+	*fakeConversation
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingSendConversation) SendTurn(context.Context, ports.ChatUserMessage) (ports.ChatTurnRef, error) {
+	c.mu.Lock()
+	c.sendCalls++
+	c.mu.Unlock()
+	close(c.started)
+	<-c.release
+	return ports.ChatTurnRef{}, errors.New("provider call ended after Stop")
+}
+
+func TestProviderAdmittedDispatchDoesNotBlockStop(t *testing.T) {
+	conv := &blockingSendConversation{
+		fakeConversation: newFakeConversation(),
+		started:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store { return st })
+	sent := make(chan error, 1)
+	go func() {
+		_, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+			Text: "provider boundary already admitted", ClientMessageID: "provider-admitted",
+		})
+		sent <- err
+	}()
+	<-conv.started
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.svc.Stop(ctx, testSession); err != nil {
+		t.Fatalf("Stop waited or failed behind SendTurn: %v", err)
+	}
+	close(conv.release)
+	if err := <-sent; err == nil {
+		t.Fatal("blocked provider call unexpectedly succeeded")
+	}
+	if got := conv.sendCallCount(); got != 1 {
+		t.Fatalf("provider calls = %d, want exactly one", got)
 	}
 }

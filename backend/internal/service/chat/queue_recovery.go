@@ -303,10 +303,13 @@ func (c *Controller) ResumeQueuedTurn(
 		return QueueResumeResult{Outcome: QueueResumeSessionBusy}, nil
 	}
 
+	// Capture Stop admission before the manual claim. A Stop that wins after the
+	// claim but before provider I/O must prevent SendTurn/StartDeferredTurn.
+	admissionEpoch := c.providerAdmissionEpoch()
 	// Arm the one-shot before dispatch so the resumed turn's terminal event holds
 	// the queue instead of releasing the next turn.
 	c.armResumeHold(expectedTurnID)
-	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true); err != nil {
+	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true, admissionEpoch); err != nil {
 		if errors.Is(err, errUncertainDelivery) {
 			// The eager provider boundary was crossed but AO could not record the
 			// provider id. Keep the one-shot armed so a late terminal for this

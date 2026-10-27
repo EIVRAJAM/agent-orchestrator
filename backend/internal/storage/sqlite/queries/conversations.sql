@@ -1059,7 +1059,27 @@ WHERE c.id = sqlc.arg(conversation_id)
   AND r.interface_mode = 'chat'
   AND c.stop_episode_id = sqlc.arg(stop_episode_id);
 
+-- A dispatch that claimed a turn but had not yet called the provider can settle
+-- it as interrupted when Stop wins admission. It must have no provider id.
+-- name: InterruptClaimedUndeliveredTurn :execrows
+UPDATE conversation_turns
+SET state = 'interrupted',
+    error_message = '',
+    completed_at = sqlc.arg(completed_at)
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND (
+      (sqlc.arg(review_id) = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = sqlc.arg(review_id)
+  )
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.controller_generation = sqlc.arg(controller_generation);
+
 -- Current ownership proofs used by mutation transactions.
+-- Cleanup ownership can survive is_terminated=1 / archived review, but it must
+-- still prove the conversation has not moved to another owner.
 -- name: ConversationOwnedByPrimarySession :one
 SELECT CAST(COUNT(*) AS INTEGER) AS owned
 FROM conversations AS c
@@ -1072,6 +1092,32 @@ WHERE c.id = sqlc.arg(conversation_id)
   AND s.controller_generation = sqlc.arg(controller_generation);
 
 -- name: ConversationOwnedByReview :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = sqlc.arg(conversation_id)
+  AND c.scope = 'review'
+  AND c.review_id = sqlc.arg(review_id)
+  AND c.current_review_id = sqlc.arg(review_id)
+  AND r.id = sqlc.arg(review_id)
+  AND r.session_id = sqlc.arg(session_id)
+  AND r.controller_generation = sqlc.arg(controller_generation);
+
+-- Active dispatch ownership additionally requires a live Chat session.
+-- name: ConversationOwnedByPrimarySessionActive :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN sessions AS s ON s.id = c.current_session_id
+WHERE c.id = sqlc.arg(conversation_id)
+  AND c.current_session_id = sqlc.arg(session_id)
+  AND c.current_review_id IS NULL
+  AND c.scope IN ('session', 'project')
+  AND s.id = sqlc.arg(session_id)
+  AND s.session_mode = 'chat'
+  AND s.is_terminated = 0
+  AND s.controller_generation = sqlc.arg(controller_generation);
+
+-- name: ConversationOwnedByReviewActive :one
 SELECT CAST(COUNT(*) AS INTEGER) AS owned
 FROM conversations AS c
 JOIN review AS r ON r.id = c.current_review_id

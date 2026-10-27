@@ -88,8 +88,8 @@ func TestBindClaimedEagerRequiresRunningAndRefusesRebind(t *testing.T) {
 		t.Fatalf("bind claimed eager turn: %v", err)
 	}
 	if err := s.BindClaimedEagerTurn(
-		ctx, conversation.ID, session.ID, "", "generation-old", "eager-bind", "provider-eager-2", testNow); !errors.Is(err, storepkg.ErrTurnDispatchFenced) {
-		t.Fatalf("second eager bind = %v, want ErrTurnDispatchFenced", err)
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-bind", "provider-eager-2", testNow); !errors.Is(err, storepkg.ErrTurnProviderIDConflict) {
+		t.Fatalf("second eager bind = %v, want ErrTurnProviderIDConflict", err)
 	}
 	turn, err := s.TurnByID(ctx, "eager-bind")
 	if err != nil || turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "provider-eager" {
@@ -276,5 +276,107 @@ func TestConcurrentControllerClaimsHaveOneWinner(t *testing.T) {
 	turn, err := s.TurnByID(ctx, "controller-race-queue")
 	if err != nil || turn.State != domain.TurnStateQueued {
 		t.Fatalf("queued winner state = %+v err=%v", turn, err)
+	}
+}
+
+func TestBindClaimedEagerIsIdempotentOnlyForSameProviderID(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "eager-idempotent", "generation-old")
+	if claimed, err := s.ClaimQueuedTurnForDispatch(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-idempotent", testNow); err != nil || !claimed {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-idempotent", "provider-same", testNow); err != nil {
+		t.Fatalf("first eager bind: %v", err)
+	}
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-idempotent", "provider-same", testNow.Add(time.Minute)); err != nil {
+		t.Fatalf("idempotent eager bind: %v", err)
+	}
+	turn, err := s.TurnByID(ctx, "eager-idempotent")
+	if err != nil || turn.ProviderTurnID != "provider-same" || turn.StartedAt == nil {
+		t.Fatalf("idempotent eager turn = %+v err=%v", turn, err)
+	}
+	originalStarted := *turn.StartedAt
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "eager-idempotent", "provider-other", testNow.Add(2*time.Minute)); !errors.Is(err, storepkg.ErrTurnProviderIDConflict) {
+		t.Fatalf("conflicting eager bind = %v, want ErrTurnProviderIDConflict", err)
+	}
+	turn, err = s.TurnByID(ctx, "eager-idempotent")
+	if err != nil || turn.ProviderTurnID != "provider-same" || !turn.StartedAt.Equal(originalStarted) {
+		t.Fatalf("conflicting bind changed identity = %+v err=%v", turn, err)
+	}
+}
+
+func TestTerminatedOwnerCannotDispatchButCanCancelOwnQueue(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "terminated-queued", "generation-old")
+	seedQueuedTurn(t, s, session, conversation.ID, "terminated-running", "generation-old")
+	rec, found, err := s.GetSession(ctx, session.ID)
+	if err != nil || !found {
+		t.Fatalf("GetSession: found=%v err=%v", found, err)
+	}
+	rec.IsTerminated = true
+	if err := s.UpdateSession(ctx, rec); err != nil {
+		t.Fatalf("terminate session: %v", err)
+	}
+	if claimed, err := s.ClaimQueuedTurnForDispatch(
+		ctx, conversation.ID, session.ID, "", "generation-old", "terminated-queued", testNow); claimed || !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("terminated dispatch claim = %v, %v, want ErrChatOwnershipLost", claimed, err)
+	}
+	if bound, err := s.BindPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "terminated-queued", "provider-terminal", testNow); bound || !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("terminated deferred bind = %v, %v, want ErrChatOwnershipLost", bound, err)
+	}
+	if err := s.MarkTurnDispatching(ctx, "terminated-running"); err != nil {
+		t.Fatalf("setup running: %v", err)
+	}
+	if err := s.BindClaimedEagerTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "terminated-running", "provider-terminal", testNow); !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("terminated eager bind = %v, want ErrChatOwnershipLost", err)
+	}
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, conversation.ID, session.ID, "", "generation-old",
+		domain.ChatStopReasonSessionTerminated, "terminated-stop", testNow); err != nil {
+		t.Fatalf("terminated cleanup Stop: %v", err)
+	}
+	if got := turnState(t, s, "terminated-queued"); got != domain.TurnStateInterrupted {
+		t.Fatalf("terminated queue state = %q, want interrupted", got)
+	}
+}
+
+func TestTerminatedOwnerCannotPublishBoundary(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	seedProject(t, st, "terminated-boundary")
+	owner := newScopedChatSession(t, st, "terminated-boundary", "gen-a")
+	conversation, err := st.CreateConversation(ctx, "terminated-boundary-conversation", domain.ConversationScopeProject, "terminated-boundary", owner.ID, testNow)
+	if err != nil {
+		t.Fatalf("CreateConversation: %v", err)
+	}
+	rec, found, err := st.GetSession(ctx, owner.ID)
+	if err != nil || !found {
+		t.Fatalf("GetSession: found=%v err=%v", found, err)
+	}
+	rec.IsTerminated = true
+	if err := st.UpdateSession(ctx, rec); err != nil {
+		t.Fatalf("terminate owner: %v", err)
+	}
+	branch := domain.ConversationBranch{
+		ID: "terminated-boundary", ConversationID: conversation.ID, SessionID: owner.ID,
+		ProviderConversationID: "thread-terminated", ParentBranchID: conversation.ActiveBranchID,
+		ForkAfterSequence: conversation.LatestSequence, ProviderScopeID: "terminated-boundary",
+		CreatedAt: testNow,
+	}
+	if err := st.CreateAndActivateConversationBranchAndAdoptQueued(
+		ctx, owner.ID, branch, "gen-a", "gen-b", testNow); !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("terminated boundary error = %v, want ErrChatOwnershipLost", err)
+	}
+	if _, err := st.ConversationBranch(ctx, conversation.ID, branch.ID); !errors.Is(err, domain.ErrNoConversationBranch) {
+		t.Fatalf("terminated boundary branch error = %v, want absent", err)
 	}
 }

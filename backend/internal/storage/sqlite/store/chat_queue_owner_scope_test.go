@@ -366,3 +366,32 @@ func TestReviewAppendFenceRejectsChangedEpisode(t *testing.T) {
 		t.Fatalf("review Stop episode = %q err=%v, want durable", episode, err)
 	}
 }
+
+func TestArchivedOrNonChatReviewCannotDispatchButCleanupIsScoped(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "review-archive")
+	worker := newScopedChatSession(t, s, "review-archive", "gen-worker")
+	conversation := seedReviewConversation(t, s, "review-archive", domain.ReviewerCodex, worker, "review-archive-conversation", "review-archive-turn", "gen-review")
+	if ok, err := s.SetReviewInterfaceMode(ctx, "review-archive", domain.ReviewerInterfaceTUI, testNow.Add(time.Second)); err != nil || !ok {
+		t.Fatalf("SetReviewInterfaceMode: ok=%v err=%v", ok, err)
+	}
+	if _, err := s.AppendReviewUserMessageFenced(ctx, conversation.ID, worker.ID, "review-archive", "gen-review", "",
+		domain.ConversationMessage{
+			ID: "archived-review-message", Text: "archived review", Origin: domain.MessageOriginHuman,
+			ClientMessageID: "archived-review-message",
+		}, "archived-review-turn", testNow); !errors.Is(err, storepkg.ErrChatIntakeClosed) {
+		t.Fatalf("archived review append error = %v, want ErrChatIntakeClosed", err)
+	}
+	if claimed, err := s.ClaimQueuedTurnForDispatch(
+		ctx, conversation.ID, worker.ID, "review-archive", "gen-review", "review-archive-turn", testNow); claimed || !errors.Is(err, storepkg.ErrChatOwnershipLost) {
+		t.Fatalf("archived review dispatch claim = %v, %v, want ErrChatOwnershipLost", claimed, err)
+	}
+	if _, err := s.RecordStopIntentAndCancelQueued(ctx, conversation.ID, worker.ID, "review-archive", "gen-review",
+		domain.ChatStopReasonUserStop, "archived-review-stop", testNow); err != nil {
+		t.Fatalf("archived review cleanup Stop: %v", err)
+	}
+	if got := turnState(t, s, "review-archive-turn"); got != domain.TurnStateInterrupted {
+		t.Fatalf("archived review queue = %q, want interrupted by scoped cleanup", got)
+	}
+}

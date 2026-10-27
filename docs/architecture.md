@@ -738,13 +738,26 @@ Dispatch has three distinct durable transitions:
   interrupted the queued row leaves it untouched, discards the prepared turn,
   and never starts the provider.
 - **Eager bind** — after `SendTurn`, attaches the provider id only to the
-  already-running row. Failure remains uncertain delivery and never requeues or
-  retries the prompt.
+  already-running row. The same exact id is an idempotent success (a provider
+  may emit `TurnStarted` before `SendTurn` returns), while a different id is a
+  conflict. Failure remains uncertain delivery and never requeues or retries the
+  prompt.
+
+Before calling the provider, dispatch passes a short admission gate under
+`Controller.mu`, comparing the Stop epoch observed before the Send with the
+current epoch and closing admission for Stop/Terminate. The gate is released
+before `SendTurn`/`StartDeferredTurn`, so Stop never waits behind a blocked
+provider call. If Stop wins, a claimed running turn with no provider id settles
+as `interrupted`; if dispatch already admitted the call, Stop terminates or
+interrupts the provider concurrently and does not resend the turn.
 
 There is no generic production bind that mixes these boundaries. The same
 transaction also verifies that the conversation's current primary or review
 owner is still the caller; a Stop, claim, branch publication, or dispatch after
-a rebind fails without changing the new owner's rows, hold, or episode.
+a rebind fails without changing the new owner's rows, hold, or episode. Active
+dispatch ownership requires a live Chat session; cleanup/Stop ownership may
+survive `is_terminated`, but still requires the same current conversation owner
+and generation.
 
 Every new queue operation is owner-scoped by conversation, `handled_by_session_id`,
 and the expected `handled_by_review_id` state. Primary operations require
