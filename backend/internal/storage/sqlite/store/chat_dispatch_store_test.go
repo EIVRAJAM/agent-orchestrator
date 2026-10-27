@@ -228,3 +228,53 @@ func TestStaleOwnerCannotPublishProviderBoundary(t *testing.T) {
 		t.Fatalf("stale boundary queue = %q, want untouched", got)
 	}
 }
+
+func TestConcurrentControllerClaimsHaveOneWinner(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "controller-race-queue", "generation-old")
+	var wg sync.WaitGroup
+	results := make(chan error, 2)
+	for _, generation := range []string{"generation-a", "generation-b"} {
+		generation := generation
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.ClaimChatControllerGenerationAndAdoptQueued(ctx, domain.ChatControllerClaim{
+				SessionID: session.ID, ConversationID: conversation.ID,
+				ExpectedGeneration: "generation-old", Generation: generation,
+				AdoptQueued: true, RecoveryRequired: true, SettleRunning: true, Now: testNow,
+			})
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		if !errors.Is(err, domain.ErrChatControllerGenerationChanged) &&
+			!errors.Is(err, storepkg.ErrChatOwnershipLost) &&
+			!errors.Is(err, domain.ErrChatControllerRunningTurn) {
+			t.Fatalf("concurrent controller claim error = %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent controller claims succeeded %d times, want exactly 1", successes)
+	}
+	rec, found, err := s.GetSession(ctx, session.ID)
+	if err != nil || !found {
+		t.Fatalf("GetSession: found=%v err=%v", found, err)
+	}
+	if rec.Metadata.ControllerGeneration != "generation-a" && rec.Metadata.ControllerGeneration != "generation-b" {
+		t.Fatalf("winner generation = %q", rec.Metadata.ControllerGeneration)
+	}
+	turn, err := s.TurnByID(ctx, "controller-race-queue")
+	if err != nil || turn.State != domain.TurnStateQueued {
+		t.Fatalf("queued winner state = %+v err=%v", turn, err)
+	}
+}
