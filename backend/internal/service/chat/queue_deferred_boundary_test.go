@@ -173,12 +173,16 @@ func TestDeferredStartWinsAndDoesNotBlockStop(t *testing.T) {
 	conv.start = func(string) error { startCalls++; close(started); <-release; return nil }
 	conv.discard = func(string) { discardCalls++ }
 	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store { return st })
-	result := make(chan error, 1)
+	type sendResult struct {
+		turn domain.ConversationTurn
+		err  error
+	}
+	result := make(chan sendResult, 1)
 	go func() {
-		_, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+		turn, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
 			Text: "deferred start admitted", ClientMessageID: "deferred-start-wins",
 		})
-		result <- err
+		result <- sendResult{turn: turn, err: err}
 	}()
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -187,12 +191,26 @@ func TestDeferredStartWinsAndDoesNotBlockStop(t *testing.T) {
 		t.Fatalf("TerminateForStop waited behind StartDeferredTurn: %v", err)
 	}
 	close(release)
-	<-result
+	sent := <-result
+	if sent.err != nil {
+		t.Fatalf("admitted deferred start error = %v", sent.err)
+	}
 	if startCalls != 1 {
 		t.Fatalf("StartDeferredTurn calls = %d, want exactly one", startCalls)
 	}
 	if discardCalls != 0 {
 		t.Fatalf("DiscardDeferredTurn calls = %d, want 0 after admitted start", discardCalls)
+	}
+	turnID := sent.turn.ID
+	if turnID == "" {
+		turnID = turnIDByClientID(t, h, "deferred-start-wins")
+	}
+	turn, err := h.st.TurnByID(context.Background(), turnID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.ProviderTurnID == "" {
+		t.Fatal("provider-owned turn lost its provider id after Stop")
 	}
 }
 

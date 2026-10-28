@@ -493,8 +493,14 @@ func assertInterruptedUnstarted(t *testing.T, turn domain.ConversationTurn) {
 
 func assertNoDispatchingTurn(t *testing.T, h *harness) {
 	t.Helper()
-	ids := h.ctrl.DispatchingTurnIDs()
-	if len(ids) > 0 && ids[len(ids)-1] != "" {
-		t.Fatalf("dispatching turn tracking survived finalization: %v", ids)
+	for _, id := range h.ctrl.DispatchingTurnIDs() {
+		if id != "" {
+			t.Fatalf("dispatch tracking survived confirmed finalization: %v", h.ctrl.DispatchingTurnIDs())
+		}
+	}
+	dispatchingTurnID, providerTurnID, phase := h.ctrl.DeferredDispatchTrackingForTest()
+	if dispatchingTurnID != "" || providerTurnID != "" || phase != "none" {
+		t.Fatalf("deferred tracking survived confirmed finalization: turn=%q provider=%q phase=%q",
+			dispatchingTurnID, providerTurnID, phase)
 	}
 }

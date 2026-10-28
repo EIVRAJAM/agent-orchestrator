@@ -767,12 +767,22 @@ is never resent.
 
 If the Send context is canceled while a Stop transaction is still pending, the
 deferred dispatch does not clear its tracking and return. It waits for the
-pending Stop tokens with a detached, bounded cleanup context, then discards the
-prepared turn once and applies the exact claimed or prepared terminal transition
-before clearing the dispatch marker. A confirmed Stop and a failed Stop converge
+pending Stop tokens with a detached, bounded cleanup context, then applies the
+exact claimed or prepared terminal transition before discarding the prepared
+turn or clearing the dispatch marker. A confirmed Stop and a failed Stop converge
 to `interrupted` here because no provider boundary was crossed; only a confirmed
 Stop writes the durable episode. This also prevents a canceled preclaimed head
 from remaining `running/unbound` when Stop fails.
+
+The finalizer classifies the durable outcome before forgetting anything:
+`finalized`, `already_terminal`, `not_running`, or `ownership_lost` allow
+cleanup; `provider_owned` and `unresolved` do not. Zero affected rows are never
+treated as success without re-reading the turn. A Stop-wait timeout, SQLite
+timeout/error, or a still-running row returns
+`ErrDeferredDispatchCleanupIncomplete` and deliberately retains
+`dispatchingTurnID`, `sendingTurnID`, `deferredPhase`, and the prepared provider
+id. Recovery may settle the row conservatively; the controller must not silently
+forget it.
 
 There is no generic production bind that mixes these boundaries. The same
 transaction also verifies that the conversation's current primary or review

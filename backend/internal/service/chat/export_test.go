@@ -50,3 +50,28 @@ func (c *Controller) RetainedQueueTurnIDForTest() string {
 	}
 	return c.retainedQueue.turnID
 }
+
+// SetDeferredPendingStopLimitsForTest shortens the two bounded finalization
+// windows and returns a restore function.
+func (c *Controller) SetDeferredPendingStopLimitsForTest(wait, cleanup time.Duration) (restore func()) {
+	c.mu.Lock()
+	previousWait := c.deferredPendingStopWaitOverride
+	previousCleanup := c.deferredPendingStopCleanupOverride
+	c.deferredPendingStopWaitOverride = wait
+	c.deferredPendingStopCleanupOverride = cleanup
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		c.deferredPendingStopWaitOverride = previousWait
+		c.deferredPendingStopCleanupOverride = previousCleanup
+		c.mu.Unlock()
+	}
+}
+
+// DeferredDispatchTrackingForTest reports the in-memory tracking a failed
+// finalization must retain.
+func (c *Controller) DeferredDispatchTrackingForTest() (dispatchingTurnID, providerTurnID, phase string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dispatchingTurnID, c.deferredProviderTurnID, c.deferredPhase.String()
+}
