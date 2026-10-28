@@ -765,6 +765,15 @@ settling it `interrupted`. If `StartDeferredTurn` wins, Stop may terminate the
 provider concurrently; the durable binding and provider id remain, and the turn
 is never resent.
 
+If the Send context is canceled while a Stop transaction is still pending, the
+deferred dispatch does not clear its tracking and return. It waits for the
+pending Stop tokens with a detached, bounded cleanup context, then discards the
+prepared turn once and applies the exact claimed or prepared terminal transition
+before clearing the dispatch marker. A confirmed Stop and a failed Stop converge
+to `interrupted` here because no provider boundary was crossed; only a confirmed
+Stop writes the durable episode. This also prevents a canceled preclaimed head
+from remaining `running/unbound` when Stop fails.
+
 There is no generic production bind that mixes these boundaries. The same
 transaction also verifies that the conversation's current primary or review
 owner is still the caller; a Stop, claim, branch publication, or dispatch after

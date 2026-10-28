@@ -1060,12 +1060,14 @@ WHERE c.id = sqlc.arg(conversation_id)
   AND c.stop_episode_id = sqlc.arg(stop_episode_id);
 
 -- A dispatch that claimed a turn but had not yet called the provider can settle
--- it as interrupted when Stop wins admission. It must have no provider id.
+-- it as interrupted when Stop wins admission. It must have no provider id, and
+-- the claim's started_at must not survive as a false provider-start timestamp.
 -- name: InterruptClaimedUndeliveredTurn :execrows
 UPDATE conversation_turns
 SET state = 'interrupted',
     error_message = '',
-    completed_at = sqlc.arg(completed_at)
+    completed_at = sqlc.arg(completed_at),
+    started_at = NULL
 WHERE conversation_turns.id = sqlc.arg(id)
   AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
   AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)

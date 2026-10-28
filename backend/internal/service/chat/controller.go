@@ -2009,6 +2009,63 @@ func (c *Controller) waitForPendingStopsLocked() (<-chan struct{}, bool) {
 	return nil, false
 }
 
+func (c *Controller) waitForPendingStops(ctx context.Context) {
+	for {
+		c.mu.Lock()
+		ch, pending := c.waitForPendingStopsLocked()
+		c.mu.Unlock()
+		if !pending {
+			return
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// finalizeDeferredDispatchAfterPendingStop owns cleanup when the Send context is
+// canceled while a Stop transaction is still pending. It waits for the pending
+// Stop tokens with a detached bounded context, then settles the exact claimed or
+// prepared row before clearing tracking. Both a confirmed and a failed Stop
+// converge to interrupted because no provider boundary was crossed.
+func (c *Controller) finalizeDeferredDispatchAfterPendingStop(
+	ctx context.Context,
+	turnID, preparedProviderTurnID string,
+) error {
+	waitCtx, cancelWait := context.WithTimeout(
+		context.WithoutCancel(ctx), deferredPendingStopWaitLimit)
+	c.waitForPendingStops(waitCtx)
+	cancelWait()
+
+	if preparedProviderTurnID != "" {
+		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+			deferred.DiscardDeferredTurn(preparedProviderTurnID)
+		}
+	}
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.WithoutCancel(ctx), deferredPendingStopCleanupLimit)
+	defer cancelCleanup()
+	c.interruptUnadmittedDispatch(cleanupCtx)
+	c.clearDeferredPreparation()
+	c.mu.Lock()
+	if c.dispatchingTurnID == turnID {
+		c.dispatchingTurnID = ""
+	}
+	if c.sendingTurnID == turnID {
+		c.sendingTurnID = ""
+	}
+	c.mu.Unlock()
+
+	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = context.Canceled
+	}
+	return fmt.Errorf("%w: %w", ErrProviderDispatchStopped, cause)
+}
+
 // admitProviderCall is the eager provider boundary. It holds c.mu only for the
 // decision and never across SendTurn. A pending Stop is awaited because its
 // durable outcome decides admission; a failed Stop retracts only its own token.
@@ -2044,6 +2101,9 @@ func (c *Controller) admitProviderCall(ctx context.Context, expected uint64) pro
 // StartDeferredTurn.
 func (c *Controller) admitDeferredPrepare(ctx context.Context, expected uint64) providerAdmission {
 	for {
+		if ctx.Err() != nil {
+			return providerAdmissionPending
+		}
 		c.mu.Lock()
 		if c.stopEpoch != expected {
 			c.mu.Unlock()
@@ -2073,6 +2133,9 @@ func (c *Controller) admitDeferredPrepare(ctx context.Context, expected uint64) 
 // durable bind, so a Stop during the local prepare discards without binding.
 func (c *Controller) deferredPreparationAuthorized(ctx context.Context, expected uint64) providerAdmission {
 	for {
+		if ctx.Err() != nil {
+			return providerAdmissionPending
+		}
 		c.mu.Lock()
 		if c.stopEpoch != expected {
 			c.mu.Unlock()
@@ -2108,6 +2171,9 @@ func (c *Controller) markDeferredPrepared(providerTurnID string) {
 // StartDeferredTurn.
 func (c *Controller) admitDeferredProvider(ctx context.Context, expected uint64) providerAdmission {
 	for {
+		if ctx.Err() != nil {
+			return providerAdmissionPending
+		}
 		c.mu.Lock()
 		if c.stopEpoch != expected {
 			c.mu.Unlock()
@@ -2278,6 +2344,9 @@ func (c *Controller) dispatchTurn(
 		admission = c.admitProviderCall(ctx, admissionEpoch)
 	}
 	if admission != providerAdmissionAllowed {
+		if hasDeferredStart && admission == providerAdmissionPending {
+			return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(ctx, turnID, "")
+		}
 		return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
 	}
 	if !hasDeferredStart {
@@ -2289,6 +2358,10 @@ func (c *Controller) dispatchTurn(
 			// A prepared turn that raced Stop is not a failed provider turn. Discard
 			// it and let the Stop transition own the durable outcome.
 			if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
+				if admission == providerAdmissionPending {
+					return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(
+						ctx, turnID, ref.ProviderTurnID)
+				}
 				deferred.DiscardDeferredTurn(ref.ProviderTurnID)
 				return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
 			}
@@ -2354,6 +2427,10 @@ func (c *Controller) dispatchTurn(
 		// SendTurn prepared locally, but Stop may have won while it was running.
 		// Never bind or start that prepared turn in that case.
 		if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
+			if admission == providerAdmissionPending {
+				return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(
+					ctx, turnID, ref.ProviderTurnID)
+			}
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
 			return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
 		}
@@ -2426,19 +2503,18 @@ func (c *Controller) dispatchTurn(
 		c.markDeferredPrepared(ref.ProviderTurnID)
 		admission := c.admitDeferredProvider(ctx, admissionEpoch)
 		if admission != providerAdmissionAllowed {
-			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-			if admission == providerAdmissionStopped {
-				c.interruptUnadmittedDispatch(ctx)
+			if admission == providerAdmissionPending {
+				return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(
+					ctx, turnID, ref.ProviderTurnID)
 			}
+			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			c.interruptUnadmittedDispatch(ctx)
 			c.clearDeferredPreparation()
 			c.mu.Lock()
 			if c.dispatchingTurnID == turnID {
 				c.dispatchingTurnID = ""
 			}
 			c.mu.Unlock()
-			if admission == providerAdmissionPending {
-				return domain.ConversationTurn{}, fmt.Errorf("%w: stop transaction still pending", ErrProviderDispatchStopped)
-			}
 			return domain.ConversationTurn{}, ErrProviderDispatchStopped
 		}
 		defer c.finishProviderCall()
@@ -3053,6 +3129,14 @@ func (c *Controller) Compact(ctx context.Context) (ports.ChatCompactionResult, e
 // in the moment someone is most likely to use it: right after realizing they sent
 // the wrong thing.
 const turnAckWait = 3 * time.Second
+
+// A deferred dispatch that observed a pending Stop must finish that Stop's
+// outcome even when the Send context is canceled. These bounds keep the cleanup
+// finite while using a detached context for the durable transition.
+const (
+	deferredPendingStopWaitLimit    = 10 * time.Second
+	deferredPendingStopCleanupLimit = 10 * time.Second
+)
 
 // interruptForHandoff cancels only the provider turn. BeginHandoff has already
 // cancelled the durable queue under the dispatch lock, so reusing Interrupt here
