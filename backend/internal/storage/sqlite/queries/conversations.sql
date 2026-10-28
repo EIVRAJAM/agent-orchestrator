@@ -1077,6 +1077,28 @@ WHERE conversation_turns.id = sqlc.arg(id)
   AND conversation_turns.provider_turn_id = ''
   AND conversation_turns.controller_generation = sqlc.arg(controller_generation);
 
+-- A deferred turn can be durably bound before StartDeferredTurn crosses the
+-- provider boundary. If Stop wins that second admission, clear the prepared id
+-- and started_at so the row never claims an unstarted provider turn.
+-- name: InterruptPreparedDeferredTurn :execrows
+UPDATE conversation_turns
+SET state = 'interrupted',
+    error_message = '',
+    completed_at = sqlc.arg(completed_at),
+    provider_turn_id = '',
+    started_at = NULL
+WHERE conversation_turns.id = sqlc.arg(id)
+  AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_turns.handled_by_session_id = sqlc.arg(handled_by_session_id)
+  AND (
+      (sqlc.arg(review_id) = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = sqlc.arg(review_id)
+  )
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = sqlc.arg(provider_turn_id)
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = sqlc.arg(controller_generation);
+
 -- Current ownership proofs used by mutation transactions.
 -- Cleanup ownership can survive is_terminated=1 / archived review, but it must
 -- still prove the conversation has not moved to another owner.

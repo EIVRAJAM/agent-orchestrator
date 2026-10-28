@@ -1897,6 +1897,45 @@ func (s *Store) InterruptClaimedUndeliveredTurn(
 	return settled, err
 }
 
+// InterruptPreparedDeferredTurn cancels a deferred prepared turn that never
+// crossed StartDeferredTurn. It clears the prepared provider id and the
+// started_at written by the bind, while requiring cleanup ownership and the
+// exact prepared id so it can never overwrite provider-owned work.
+func (s *Store) InterruptPreparedDeferredTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) (bool, error) {
+	var settled bool
+	err := s.conversationMutationTx(ctx, "interrupt prepared deferred chat turn", func(q *gen.Queries) error {
+		owned, err := conversationOwnedBy(ctx, q, conversationID, session, reviewID, generation, false)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrChatOwnershipLost
+		}
+		rows, err := q.InterruptPreparedDeferredTurn(ctx,
+			gen.InterruptPreparedDeferredTurnParams{
+				CompletedAt:          sql.NullTime{Time: now, Valid: true},
+				ID:                   turnID,
+				ConversationID:       conversationID,
+				HandledBySessionID:   session,
+				ReviewID:             reviewID,
+				ProviderTurnID:       providerTurnID,
+				ControllerGeneration: generation,
+			})
+		if err != nil {
+			return fmt.Errorf("interrupt prepared deferred turn %s: %w", turnID, err)
+		}
+		settled = rows > 0
+		return nil
+	})
+	return settled, err
+}
+
 // MarkTurnDispatching is a test/setup strict queued -> running claim. Production
 // dispatch uses ClaimQueuedTurnForDispatch with owner and generation fencing.
 func (s *Store) MarkTurnDispatching(ctx context.Context, turnID string) error {

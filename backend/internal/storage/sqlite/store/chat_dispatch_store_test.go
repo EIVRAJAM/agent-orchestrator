@@ -380,3 +380,37 @@ func TestTerminatedOwnerCannotPublishBoundary(t *testing.T) {
 		t.Fatalf("terminated boundary branch error = %v, want absent", err)
 	}
 }
+
+func TestInterruptPreparedDeferredTurnClearsOnlyPreparedIdentity(t *testing.T) {
+	s, _ := openChatStoreWithRawDB(t)
+	session, conversation := seedOpenChatSession(t, s)
+	ctx := context.Background()
+	seedQueuedTurn(t, s, session, conversation.ID, "prepared-stop", "generation-old")
+	if bound, err := s.BindPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "prepared-stop", "provider-prepared", testNow); err != nil || !bound {
+		t.Fatalf("BindPreparedDeferredTurn: bound=%v err=%v", bound, err)
+	}
+	if settled, err := s.InterruptPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "prepared-stop", "wrong-provider", testNow); err != nil || settled {
+		t.Fatalf("wrong prepared id = settled=%v err=%v, want no mutation", settled, err)
+	}
+	turn, err := s.TurnByID(ctx, "prepared-stop")
+	if err != nil || turn.ProviderTurnID != "provider-prepared" || turn.StartedAt == nil || turn.State != domain.TurnStateRunning {
+		t.Fatalf("wrong id changed row = %+v err=%v", turn, err)
+	}
+	if settled, err := s.InterruptPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-stale", "prepared-stop", "provider-prepared", testNow); !errors.Is(err, storepkg.ErrChatOwnershipLost) || settled {
+		t.Fatalf("stale owner = settled=%v err=%v, want ownership lost", settled, err)
+	}
+	if settled, err := s.InterruptPreparedDeferredTurn(
+		ctx, conversation.ID, session.ID, "", "generation-old", "prepared-stop", "provider-prepared", testNow); err != nil || !settled {
+		t.Fatalf("prepared interrupt = settled=%v err=%v", settled, err)
+	}
+	turn, err = s.TurnByID(ctx, "prepared-stop")
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateInterrupted || turn.ProviderTurnID != "" || turn.StartedAt != nil || turn.CompletedAt == nil {
+		t.Fatalf("prepared interrupt row = %+v, want interrupted without prepared identity", turn)
+	}
+}

@@ -86,6 +86,7 @@ type Store interface {
 	BindPreparedDeferredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) (bool, error)
 	BindClaimedEagerTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) error
 	InterruptClaimedUndeliveredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID string, now time.Time) (bool, error)
+	InterruptPreparedDeferredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) (bool, error)
 	SettleTurn(ctx context.Context, conversationID, providerTurnID string, state domain.TurnState, errMessage string, now time.Time) error
 	SettleTurnByID(ctx context.Context, turnID string, state domain.TurnState, errMessage string, now time.Time) error
 	SettleOrphanedRunningTurnsForConversation(ctx context.Context, session domain.SessionID, conversationID string, now time.Time) error
@@ -210,6 +211,22 @@ func interfaceHandoff(policy domain.SessionInterfaceTransitionPolicy) controller
 	return controllerHandoffInterfaceInterrupt
 }
 
+type deferredTurnPhase uint8
+
+const (
+	deferredTurnNone deferredTurnPhase = iota
+	deferredTurnPreparing
+	deferredTurnPrepared
+)
+
+type providerAdmission uint8
+
+const (
+	providerAdmissionAllowed providerAdmission = iota
+	providerAdmissionStopped
+	providerAdmissionPending
+)
+
 // Controller drives one Chat session.
 type Controller struct {
 	sessionID    domain.SessionID
@@ -318,6 +335,16 @@ type Controller struct {
 	// The provider may own the turn even after SendTurn returned, so Stop must not
 	// settle it as an unadmitted dispatch.
 	providerCallUnresolved bool
+	// deferredPhase tracks ACP-style preparation separately from provider
+	// ownership. SendTurn only prepares locally; StartDeferredTurn is the real
+	// provider boundary and has its own admission.
+	deferredPhase          deferredTurnPhase
+	deferredProviderTurnID string
+	// stopSeq identifies in-flight Stop transactions. pendingStops closes
+	// admission only until each transaction resolves; a failed Stop removes its
+	// token without publishing a new epoch.
+	stopSeq      uint64
+	pendingStops map[uint64]chan struct{}
 	// handoff closes source-controller intake while ownership is being changed.
 	// Interface drain keeps dispatching accepted rows; interface interrupt and an
 	// idle branch mutation stop dispatch entirely. The target controller is not
@@ -1934,34 +1961,190 @@ func (c *Controller) Compacting() bool {
 // Busy reports whether a provider turn or compaction is in flight.
 func (c *Controller) Busy() bool { return c.busy() }
 
-// providerAdmissionEpoch captures the Stop linearization point before a Send
-// begins durable work. StopEpoch advances only after its durable Stop transaction
-// commits, so it is the in-memory side of the same admission decision.
+// providerAdmissionEpoch captures the confirmed Stop state before a Send begins
+// durable work. pendingStops separately closes admission while a Stop transaction
+// is unresolved; StopEpoch advances only when that transaction commits.
 func (c *Controller) providerAdmissionEpoch() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.stopEpoch
 }
 
-// admitProviderCall is the short admission gate immediately before provider I/O.
-// It holds c.mu only for the decision, never across SendTurn or StartDeferredTurn.
-func (c *Controller) admitProviderCall(expected uint64) bool {
+func (c *Controller) beginStopAttempt() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stopEpoch != expected {
-		return false
+	c.stopSeq++
+	id := c.stopSeq
+	if c.pendingStops == nil {
+		c.pendingStops = make(map[uint64]chan struct{})
 	}
-	if c.handoff != controllerHandoffNone && c.handoff != controllerHandoffInterfaceDrain {
-		return false
+	c.pendingStops[id] = make(chan struct{})
+	return id
+}
+
+func (c *Controller) finishStopAttempt(id uint64, confirmed bool) {
+	c.mu.Lock()
+	ch, ok := c.pendingStops[id]
+	if ok {
+		delete(c.pendingStops, id)
+		if confirmed {
+			c.stopEpoch++
+		}
+		close(ch)
 	}
-	c.providerCallActive = true
-	c.providerCallUnresolved = false
-	return true
+	c.mu.Unlock()
+}
+
+func (c *Controller) stopHandoffAllowedLocked() bool {
+	return c.handoff == controllerHandoffNone || c.handoff == controllerHandoffInterfaceDrain
+}
+
+// waitForPendingStopsLocked returns a channel to await. It must be called with
+// c.mu held and returns false without a channel when no Stop transaction is
+// pending.
+func (c *Controller) waitForPendingStopsLocked() (<-chan struct{}, bool) {
+	for _, ch := range c.pendingStops {
+		return ch, true
+	}
+	return nil, false
+}
+
+// admitProviderCall is the eager provider boundary. It holds c.mu only for the
+// decision and never across SendTurn. A pending Stop is awaited because its
+// durable outcome decides admission; a failed Stop retracts only its own token.
+func (c *Controller) admitProviderCall(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.providerCallActive = true
+		c.providerCallUnresolved = false
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+// admitDeferredPrepare authorizes only local preparation. It deliberately does
+// not mark provider ownership or spend the resume hold: Stop may still win before
+// StartDeferredTurn.
+func (c *Controller) admitDeferredPrepare(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.deferredPhase = deferredTurnPreparing
+		c.deferredProviderTurnID = ""
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+// deferredPreparationAuthorized is checked after SendTurn returns and before the
+// durable bind, so a Stop during the local prepare discards without binding.
+func (c *Controller) deferredPreparationAuthorized(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() || c.deferredPhase != deferredTurnPreparing {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+func (c *Controller) markDeferredPrepared(providerTurnID string) {
+	c.mu.Lock()
+	c.deferredPhase = deferredTurnPrepared
+	c.deferredProviderTurnID = providerTurnID
+	c.mu.Unlock()
+}
+
+// admitDeferredProvider is the real deferred provider boundary. Only this call
+// marks provider ownership, and it must happen immediately before
+// StartDeferredTurn.
+func (c *Controller) admitDeferredProvider(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() || c.deferredPhase != deferredTurnPrepared {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.deferredPhase = deferredTurnNone
+		c.deferredProviderTurnID = ""
+		c.providerCallActive = true
+		c.providerCallUnresolved = false
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
 }
 
 func (c *Controller) finishProviderCall() {
 	c.mu.Lock()
 	c.providerCallActive = false
+	c.mu.Unlock()
+}
+
+func (c *Controller) clearDeferredPreparation() {
+	c.mu.Lock()
+	c.deferredPhase = deferredTurnNone
+	c.deferredProviderTurnID = ""
 	c.mu.Unlock()
 }
 
@@ -1983,9 +2166,27 @@ func (c *Controller) markProviderBound() {
 func (c *Controller) interruptUnadmittedDispatch(ctx context.Context) {
 	c.mu.Lock()
 	turnID := c.dispatchingTurnID
+	phase := c.deferredPhase
+	providerTurnID := c.deferredProviderTurnID
 	active := c.providerCallActive || c.providerCallUnresolved
 	c.mu.Unlock()
 	if turnID == "" || active {
+		return
+	}
+	if (phase == deferredTurnPreparing || phase == deferredTurnPrepared) && providerTurnID == "" {
+		// The bind may have committed between the phase snapshot and this read.
+		// The row is still authoritative for the prepared provider id.
+		if turn, err := c.store.TurnByID(ctx, turnID); err == nil {
+			providerTurnID = turn.ProviderTurnID
+		}
+	}
+	if (phase == deferredTurnPreparing || phase == deferredTurnPrepared) && providerTurnID != "" {
+		if _, err := c.store.InterruptPreparedDeferredTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, providerTurnID, c.now(),
+		); err != nil && !errors.Is(err, store.ErrChatOwnershipLost) {
+			c.log.Error("failed to settle prepared deferred dispatch after Stop",
+				"session", c.sessionID, "turn", turnID, "error", err)
+		}
 		return
 	}
 	if _, err := c.store.InterruptClaimedUndeliveredTurn(
@@ -2005,6 +2206,26 @@ func (c *Controller) dispatch(
 	admissionEpoch uint64,
 ) (domain.ConversationTurn, error) {
 	return c.dispatchTurn(ctx, turnID, msg, requestedAt, false, admissionEpoch)
+}
+
+func (c *Controller) abortDispatchBeforeProvider(
+	ctx context.Context,
+	turnID string,
+	admission providerAdmission,
+) error {
+	if admission == providerAdmissionStopped {
+		c.interruptUnadmittedDispatch(ctx)
+	}
+	c.clearDeferredPreparation()
+	c.mu.Lock()
+	if c.dispatchingTurnID == turnID {
+		c.dispatchingTurnID = ""
+	}
+	c.mu.Unlock()
+	if admission == providerAdmissionPending {
+		return fmt.Errorf("%w: stop transaction still pending", ErrProviderDispatchStopped)
+	}
+	return ErrProviderDispatchStopped
 }
 
 // dispatchTurn is dispatch with an explicit claim precondition. preClaimed means
@@ -2050,18 +2271,28 @@ func (c *Controller) dispatchTurn(
 		}
 	}
 
-	if !c.admitProviderCall(admissionEpoch) {
-		c.interruptUnadmittedDispatch(ctx)
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
-		}
-		c.mu.Unlock()
-		return domain.ConversationTurn{}, ErrProviderDispatchStopped
+	var admission providerAdmission
+	if hasDeferredStart {
+		admission = c.admitDeferredPrepare(ctx, admissionEpoch)
+	} else {
+		admission = c.admitProviderCall(ctx, admissionEpoch)
 	}
-	defer c.finishProviderCall()
+	if admission != providerAdmissionAllowed {
+		return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
+	}
+	if !hasDeferredStart {
+		defer c.finishProviderCall()
+	}
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
+		if hasDeferredStart {
+			// A prepared turn that raced Stop is not a failed provider turn. Discard
+			// it and let the Stop transition own the durable outcome.
+			if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
+				deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+				return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
+			}
+		}
 		// A turn is definitive only when the adapter can prove the provider never
 		// received it, when the provider explicitly rejected it, or when the driver
 		// is deferred and SendTurn is still the prepare step (no boundary crossed).
@@ -2093,6 +2324,10 @@ func (c *Controller) dispatchTurn(
 			c.dispatchingTurnID = ""
 		}
 		c.mu.Unlock()
+		if hasDeferredStart {
+			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			c.clearDeferredPreparation()
+		}
 		// Definitive: the provider cannot have accepted the turn. Settle it failed
 		// rather than retrying; settling by AO's own turn id avoids looking up an
 		// empty provider id after the error. Archiving is deliberately after this
@@ -2113,6 +2348,15 @@ func (c *Controller) dispatchTurn(
 			RequestedAt:        requestedAt,
 			CompletedAt:        &completedAt,
 		}, fmt.Errorf("send turn: %w", err)
+	}
+
+	if hasDeferredStart {
+		// SendTurn prepared locally, but Stop may have won while it was running.
+		// Never bind or start that prepared turn in that case.
+		if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
+			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
+		}
 	}
 
 	// Eager drivers cross the provider boundary inside SendTurn. Record the
@@ -2147,6 +2391,7 @@ func (c *Controller) dispatchTurn(
 			// fence means the queued row is already terminal; do not settle it or
 			// start the prepared turn.
 			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			c.clearDeferredPreparation()
 			c.mu.Lock()
 			if c.dispatchingTurnID == turnID {
 				c.dispatchingTurnID = ""
@@ -2173,6 +2418,30 @@ func (c *Controller) dispatchTurn(
 		c.providerCallUnresolved = true
 		c.mu.Unlock()
 		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, bindErr)
+	}
+
+	if hasDeferredStart {
+		// The durable bind only prepared the turn. StartDeferredTurn is the real
+		// provider boundary, so admit it again after the bind.
+		c.markDeferredPrepared(ref.ProviderTurnID)
+		admission := c.admitDeferredProvider(ctx, admissionEpoch)
+		if admission != providerAdmissionAllowed {
+			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			if admission == providerAdmissionStopped {
+				c.interruptUnadmittedDispatch(ctx)
+			}
+			c.clearDeferredPreparation()
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
+			if admission == providerAdmissionPending {
+				return domain.ConversationTurn{}, fmt.Errorf("%w: stop transaction still pending", ErrProviderDispatchStopped)
+			}
+			return domain.ConversationTurn{}, ErrProviderDispatchStopped
+		}
+		defer c.finishProviderCall()
 	}
 
 	c.mu.Lock()
@@ -2527,7 +2796,7 @@ func (c *Controller) BeginHandoff(
 		c.mu.Lock()
 		active := c.pendingTurnID != ""
 		c.mu.Unlock()
-		err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonHandoffInterrupt)
+		err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonHandoffInterrupt, false)
 		if err == nil {
 			c.mu.Lock()
 			// An interrupt handoff settles the whole source queue and never
@@ -2831,19 +3100,25 @@ func (c *Controller) interruptForHandoff(ctx context.Context) error {
 // provider SendTurn. The store transaction is BEGIN IMMEDIATE either way, so
 // intent and cancellation cannot split; a row appended after the cutoff is
 // unambiguously post-stop.
-func (c *Controller) recordStopIntentLocked(ctx context.Context, reason domain.ChatStopReason) error {
-	// Close provider admission before the durable transaction. If Stop then
-	// fails, this only makes the next Send conservatively refuse; no queue row
-	// was changed. If Stop succeeds, no dispatch can cross the boundary after
-	// the intention was published.
-	c.mu.Lock()
-	c.stopEpoch++
-	c.mu.Unlock()
+func (c *Controller) recordStopIntentLocked(ctx context.Context, reason domain.ChatStopReason, terminate bool) error {
+	// A pending Stop token closes provider admission while the durable
+	// transaction runs. Only a confirmed transaction publishes a new epoch; a
+	// failed Stop retracts its own token so it cannot leave a phantom closure.
+	attempt := c.beginStopAttempt()
 	intent, err := c.store.RecordStopIntentAndCancelQueued(
 		ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, reason, c.newID(), c.now())
 	if err != nil {
+		c.finishStopAttempt(attempt, false)
 		return fmt.Errorf("record %s stop intent: %w", reason, err)
 	}
+	if terminate {
+		c.mu.Lock()
+		if c.handoff == controllerHandoffNone {
+			c.handoff = controllerHandoffTerminated
+		}
+		c.mu.Unlock()
+	}
+	c.finishStopAttempt(attempt, true)
 	c.mu.Lock()
 	c.cancelQueuedAt = time.Time{}
 	c.dispatchAfterStop = true
@@ -2877,7 +3152,7 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 	c.mu.Unlock()
 	// Local durable state is the Stop linearization point. No provider call may
 	// happen if the queue cancellation or its intent did not commit.
-	if err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonUserStop); err != nil {
+	if err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonUserStop, false); err != nil {
 		c.sendMu.Unlock()
 		return err
 	}
@@ -3140,15 +3415,11 @@ func (c *Controller) Close(ctx context.Context) error {
 // durable queue before closing the provider. The sendMu fence means no message
 // accepted after the reason is written can be mistaken for pre-termination work.
 func (c *Controller) TerminateForStop(ctx context.Context, reason domain.ChatStopReason) error {
-	// Closing intake is one mutex acquisition; do not wait on sendMu. A provider
-	// SendTurn may be stuck, and Kill must remain able to stop the controller.
-	// The durable rowid cutoff makes a concurrent append unambiguously post-stop.
-	c.mu.Lock()
-	if c.handoff == controllerHandoffNone {
-		c.handoff = controllerHandoffTerminated
-	}
-	c.mu.Unlock()
-	if err := c.recordStopIntentLocked(ctx, reason); err != nil {
+	// Do not take sendMu: a provider SendTurn may be stuck, and Kill must remain
+	// able to stop the controller. The pending Stop token closes provider
+	// admission; only a confirmed transaction publishes the epoch and terminal
+	// handoff. The durable rowid cutoff makes a concurrent append post-stop.
+	if err := c.recordStopIntentLocked(ctx, reason, true); err != nil {
 		return err
 	}
 	c.interruptUnadmittedDispatch(ctx)

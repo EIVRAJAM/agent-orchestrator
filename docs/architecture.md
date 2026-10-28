@@ -744,12 +744,26 @@ Dispatch has three distinct durable transitions:
   prompt.
 
 Before calling the provider, dispatch passes a short admission gate under
-`Controller.mu`, comparing the Stop epoch observed before the Send with the
-current epoch and closing admission for Stop/Terminate. The gate is released
-before `SendTurn`/`StartDeferredTurn`, so Stop never waits behind a blocked
-provider call. If Stop wins, a claimed running turn with no provider id settles
-as `interrupted`; if dispatch already admitted the call, Stop terminates or
-interrupts the provider concurrently and does not resend the turn.
+`Controller.mu`, comparing the confirmed Stop epoch observed before the Send
+with the current epoch and closing admission for Stop/Terminate. A pending Stop
+transaction closes admission through a temporary token; only its commit
+publishes a new epoch. A failed Stop retracts its own token (and does not install
+a terminal handoff), so it cannot leave a phantom epoch that blocks every later
+Send. The gate is released before provider I/O, so Stop never waits behind a
+blocked call.
+
+Eager drivers cross the provider boundary inside `SendTurn`: admission marks the
+provider call active before that call. Deferred drivers (ACP and its OpenCode
+wrappers) have three distinct phases. `SendTurn` only prepares locally and does
+not mark provider ownership. `BindPreparedDeferredTurn` atomically records the
+prepared provider id while the turn is still not provider-owned. Immediately
+before `StartDeferredTurn`, a second admission checks the original Stop epoch
+again and only then marks the provider call active. If Stop wins before that
+second admission, the prepared turn is discarded exactly once and
+`InterruptPreparedDeferredTurn` clears the prepared id and `started_at` while
+settling it `interrupted`. If `StartDeferredTurn` wins, Stop may terminate the
+provider concurrently; the durable binding and provider id remain, and the turn
+is never resent.
 
 There is no generic production bind that mixes these boundaries. The same
 transaction also verifies that the conversation's current primary or review

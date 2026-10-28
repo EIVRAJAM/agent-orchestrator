@@ -1844,6 +1844,55 @@ func (q *Queries) InterruptClaimedUndeliveredTurn(ctx context.Context, arg Inter
 	return result.RowsAffected()
 }
 
+const interruptPreparedDeferredTurn = `-- name: InterruptPreparedDeferredTurn :execrows
+UPDATE conversation_turns
+SET state = 'interrupted',
+    error_message = '',
+    completed_at = ?1,
+    provider_turn_id = '',
+    started_at = NULL
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.handled_by_session_id = ?4
+  AND (
+      (?5 = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = ?5
+  )
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ?6
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = ?7
+`
+
+type InterruptPreparedDeferredTurnParams struct {
+	CompletedAt          sql.NullTime
+	ID                   string
+	ConversationID       string
+	HandledBySessionID   domain.SessionID
+	ReviewID             interface{}
+	ProviderTurnID       string
+	ControllerGeneration string
+}
+
+// A deferred turn can be durably bound before StartDeferredTurn crosses the
+// provider boundary. If Stop wins that second admission, clear the prepared id
+// and started_at so the row never claims an unstarted provider turn.
+func (q *Queries) InterruptPreparedDeferredTurn(ctx context.Context, arg InterruptPreparedDeferredTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, interruptPreparedDeferredTurn,
+		arg.CompletedAt,
+		arg.ID,
+		arg.ConversationID,
+		arg.HandledBySessionID,
+		arg.ReviewID,
+		arg.ProviderTurnID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const interruptRolledBackQueuedTurns = `-- name: InterruptRolledBackQueuedTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?

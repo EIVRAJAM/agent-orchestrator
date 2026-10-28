@@ -1968,7 +1968,12 @@ func TestACPDriverPreservesSessionPreambleWhenFirstTurnNeverStarts(t *testing.T)
 		if err != nil {
 			t.Fatalf("SendTurn: %v", err)
 		}
-		conv.(ports.ChatDeferredTurnStarter).DiscardDeferredTurn(ref.ProviderTurnID)
+		deferred := conv.(ports.ChatDeferredTurnStarter)
+		deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+		deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); !errors.Is(err, ports.ErrDeferredTurnNotStarted) {
+			t.Fatalf("starting a discarded turn error = %v, want ErrDeferredTurnNotStarted", err)
+		}
 		if agent.promptParams.Prompt != nil {
 			t.Fatal("a discarded turn still reached the provider")
 		}
