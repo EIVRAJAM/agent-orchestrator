@@ -18,12 +18,17 @@ func spawnDetached(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	stdout, stderr, closeDiagnostics, err := openHostStreams()
+	if err != nil {
+		return err
+	}
+	defer closeDiagnostics()
 	cmd := exec.Command(exe, hostArgs(cfg)...) //nolint:forbidigo // detached chat host has specialized lifetime and session ownership
 	cmd.Dir = cfg.Workdir
 	cmd.Env = cfg.Env
 	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn detached chat host: %w", err)
