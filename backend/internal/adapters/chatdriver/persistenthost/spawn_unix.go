@@ -18,9 +18,13 @@ func spawnDetached(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	stdout, stderr, closeDiagnostics, err := openHostStreams()
-	if err != nil {
-		return err
+	stdout, stderr, closeDiagnostics, diagnosticsErr := openHostStreams()
+	if diagnosticsErr != nil {
+		// Diagnostics must never prevent the host from starting. The original
+		// startup error, if any, remains the one surfaced by the host.
+		fmt.Fprintf(os.Stderr, "chat host diagnostics unavailable: %v\n", diagnosticsErr)
+		stdout, stderr = nil, nil
+		closeDiagnostics = func() {}
 	}
 	defer closeDiagnostics()
 	cmd := exec.Command(exe, hostArgs(cfg)...) //nolint:forbidigo // detached chat host has specialized lifetime and session ownership
