@@ -1579,7 +1579,7 @@ func (c *Controller) sendLocked(
 	ctx context.Context,
 	msg ports.ChatUserMessage,
 	queueWhenBusy bool,
-) (domain.ConversationTurn, error) {
+) (turn domain.ConversationTurn, err error) {
 	if msg.ClientPayloadHash == "" {
 		var err error
 		msg.ClientPayloadHash, err = clientPayloadHash(msg)
@@ -1647,7 +1647,8 @@ func (c *Controller) sendLocked(
 	// insert, a duplicate, a queued row or a dispatch error leaves no running turn,
 	// and a stale marker would report a still-queued row as running.
 	defer func() {
-		if markedSending && !dispatched {
+		if markedSending && !dispatched &&
+			!errors.Is(err, ErrDeferredDispatchCleanupIncomplete) {
 			c.clearSendingTurn(turnID)
 		}
 	}()
@@ -1711,7 +1712,7 @@ func (c *Controller) sendLocked(
 		}, nil
 	}
 
-	turn, err := c.dispatch(ctx, turnID, msg, now, admissionEpoch)
+	turn, err = c.dispatch(ctx, turnID, msg, now, admissionEpoch)
 	dispatched = err == nil
 	return turn, err
 }

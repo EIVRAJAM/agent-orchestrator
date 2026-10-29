@@ -95,6 +95,10 @@ func TestDeferredNotStartedSettlementFailureRetainsTracking(t *testing.T) {
 	if pending == "" || pending != turn.ProviderTurnID {
 		t.Fatalf("pendingTurnID = %q, want retained provider id %q", pending, turn.ProviderTurnID)
 	}
+	ids := h.ctrl.DispatchingTurnIDs()
+	if len(ids) < 1 || ids[0] != turnIDByClientID(t, h, "not-started-fails") {
+		t.Fatalf("sending tracking = %v, want retained turn", ids)
+	}
 	if !h.ctrl.Busy() {
 		t.Fatal("controller is not busy after a failed not-started settlement")
 	}
@@ -224,6 +228,10 @@ func TestDeferredNotStartedSettlementDeadlineRetainsTracking(t *testing.T) {
 	}
 	if pending := h.ctrl.PendingTurnIDForTest(); pending != turn.ProviderTurnID {
 		t.Fatalf("pendingTurnID = %q, want retained %q", pending, turn.ProviderTurnID)
+	}
+	ids := h.ctrl.DispatchingTurnIDs()
+	if len(ids) < 1 || ids[0] != turnIDByClientID(t, h, "not-started-deadline") {
+		t.Fatalf("sending tracking = %v, want retained turn", ids)
 	}
 }
 
