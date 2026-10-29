@@ -118,10 +118,12 @@ func (c *Controller) CancelQueuedTurn(ctx context.Context, turnID string) error 
 	if err := c.store.CancelQueuedTurnByID(ctx, c.conversation.ID, turnID, c.now()); err != nil {
 		return err
 	}
-	// If that was the last held row, the manual-resume retention no longer
-	// describes any backlog and must not survive invisibly.
+	// If that was the last held row, neither the manual-resume retention nor
+	// the restart recovery hold describes any backlog and must not survive
+	// invisibly.
 	if _, err := c.store.NextQueuedTurn(ctx, c.conversation.ID); errors.Is(err, domain.ErrNoQueuedTurn) {
 		c.clearRetainedQueue()
+		c.clearQueueRecoveryHold()
 	}
 	return nil
 }

@@ -81,8 +81,9 @@ var ErrStaleControllerGeneration = errors.New("chat controller generation change
 var ErrSessionTerminated = errors.New("session is terminated")
 
 // ErrQueueDispatchFailed reports that the released turn could not be handed to
-// the provider. dispatch already settled that turn failed; the rest of the queue
-// is untouched.
+// the provider. When the durable settlement succeeded the turn is failed; when
+// it did not, ErrDeferredDispatchCleanupIncomplete is joined and tracking remains
+// retained. The rest of the queue is untouched in either case.
 var ErrQueueDispatchFailed = errors.New("the released turn was not accepted by the provider")
 
 // errUncertainDelivery reports a dispatch that may have crossed the provider
@@ -154,6 +155,32 @@ func (c *Controller) manualResumeRetained() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.retainedQueue != nil && c.retainedQueue.generation == c.generation
+}
+
+// setQueueRecoveryRequired installs the durable restart hold before the
+// controller is published. It prevents a drain between publication and the
+// first explicit resume.
+func (c *Controller) setQueueRecoveryRequired(required bool) {
+	c.mu.Lock()
+	c.queueRecoveryRequired = required
+	c.mu.Unlock()
+}
+
+// queueRecoveryHeld reports whether this controller is still waiting for the
+// first explicit resume of work adopted after a lost controller.
+func (c *Controller) queueRecoveryHeld() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.queueRecoveryRequired
+}
+
+// clearQueueRecoveryHold retires the in-memory hold after an explicit resume or
+// after durable cancellation left no queued work. The durable fact is cleared
+// separately only when the queue is empty.
+func (c *Controller) clearQueueRecoveryHold() {
+	c.mu.Lock()
+	c.queueRecoveryRequired = false
+	c.mu.Unlock()
 }
 
 // retainedBacklog reports whether the manual-resume retention is active with
@@ -277,16 +304,26 @@ func (c *Controller) ResumeQueuedTurn(
 		return QueueResumeResult{Outcome: QueueResumeSessionBusy}, nil
 	}
 
+	// Capture Stop admission before the manual claim. A Stop that wins after the
+	// claim but before provider I/O must prevent SendTurn/StartDeferredTurn.
+	admissionEpoch := c.providerAdmissionEpoch()
 	// Arm the one-shot before dispatch so the resumed turn's terminal event holds
 	// the queue instead of releasing the next turn.
 	c.armResumeHold(expectedTurnID)
-	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true); err != nil {
+	if err := c.drainLockedFor(ctx, true, expectedTurnID, expectedControllerGeneration, true, admissionEpoch); err != nil {
 		if errors.Is(err, errUncertainDelivery) {
 			// The eager provider boundary was crossed but AO could not record the
 			// provider id. Keep the one-shot armed so a late terminal for this
 			// provider id still holds the queue instead of releasing the next turn.
 			// The durable running row keeps the snapshot at state_uncertain.
 			return QueueResumeResult{Outcome: QueueResumeStateUncertain}, nil
+		}
+		if errors.Is(err, ErrDeferredDispatchCleanupIncomplete) {
+			// The adapter proved StartDeferredTurn did not cross the boundary, but
+			// the durable settlement failed. Keep the one-shot armed and surface the
+			// cleanup failure rather than treating the row as a settled provider
+			// failure that may release the next head.
+			return QueueResumeResult{}, errors.Join(ErrQueueDispatchFailed, err)
 		}
 		c.clearResumeHold()
 		switch {
@@ -318,8 +355,20 @@ func (c *Controller) ResumeQueuedTurn(
 		return QueueResumeResult{Outcome: QueueResumeSessionBusy}, nil
 	}
 	// A new explicit resume is the action that continues the queue, so it retires
-	// the retained-after-one-shot reason.
+	// both the one-shot retention and the in-memory restart hold. The durable
+	// restart hold remains while a backlog is still held, and is cleared only
+	// when this resume left no queued work.
 	c.clearRetainedQueue()
+	c.clearQueueRecoveryHold()
+	if _, queueErr := c.store.NextQueuedTurn(ctx, c.conversation.ID); errors.Is(queueErr, domain.ErrNoQueuedTurn) {
+		if err := c.store.ClearChatQueueRecovery(ctx, c.conversation.ID); err != nil {
+			c.log.Warn("failed to clear queue recovery after explicit resume",
+				"session", c.sessionID, "error", err)
+		}
+	} else if queueErr != nil {
+		c.log.Warn("failed to read queue after explicit resume",
+			"session", c.sessionID, "error", queueErr)
+	}
 	return QueueResumeResult{Outcome: QueueResumeResumed, TurnID: expectedTurnID}, nil
 }
 
@@ -330,9 +379,9 @@ func (c *Controller) ResumeQueuedTurn(
 // controller is no longer the owner. expectedControllerGeneration is only an
 // optimistic CAS for a client acting on a snapshot it already holds.
 //
-// This first delivery resumes only while a live, authoritative controller owns a
-// durable queued row. It deliberately does not recover after a cold start, where
-// SettleOrphanedTurns has already closed the queue.
+// This resumes only while a live, authoritative controller owns a durable queued
+// row. Cold start preserves queued work and builds the live controller; it never
+// drains that queue without this explicit call.
 func (s *Service) ResumeHeldQueue(
 	ctx context.Context,
 	id domain.SessionID,
@@ -507,11 +556,12 @@ func deriveQueueState(
 	// interrupted one-shot is caught by heldAfterFailure first.
 	heldAfterManualResume := facts.PendingCount > 0 && facts.RunningCount == 0 &&
 		controller != nil && controller.manualResumeRetained()
+	recoveryRequired := facts.QueueRecoveryRequired && facts.PendingCount > 0
 
 	// Priority, strongest first: terminated, handoff, an uncertain running turn,
-	// an active turn, compaction, a missing controller, a failure hold, a
-	// manual-resume hold, a normal queued turn, idle. An uncertain turn or a
-	// handoff is never hidden behind a hold.
+	// an active turn, compaction, a missing controller, a durable recovery hold,
+	// a failure hold, a manual-resume hold, a normal queued turn, idle. An
+	// uncertain turn or a handoff is never hidden behind a hold.
 	switch {
 	case record.IsTerminated:
 		state.State = QueueStateTerminated
@@ -535,6 +585,11 @@ func deriveQueueState(
 	case !state.ControllerAvailable:
 		state.State = QueueStateControllerRecoveryRequired
 		state.ResumeSafety = QueueResumeControllerRecoveryRequired
+	case recoveryRequired:
+		// The controller is live but the adopted queue is deliberately held
+		// until a manual resume names its head.
+		state.State = QueueStateControllerRecoveryRequired
+		state.ResumeSafety = QueueResumeResumed
 	case heldAfterFailure:
 		state.State = QueueStateHeldAfterFailure
 		state.ResumeSafety = QueueResumeResumed

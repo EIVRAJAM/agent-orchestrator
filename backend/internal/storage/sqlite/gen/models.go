@@ -249,6 +249,11 @@ type Conversation struct {
 	UsageCurrency              sql.NullString
 	ActiveBranchID             string
 	OpencodeMode               string
+	QueueRecoveryRequired      int64
+	StopReason                 string
+	StopEpisodeID              string
+	StopIntentAt               sql.NullTime
+	StopCutoffRowid            int64
 }
 
 type ConversationActivity struct {

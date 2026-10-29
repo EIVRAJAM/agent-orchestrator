@@ -618,9 +618,10 @@ Ownership invariants:
    confer daemon ownership.
 5. A residual `daemon.lock` does not imply that an owner exists.
 6. The daemon never breaks a lock based on PID, health, or timestamps.
-7. This delivery does not change queue settlement or preservation.
-8. Preservation/adoption of queued turns will be a later delivery built on this
-   single-owner guarantee.
+7. Queue preservation and controller adoption rely on this single-owner
+   guarantee; no second process can race the same generation.
+8. A direct writer of `ao.db` must hold the same lock before claiming Chat
+   controller ownership or changing queue state.
 
 A conflicting daemon exits before opening its store, publishing a run-file,
 removing a socket, or binding a listener. It prints that another daemon owns the
@@ -640,7 +641,189 @@ it and never migrates or writes. Provider-owned databases (for example OpenCode)
 are outside this lock. Any future writer of the main `ao.db` must acquire the
 same lock; it must not rely on `running.json`.
 
-This delivery still does not preserve or adopt queued turns.
+### Chat queue ownership across controller loss
+
+`conversation_turns` separates two facts that must never be settled the same
+way:
+
+- `running` crossed the provider boundary. A dead controller may have caused the
+  provider to accept the work, so orphaned running rows settle as `failed` and
+  are never re-sent or moved back to `queued`.
+- `queued` never crossed the provider boundary. Crash, stream end, controller
+  replacement, and clean daemon shutdown preserve those rows.
+
+`SettleOrphanedRunningTurns` is the only crash/stream-end settlement used by the
+daemon. `CleanupOwnedControllerWork` is fenced by controller generation and uses
+the same running-only rule. The general settlement is deliberately absent from
+the crash path.
+
+A replacement controller claims ownership and adopts queued work in one
+`BEGIN IMMEDIATE` transaction:
+
+1. compare-and-set `sessions.controller_generation` against the generation the
+   caller observed;
+2. require a non-terminated Chat session;
+3. refuse when a conversation running turn exists, unless this is cold recovery,
+   which first settles only running rows;
+4. update `conversation_turns.controller_generation` only for rows that are
+   `queued`, unpromoted, not rolled back, owned by the same session and
+   conversation, after the last durable Stop cutoff, and at or before the queue
+   rowid observed by the claim;
+5. set `conversations.queue_recovery_required` when queued rows were adopted.
+
+Any failure rolls back the generation, running settlement, row adoption, and the
+recovery hold together. The provider is not published as the session owner and
+no queued row can dispatch from the transaction. IDs, `requested_at`, rowid
+ordering, promotion state, and retry links are untouched.
+
+A fresh provider boundary or branch uses the same transaction discipline. The
+branch is inserted and activated, the generation CAS runs against the owner read
+inside that transaction, running work for the target session is settled, and
+the target's safe queued rows are adopted. No branch can become active while its
+queue still points at the previous generation. The lifecycle `CommitChatSpawn`
+and `CommitChatSpawnPrepared` paths carry this transition; the fallback path
+without a ControllerReady callback uses
+`CreateAndActivateConversationBranchAndAdoptQueued`. A failed callback or
+publication rolls all of it back.
+
+`Service.Start` reads `queue_recovery_required` from the durable conversation
+after every publication path and installs it on the controller before registry
+publication or projector start. That includes live reconnect. The restored
+running turn is not treated as a reason to clear the hold; only an explicit
+resume, empty queue, or cancellation can do that.
+
+`queue_recovery_required` is an operational hold, not a display status. The
+snapshot derives `controller_recovery_required` while a queued head exists; the
+new controller cannot auto-drain it. `resume-queue` releases exactly one named
+head through the existing durable CAS. A completed one-shot leaves the rest
+held, and a repeated restart remains held until queued work is explicitly
+resumed or cancelled. Sending, steering, or retrying during the hold queues
+behind the existing head.
+
+`conversations` also records the latest closed Stop episode:
+
+- `stop_reason` is one of `user_stop`, `interface_interrupt`,
+  `handoff_interrupt`, `agent_switch`, or `session_terminated`;
+- `stop_episode_id` is an opaque episode identity;
+- `stop_intent_at` is the intent instant;
+- `stop_cutoff_rowid` is the maximum queued rowid observed inside the same
+  `BEGIN IMMEDIATE` transaction that writes the intent and interrupts queued
+  rows through that cutoff.
+
+Rows inserted after the cutoff are new work and survive. The transaction
+verifies current conversation ownership before writing any Stop fact. For the
+primary owner that is `current_session_id` plus live session generation; for a
+review it is `review_id`/`current_review_id` plus the review's live controller
+generation. Review Stop facts live in the review conversation, never in a
+primary conversation. The transaction commits before provider interruption, so
+a crash either leaves no Stop intent or leaves the complete cancellation. A
+clean daemon shutdown uses `Close`, not a user Stop, and does not cancel queued
+work.
+
+A Send also carries an intake fence. It captures `stop_episode_id` before it
+starts recording the prompt and the append transaction re-checks that episode
+together with the session's non-terminated state, ownership, and controller
+generation. Reviewer Chat has its own equivalent append fence against its review
+conversation, `review_id`, worker session, review generation, open interface,
+and review Stop episode. If Stop commits while a Send is paused before the
+insert, the append returns `ErrChatIntakeClosed` and creates no row. If the
+append wins, the turn is inside the Stop cutoff and is interrupted.
+
+Dispatch has three distinct durable transitions:
+
+- **Eager claim** — strictly `queued -> running` before `SendTurn`; a second
+  claim over the same running row is `ErrTurnDispatchFenced`.
+- **Deferred bind** — a single `queued -> running` plus provider-id and
+  `started_at` transaction before `StartDeferredTurn`. A Stop that already
+  interrupted the queued row leaves it untouched, discards the prepared turn,
+  and never starts the provider.
+- **Eager bind** — after `SendTurn`, attaches the provider id only to the
+  already-running row. The same exact id is an idempotent success (a provider
+  may emit `TurnStarted` before `SendTurn` returns), while a different id is a
+  conflict. Failure remains uncertain delivery and never requeues or retries the
+  prompt.
+
+Before calling the provider, dispatch passes a short admission gate under
+`Controller.mu`, comparing the confirmed Stop epoch observed before the Send
+with the current epoch and closing admission for Stop/Terminate. A pending Stop
+transaction closes admission through a temporary token; only its commit
+publishes a new epoch. A failed Stop retracts its own token (and does not install
+a terminal handoff), so it cannot leave a phantom epoch that blocks every later
+Send. The gate is released before provider I/O, so Stop never waits behind a
+blocked call.
+
+Eager drivers cross the provider boundary inside `SendTurn`: admission marks the
+provider call active before that call. Deferred drivers (ACP and its OpenCode
+wrappers) have three distinct phases. `SendTurn` only prepares locally and does
+not mark provider ownership. `BindPreparedDeferredTurn` atomically records the
+prepared provider id while the turn is still not provider-owned. Immediately
+before `StartDeferredTurn`, a second admission checks the original Stop epoch
+again and only then marks the provider call active. If Stop wins before that
+second admission, the prepared turn is discarded exactly once and
+`InterruptPreparedDeferredTurn` clears the prepared id and `started_at` while
+settling it `interrupted`. If `StartDeferredTurn` wins, Stop may terminate the
+provider concurrently; the durable binding and provider id remain, and the turn
+is never resent.
+
+Every deferred dispatch that ends before `StartDeferredTurn` uses the same
+finalizer, whether admission returned `stopped` or `pending`. A pending Stop is
+awaited through its token with a detached, bounded context; a confirmed Stop is
+already authoritative. The finalizer applies the exact claimed or prepared
+transition before discarding the prepared turn or clearing the dispatch marker.
+A confirmed Stop and a failed Stop converge to `interrupted` here because no
+provider boundary was crossed; only a confirmed Stop writes the durable episode.
+This also prevents a canceled preclaimed head from remaining `running/unbound`
+when Stop fails.
+
+The finalizer classifies the durable outcome before forgetting anything:
+`finalized`, `already_terminal`, `not_running`, or `ownership_lost` allow
+cleanup; `provider_owned` and `unresolved` do not. Zero affected rows are never
+treated as success without re-reading the turn. A Stop-wait timeout, SQLite
+timeout/error, or a still-running row returns
+`ErrDeferredDispatchCleanupIncomplete` and deliberately retains
+`dispatchingTurnID`, `sendingTurnID`, `deferredPhase`, and the prepared provider
+id. Recovery may settle the row conservatively; the controller must not silently
+forget it.
+
+`ErrDeferredTurnNotStarted` follows the same rule even though the adapter proved
+the provider never received the prompt. The controller settles the row `failed`
+first, clears `pendingTurnID` only if it still names that provider turn, and only
+then writes the diagnostic archive. If settlement fails, `pendingTurnID` and the
+durable provider binding remain, the controller stays busy, and the call returns
+`ErrDeferredDispatchCleanupIncomplete`. A resume keeps its one-shot hold in that
+case; the running/provider-bound row may be rendered as `state_uncertain` until
+restart or later cleanup settles it.
+
+There is no generic production bind that mixes these boundaries. The same
+transaction also verifies that the conversation's current primary or review
+owner is still the caller; a Stop, claim, branch publication, or dispatch after
+a rebind fails without changing the new owner's rows, hold, or episode. Active
+dispatch ownership requires a live Chat session; cleanup/Stop ownership may
+survive `is_terminated`, but still requires the same current conversation owner
+and generation.
+
+Every new queue operation is owner-scoped by conversation, `handled_by_session_id`,
+and the expected `handled_by_review_id` state. Primary operations require
+`handled_by_review_id IS NULL`; review cleanup keeps its separate path. A Stop or
+claim for one worker session does not consume another session's queue in a shared
+project conversation or a reviewer's turns. Retiring a predecessor also settles
+its running activities in the same transaction, scoped to that conversation,
+session, and non-review owner; target and reviewer activities remain untouched.
+
+Live reconnect is not a replacement claim. It reuses the durable
+`controller_generation`, restores only the provider-bound session it can
+reattach, settles only unbound running rows, and does not adopt queued work or
+rotate the generation. A native provider handoff is an explicit ownership
+transfer to a different provider context: it retires the predecessor Session
+and settles both its queued and running accepted work because neither belongs in
+the target context. That is intentionally separate from crash recovery.
+Reviewer Chat keeps its separate controller/review cleanup path. Its Stop path
+uses the owner-scoped cutoff to cancel review turns but does not write the
+primary conversation-wide Stop facts or adopt review work into the worker queue.
+
+There is no scheduler, automatic recovery, automatic retry, backoff,
+rate-limit classification, SQLite lease, heartbeat, or force unlock in this
+model. A preserved queue waits for a person.
 
 ---
 

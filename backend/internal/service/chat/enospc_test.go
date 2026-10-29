@@ -29,6 +29,23 @@ func (s *enospcOnceStore) AppendUserMessage(ctx context.Context, conversationID 
 	return s.Store.AppendUserMessage(ctx, conversationID, session, generation, msg, turnID, now)
 }
 
+func (s *enospcOnceStore) AppendUserMessageFenced(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	generation, expectedStopEpisode string,
+	msg domain.ConversationMessage,
+	turnID string,
+	now time.Time,
+) (bool, error) {
+	if !s.failed {
+		s.failed = true
+		return false, syscall.ENOSPC
+	}
+	return s.Store.AppendUserMessageFenced(
+		ctx, conversationID, session, generation, expectedStopEpisode, msg, turnID, now)
+}
+
 type enospcBindStore struct {
 	chatsvc.Store
 	failed bool
@@ -38,12 +55,18 @@ type reconnectedReceiptConversation struct{ *receiptConversation }
 
 func (*reconnectedReceiptConversation) ReconnectedLive() bool { return true }
 
-func (s *enospcBindStore) BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error {
+func (s *enospcBindStore) BindClaimedEagerTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) error {
 	if !s.failed {
 		s.failed = true
 		return syscall.ENOSPC
 	}
-	return s.Store.BindTurnToProvider(ctx, turnID, providerTurnID, now)
+	return s.Store.BindClaimedEagerTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
 }
 
 func TestSendRetryAfterENOSPCDoesNotDuplicateProviderTurn(t *testing.T) {

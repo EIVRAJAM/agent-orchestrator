@@ -27,6 +27,7 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
 
 const (
@@ -55,11 +56,13 @@ type Store interface {
 	CreateProjectConversationAdoptingQueue(ctx context.Context, id string, project domain.ProjectID, session domain.SessionID, reset domain.ConversationActivity, now time.Time) (domain.ConversationRecord, error)
 	ConversationForSession(ctx context.Context, session domain.SessionID) (domain.ConversationRecord, error)
 	ClaimChatControllerGeneration(ctx context.Context, session domain.SessionID, generation string) error
+	ClaimChatControllerGenerationAndAdoptQueued(ctx context.Context, claim domain.ChatControllerClaim) (int, error)
 	ClaimReviewChatController(ctx context.Context, reviewID, providerID, generation string, now time.Time) (bool, error)
 	ConversationBranch(ctx context.Context, conversationID, branchID string) (domain.ConversationBranch, error)
 	ConversationEditAnchor(ctx context.Context, conversationID, replacedTurnID string) (domain.ConversationEditAnchor, error)
 	RepairIncompleteConversationEdit(ctx context.Context, sessionID domain.SessionID, conversationID string, now time.Time) (domain.ConversationBranch, bool, error)
 	CreateAndActivateConversationBranch(ctx context.Context, sessionID domain.SessionID, branch domain.ConversationBranch, generation string, now time.Time) error
+	CreateAndActivateConversationBranchAndAdoptQueued(ctx context.Context, sessionID domain.SessionID, branch domain.ConversationBranch, expectedGeneration, generation string, now time.Time) error
 	CreateAndActivateReviewConversationBranch(ctx context.Context, reviewID string, branch domain.ConversationBranch, generation string, now time.Time) error
 	ActivateConversationBranch(ctx context.Context, sessionID domain.SessionID, conversationID, branchID, providerConversationID, generation string, now time.Time) error
 	UpdateConversationBranchReplacement(ctx context.Context, branchID, replacementTurnID string) error
@@ -69,16 +72,25 @@ type Store interface {
 	AppendImportedUserMessage(ctx context.Context, conversationID, providerTurnID string, msg domain.ConversationMessage, now time.Time) error
 
 	AppendUserMessage(ctx context.Context, conversationID string, session domain.SessionID, generation string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
+	AppendUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
 	AppendReviewUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
+	AppendReviewUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
 	ConversationMessageByClientID(ctx context.Context, conversationID, clientMessageID string) (domain.ConversationMessage, bool, error)
 	ConversationMessages(ctx context.Context, conversationID string) ([]domain.ConversationMessage, error)
 	AppendRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
+	AppendRetryUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
-	MarkTurnDispatching(ctx context.Context, turnID string) error
-	BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error
+	AppendReviewRetryUserMessageFenced(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, expectedStopEpisode string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
+	ConversationStopEpisode(ctx context.Context, conversationID string) (string, error)
+	ClaimQueuedTurnForDispatch(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID string, now time.Time) (bool, error)
+	BindPreparedDeferredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) (bool, error)
+	BindClaimedEagerTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) error
+	InterruptClaimedUndeliveredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID string, now time.Time) (bool, error)
+	InterruptPreparedDeferredTurn(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, turnID, providerTurnID string, now time.Time) (bool, error)
 	SettleTurn(ctx context.Context, conversationID, providerTurnID string, state domain.TurnState, errMessage string, now time.Time) error
 	SettleTurnByID(ctx context.Context, turnID string, state domain.TurnState, errMessage string, now time.Time) error
-	SettleOrphanedTurns(ctx context.Context, session domain.SessionID, now time.Time) error
+	SettleOrphanedRunningTurnsForConversation(ctx context.Context, session domain.SessionID, conversationID string, now time.Time) error
+	SettleRetiredSessionTurns(ctx context.Context, session domain.SessionID, conversationID string, now time.Time) error
 	SettleUnboundRunningTurn(ctx context.Context, conversationID string, session domain.SessionID, turnID string, now time.Time) error
 	CleanupOwnedControllerWork(ctx context.Context, session domain.SessionID, conversationID, generation string, now time.Time) (bool, error)
 	CleanupOwnedReviewControllerWork(ctx context.Context, reviewID, conversationID, generation string, now time.Time) (bool, error)
@@ -112,6 +124,8 @@ type Store interface {
 	CancelQueuedTurns(ctx context.Context, conversationID string, cutoff, now time.Time) error
 	CancelAllQueuedTurns(ctx context.Context, conversationID string, now time.Time) error
 	CancelQueuedTurnByID(ctx context.Context, conversationID, turnID string, now time.Time) error
+	RecordStopIntentAndCancelQueued(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, reason domain.ChatStopReason, episodeID string, now time.Time) (domain.ChatStopIntent, error)
+	ClearChatQueueRecovery(ctx context.Context, conversationID string) error
 	QueuedTurnMessage(ctx context.Context, conversationID, turnID string) (domain.ConversationMessage, error)
 	QueuedEditDelivery(ctx context.Context, conversationID, clientMessageID string) (string, bool, error)
 	UpdateQueuedTurnMessage(ctx context.Context, conversationID, turnID, text, contentJSON string, revision int64, now time.Time, delivery domain.ConversationQueuedEditDelivery) error
@@ -187,6 +201,7 @@ const (
 	controllerHandoffInterfaceInterrupt
 	controllerHandoffIdleBranch
 	controllerHandoffHibernate
+	controllerHandoffTerminated
 )
 
 func interfaceHandoff(policy domain.SessionInterfaceTransitionPolicy) controllerHandoff {
@@ -194,6 +209,75 @@ func interfaceHandoff(policy domain.SessionInterfaceTransitionPolicy) controller
 		return controllerHandoffInterfaceDrain
 	}
 	return controllerHandoffInterfaceInterrupt
+}
+
+type deferredTurnPhase uint8
+
+const (
+	deferredTurnNone deferredTurnPhase = iota
+	deferredTurnPreparing
+	deferredTurnPrepared
+)
+
+func (p deferredTurnPhase) String() string {
+	switch p {
+	case deferredTurnNone:
+		return "none"
+	case deferredTurnPreparing:
+		return "preparing"
+	case deferredTurnPrepared:
+		return "prepared"
+	default:
+		return "unknown"
+	}
+}
+
+type providerAdmission uint8
+
+const (
+	providerAdmissionAllowed providerAdmission = iota
+	providerAdmissionStopped
+	providerAdmissionPending
+)
+
+type unadmittedDispatchResult uint8
+
+const (
+	unadmittedDispatchFinalized unadmittedDispatchResult = iota
+	unadmittedDispatchAlreadyTerminal
+	unadmittedDispatchNotRunning
+	unadmittedDispatchOwnershipLost
+	unadmittedDispatchProviderOwned
+	unadmittedDispatchUnresolved
+)
+
+func (r unadmittedDispatchResult) safeToForget() bool {
+	switch r {
+	case unadmittedDispatchFinalized, unadmittedDispatchAlreadyTerminal,
+		unadmittedDispatchNotRunning, unadmittedDispatchOwnershipLost:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r unadmittedDispatchResult) String() string {
+	switch r {
+	case unadmittedDispatchFinalized:
+		return "finalized"
+	case unadmittedDispatchAlreadyTerminal:
+		return "already_terminal"
+	case unadmittedDispatchNotRunning:
+		return "not_running"
+	case unadmittedDispatchOwnershipLost:
+		return "ownership_lost"
+	case unadmittedDispatchProviderOwned:
+		return "provider_owned"
+	case unadmittedDispatchUnresolved:
+		return "unresolved"
+	default:
+		return "unknown"
+	}
 }
 
 // Controller drives one Chat session.
@@ -262,6 +346,11 @@ type Controller struct {
 	// flight), bound to the generation that produced it, and cleared by the next
 	// explicit resume or by handoff/close/terminate. Guarded by mu.
 	retainedQueue *retainedQueue
+	// queueRecoveryRequired mirrors the durable hold written when this controller
+	// adopted queued work from a lost controller. It is cleared by an explicit
+	// resume or once no queued work remains; it is never persisted as a display
+	// state. Guarded by mu.
+	queueRecoveryRequired bool
 	// Provider calls keep automatic hibernation out without blocking explicit Kill.
 	operations int
 	// ackedTurnID is the turn the PROVIDER has confirmed it started, which lags
@@ -279,9 +368,39 @@ type Controller struct {
 	// well as on disk so a dispatch does not need a read, and updated together with
 	// the row so the two cannot drift.
 	settings domain.ConversationSettings
-	// cancelQueuedAt is set when the user interrupts, and is the cutoff for the
-	// queue that interrupt cancels. Zero means nothing is being cancelled.
+	// cancelQueuedAt is the legacy in-memory cutoff. Production Stop records and
+	// cancels durably before provider I/O; this remains only as a compatibility
+	// path for callers/tests that stage a cutoff directly.
 	cancelQueuedAt time.Time
+	// dispatchAfterStop is set by an explicit Stop so a terminal that reports the
+	// running turn interrupted can still release messages submitted after the
+	// durable cutoff. It is consumed by the next non-busy drain.
+	dispatchAfterStop bool
+	// stopEpoch advances after every committed Stop. Provider admission compares
+	// the epoch observed before append against the epoch at the provider boundary,
+	// linearizing Stop against a claimed-but-not-yet-dispatched turn.
+	stopEpoch uint64
+	// providerCallActive is true only while a dispatched turn has been admitted
+	// to provider I/O. Stop can terminate that work concurrently but must not
+	// mistake a claimed-but-unadmitted turn for provider-owned work.
+	providerCallActive bool
+	// providerCallUnresolved means an admitted provider call ended ambiguously.
+	// The provider may own the turn even after SendTurn returned, so Stop must not
+	// settle it as an unadmitted dispatch.
+	providerCallUnresolved bool
+	// deferredPhase tracks ACP-style preparation separately from provider
+	// ownership. SendTurn only prepares locally; StartDeferredTurn is the real
+	// provider boundary and has its own admission.
+	deferredPhase          deferredTurnPhase
+	deferredProviderTurnID string
+	// stopSeq identifies in-flight Stop transactions. pendingStops closes
+	// admission only until each transaction resolves; a failed Stop removes its
+	// token without publishing a new epoch.
+	stopSeq      uint64
+	pendingStops map[uint64]chan struct{}
+	// Test overrides for the bounded deferred finalization windows.
+	deferredPendingStopWaitOverride    time.Duration
+	deferredPendingStopCleanupOverride time.Duration
 	// handoff closes source-controller intake while ownership is being changed.
 	// Interface drain keeps dispatching accepted rows; interface interrupt and an
 	// idle branch mutation stop dispatch entirely. The target controller is not
@@ -334,6 +453,16 @@ func (c *Controller) beginOperation() func() {
 // ErrNoActiveTurn reports an interrupt with nothing to cancel.
 var ErrNoActiveTurn = errors.New("no active turn")
 
+// ErrProviderDispatchStopped reports that Stop won provider admission after a
+// turn was claimed but before any provider call was made.
+var ErrProviderDispatchStopped = errors.New("provider dispatch stopped before admission")
+
+// ErrDeferredDispatchCleanupIncomplete reports that a deferred dispatch was
+// stopped before StartDeferredTurn but its durable terminal transition did not
+// complete. The controller deliberately retains its in-memory dispatch tracking
+// so the running row is not silently forgotten.
+var ErrDeferredDispatchCleanupIncomplete = errors.New("deferred dispatch cleanup incomplete")
+
 // ErrControllerHandoff reports a send attempted after a controller handoff has
 // closed source intake. The client should retain the draft and retry after the
 // session_updated event announces the target mode.
@@ -374,7 +503,7 @@ func newController(
 	generation string,
 	harness domain.AgentHarness,
 	conv ports.ChatConversation,
-	store Store,
+	st Store,
 	activity ActivityRecorder,
 	log *slog.Logger,
 	newID IDFactory,
@@ -390,7 +519,7 @@ func newController(
 		generation:             generation,
 		harness:                harness,
 		conv:                   conv,
-		store:                  store,
+		store:                  st,
 		continuationReader:     reader,
 		activity:               activity,
 		log:                    log,
@@ -1450,7 +1579,7 @@ func (c *Controller) sendLocked(
 	ctx context.Context,
 	msg ports.ChatUserMessage,
 	queueWhenBusy bool,
-) (domain.ConversationTurn, error) {
+) (turn domain.ConversationTurn, err error) {
 	if msg.ClientPayloadHash == "" {
 		var err error
 		msg.ClientPayloadHash, err = clientPayloadHash(msg)
@@ -1460,13 +1589,20 @@ func (c *Controller) sendLocked(
 	}
 	c.mu.Lock()
 	handoff := c.handoff != controllerHandoffNone
+	admissionEpoch := c.stopEpoch
 	c.mu.Unlock()
 	if handoff {
 		return domain.ConversationTurn{}, ErrControllerHandoff
 	}
+	// Capture the durable intake episode before doing any work that could race a
+	// Stop. The append transaction compares this exact value; a Stop that wins
+	// while this Send is paused leaves no turn behind.
+	expectedStopEpisode, err := c.store.ConversationStopEpisode(ctx, c.conversation.ID)
+	if err != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("read chat intake fence: %w", err)
+	}
 
 	// Bind retries to the client request before adding durable continuation context.
-	var err error
 	msg, err = c.prepareContinuation(ctx, msg)
 	if err != nil {
 		return domain.ConversationTurn{}, err
@@ -1487,7 +1623,17 @@ func (c *Controller) sendLocked(
 		// Conservative: a read error must not let a new turn jump a possible backlog.
 		backlog = true
 	}
-	queueBehind := retained || backlog
+	recoveryHeld := c.queueRecoveryHeld()
+	if recoveryHeld && !backlog && backlogErr == nil {
+		// The hold only means something while a preserved head exists. A stale
+		// in-memory flag after an explicit cancellation must not hold a new send.
+		c.clearQueueRecoveryHold()
+		if err := c.store.ClearChatQueueRecovery(ctx, c.conversation.ID); err != nil {
+			c.log.Warn("failed to clear empty queue recovery hold", "session", c.sessionID, "error", err)
+		}
+		recoveryHeld = false
+	}
+	queueBehind := retained || backlog || recoveryHeld
 	if queueBehind {
 		queueWhenBusy = true
 	}
@@ -1501,7 +1647,8 @@ func (c *Controller) sendLocked(
 	// insert, a duplicate, a queued row or a dispatch error leaves no running turn,
 	// and a stale marker would report a still-queued row as running.
 	defer func() {
-		if markedSending && !dispatched {
+		if markedSending && !dispatched &&
+			!errors.Is(err, ErrDeferredDispatchCleanupIncomplete) {
 			c.clearSendingTurn(turnID)
 		}
 	}()
@@ -1530,9 +1677,9 @@ func (c *Controller) sendLocked(
 
 	var created bool
 	if c.reviewID == "" {
-		created, err = c.store.AppendUserMessage(ctx, c.conversation.ID, c.sessionID, c.generation, record, turnID, now)
+		created, err = c.store.AppendUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.generation, expectedStopEpisode, record, turnID, now)
 	} else {
-		created, err = c.store.AppendReviewUserMessage(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, record, turnID, now)
+		created, err = c.store.AppendReviewUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, expectedStopEpisode, record, turnID, now)
 	}
 	if err != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("record user message: %w", err)
@@ -1565,7 +1712,7 @@ func (c *Controller) sendLocked(
 		}, nil
 	}
 
-	turn, err := c.dispatch(ctx, turnID, msg, now)
+	turn, err = c.dispatch(ctx, turnID, msg, now, admissionEpoch)
 	dispatched = err == nil
 	return turn, err
 }
@@ -1588,6 +1735,11 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	defer c.sendMu.Unlock()
 	if c.handoffActive() {
 		return domain.ConversationTurn{}, ErrControllerHandoff
+	}
+	admissionEpoch := c.providerAdmissionEpoch()
+	expectedStopEpisode, err := c.store.ConversationStopEpisode(ctx, c.conversation.ID)
+	if err != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("read chat intake fence: %w", err)
 	}
 
 	source, err := c.store.TurnByID(ctx, turnID)
@@ -1645,6 +1797,15 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	if backlogErr != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("check queued backlog before retry: %w", backlogErr)
 	}
+	recoveryHeld := c.queueRecoveryHeld()
+	if recoveryHeld && !queueBehind {
+		c.clearQueueRecoveryHold()
+		if clearErr := c.store.ClearChatQueueRecovery(ctx, c.conversation.ID); clearErr != nil {
+			c.log.Warn("failed to clear empty queue recovery hold", "session", c.sessionID, "error", clearErr)
+		}
+		recoveryHeld = false
+	}
+	queueBehind = queueBehind || recoveryHeld
 
 	content, err := retryPromptContent(prompt.DeliveryContentJSON, c.Capabilities())
 	if err != nil {
@@ -1664,9 +1825,9 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	}
 	var created bool
 	if c.reviewID == "" {
-		created, err = c.store.AppendRetryUserMessage(ctx, c.conversation.ID, c.sessionID, c.generation, retryMessage, newTurnID, turnID, now)
+		created, err = c.store.AppendRetryUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.generation, expectedStopEpisode, retryMessage, newTurnID, turnID, now)
 	} else {
-		created, err = c.store.AppendReviewRetryUserMessage(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, retryMessage, newTurnID, turnID, now)
+		created, err = c.store.AppendReviewRetryUserMessageFenced(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, expectedStopEpisode, retryMessage, newTurnID, turnID, now)
 	}
 	if err != nil {
 		return domain.ConversationTurn{}, fmt.Errorf("record retried message: %w", err)
@@ -1702,7 +1863,7 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 		Content:         content,
 		Origin:          prompt.Origin,
 		ClientMessageID: key,
-	}, now)
+	}, now, admissionEpoch)
 }
 
 // retryPromptContent reconstructs provider-neutral durable prompt blocks and
@@ -1863,14 +2024,497 @@ func (c *Controller) Compacting() bool {
 // Busy reports whether a provider turn or compaction is in flight.
 func (c *Controller) Busy() bool { return c.busy() }
 
+// providerAdmissionEpoch captures the confirmed Stop state before a Send begins
+// durable work. pendingStops separately closes admission while a Stop transaction
+// is unresolved; StopEpoch advances only when that transaction commits.
+func (c *Controller) providerAdmissionEpoch() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stopEpoch
+}
+
+func (c *Controller) beginStopAttempt() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stopSeq++
+	id := c.stopSeq
+	if c.pendingStops == nil {
+		c.pendingStops = make(map[uint64]chan struct{})
+	}
+	c.pendingStops[id] = make(chan struct{})
+	return id
+}
+
+func (c *Controller) finishStopAttempt(id uint64, confirmed bool) {
+	c.mu.Lock()
+	ch, ok := c.pendingStops[id]
+	if ok {
+		delete(c.pendingStops, id)
+		if confirmed {
+			c.stopEpoch++
+		}
+		close(ch)
+	}
+	c.mu.Unlock()
+}
+
+func (c *Controller) stopHandoffAllowedLocked() bool {
+	return c.handoff == controllerHandoffNone || c.handoff == controllerHandoffInterfaceDrain
+}
+
+// waitForPendingStopsLocked returns a channel to await. It must be called with
+// c.mu held and returns false without a channel when no Stop transaction is
+// pending.
+func (c *Controller) waitForPendingStopsLocked() (<-chan struct{}, bool) {
+	for _, ch := range c.pendingStops {
+		return ch, true
+	}
+	return nil, false
+}
+
+func (c *Controller) waitForPendingStops(ctx context.Context) {
+	for {
+		c.mu.Lock()
+		ch, pending := c.waitForPendingStopsLocked()
+		c.mu.Unlock()
+		if !pending {
+			return
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// deferredPendingStopWaitTimeout and deferredPendingStopCleanupTimeout return
+// the production bound or a test override.
+func (c *Controller) deferredPendingStopWaitTimeout() time.Duration {
+	if c.deferredPendingStopWaitOverride > 0 {
+		return c.deferredPendingStopWaitOverride
+	}
+	return deferredPendingStopWaitLimit
+}
+
+func (c *Controller) deferredPendingStopCleanupTimeout() time.Duration {
+	if c.deferredPendingStopCleanupOverride > 0 {
+		return c.deferredPendingStopCleanupOverride
+	}
+	return deferredPendingStopCleanupLimit
+}
+
+func (c *Controller) turnOwnedByCaller(turn domain.ConversationTurn) bool {
+	return turn.ConversationID == c.conversation.ID &&
+		turn.HandledBySessionID == c.sessionID &&
+		turn.HandledByReviewID == c.reviewID
+}
+
+func (c *Controller) classifyUnadmittedTurn(
+	ctx context.Context,
+	turnID string,
+	phase deferredTurnPhase,
+) (unadmittedDispatchResult, error) {
+	turn, err := c.store.TurnByID(ctx, turnID)
+	if errors.Is(err, store.ErrConversationTurnNotFound) {
+		return unadmittedDispatchAlreadyTerminal, nil
+	}
+	if err != nil {
+		return unadmittedDispatchUnresolved, fmt.Errorf("read unadmitted turn %s: %w", turnID, err)
+	}
+	if !c.turnOwnedByCaller(turn) {
+		return unadmittedDispatchOwnershipLost, nil
+	}
+	if turn.State.Terminal() {
+		return unadmittedDispatchAlreadyTerminal, nil
+	}
+	if turn.State != domain.TurnStateRunning {
+		// A queued row still belongs to the durable queue; it has no provider
+		// boundary and does not need the deferred dispatch tracking.
+		return unadmittedDispatchNotRunning, nil
+	}
+	if turn.ProviderTurnID != "" && phase == deferredTurnNone {
+		return unadmittedDispatchProviderOwned, nil
+	}
+	return unadmittedDispatchUnresolved, nil
+}
+
+// settleUnadmittedDispatch applies the exact claimed or prepared transition and
+// classifies zero affected rows. It never treats an error, timeout, or a
+// still-running row as successful cleanup.
+func (c *Controller) settleUnadmittedDispatch(
+	ctx context.Context,
+	turnID string,
+	phase deferredTurnPhase,
+	providerTurnID string,
+) (unadmittedDispatchResult, error) {
+	c.mu.Lock()
+	active := c.providerCallActive || c.providerCallUnresolved
+	c.mu.Unlock()
+	if active {
+		return unadmittedDispatchProviderOwned, nil
+	}
+
+	if phase == deferredTurnPreparing || phase == deferredTurnPrepared {
+		turn, err := c.store.TurnByID(ctx, turnID)
+		if errors.Is(err, store.ErrConversationTurnNotFound) {
+			return unadmittedDispatchAlreadyTerminal, nil
+		}
+		if err != nil {
+			return unadmittedDispatchUnresolved, fmt.Errorf("read deferred turn %s: %w", turnID, err)
+		}
+		if !c.turnOwnedByCaller(turn) {
+			return unadmittedDispatchOwnershipLost, nil
+		}
+		if turn.State.Terminal() {
+			return unadmittedDispatchAlreadyTerminal, nil
+		}
+		if turn.State != domain.TurnStateRunning {
+			return unadmittedDispatchNotRunning, nil
+		}
+		// The durable row is authoritative for whether the prepared id reached
+		// the bind. A non-empty argument that was not committed must use the
+		// claimed transition instead.
+		providerTurnID = turn.ProviderTurnID
+	}
+
+	var (
+		settled bool
+		err     error
+	)
+	if (phase == deferredTurnPreparing || phase == deferredTurnPrepared) && providerTurnID != "" {
+		settled, err = c.store.InterruptPreparedDeferredTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, providerTurnID, c.now())
+	} else {
+		settled, err = c.store.InterruptClaimedUndeliveredTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, c.now())
+	}
+	if err != nil {
+		if errors.Is(err, store.ErrChatOwnershipLost) {
+			return unadmittedDispatchOwnershipLost, nil
+		}
+		return unadmittedDispatchUnresolved, err
+	}
+	if settled {
+		return unadmittedDispatchFinalized, nil
+	}
+	return c.classifyUnadmittedTurn(ctx, turnID, phase)
+}
+
+// settleDeferredNotStarted handles the adapter-proven "provider never received
+// the prompt" result. It settles failed first, clears pendingTurnID only on
+// success, and keeps all tracking when the durable settlement fails.
+func (c *Controller) settleDeferredNotStarted(
+	ctx context.Context,
+	turnID, providerTurnID string,
+	startErr error,
+) error {
+	settleErr := c.store.SettleTurnByID(
+		ctx, turnID, domain.TurnStateFailed, startErr.Error(), c.now())
+	if settleErr != nil {
+		return fmt.Errorf("%w: %w", ErrDeferredDispatchCleanupIncomplete,
+			errors.Join(startErr, settleErr))
+	}
+	c.mu.Lock()
+	if c.pendingTurnID == providerTurnID {
+		c.pendingTurnID = ""
+	}
+	// Settlement succeeded under sendMu, so no other Send can own these markers.
+	c.dispatchingTurnID = ""
+	c.sendingTurnID = ""
+	c.mu.Unlock()
+	c.archiveDispatchError(ctx, turnID, startErr)
+	return fmt.Errorf("start turn: %w", startErr)
+}
+
+// finalizeUnadmittedDeferredDispatch owns cleanup for every deferred dispatch
+// that ended before StartDeferredTurn. Pending Stop wait for their tokens first;
+// a confirmed Stop is already authoritative. Tracking is released only after a
+// safe durable result.
+func (c *Controller) finalizeUnadmittedDeferredDispatch(
+	ctx context.Context,
+	turnID, preparedProviderTurnID string,
+	admission providerAdmission,
+) error {
+	if admission == providerAdmissionPending {
+		waitCtx, cancelWait := context.WithTimeout(
+			context.WithoutCancel(ctx), c.deferredPendingStopWaitTimeout())
+		c.waitForPendingStops(waitCtx)
+		waitErr := waitCtx.Err()
+		cancelWait()
+		if waitErr != nil {
+			return fmt.Errorf("%w: pending Stop did not resolve: %w",
+				ErrDeferredDispatchCleanupIncomplete, waitErr)
+		}
+	}
+
+	c.mu.Lock()
+	phase := c.deferredPhase
+	c.mu.Unlock()
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(
+		context.WithoutCancel(ctx), c.deferredPendingStopCleanupTimeout())
+	defer cancelCleanup()
+	result, err := c.settleUnadmittedDispatch(cleanupCtx, turnID, phase, preparedProviderTurnID)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrDeferredDispatchCleanupIncomplete, err)
+	}
+	if !result.safeToForget() {
+		return fmt.Errorf("%w: turn %s remains %s",
+			ErrDeferredDispatchCleanupIncomplete, turnID, result)
+	}
+
+	c.releaseDeferredTracking(preparedProviderTurnID)
+
+	if admission == providerAdmissionPending {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return fmt.Errorf("%w: %w", ErrProviderDispatchStopped, cause)
+	}
+	return ErrProviderDispatchStopped
+}
+
+// admitProviderCall is the eager provider boundary. It holds c.mu only for the
+// decision and never across SendTurn. A pending Stop is awaited because its
+// durable outcome decides admission; a failed Stop retracts only its own token.
+func (c *Controller) admitProviderCall(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.providerCallActive = true
+		c.providerCallUnresolved = false
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+// admitDeferredPrepare authorizes only local preparation. It deliberately does
+// not mark provider ownership or spend the resume hold: Stop may still win before
+// StartDeferredTurn.
+func (c *Controller) admitDeferredPrepare(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		if ctx.Err() != nil {
+			return providerAdmissionPending
+		}
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.deferredPhase = deferredTurnPreparing
+		c.deferredProviderTurnID = ""
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+// deferredPreparationAuthorized is checked after SendTurn returns and before the
+// durable bind, so a Stop during the local prepare discards without binding.
+func (c *Controller) deferredPreparationAuthorized(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		if ctx.Err() != nil {
+			return providerAdmissionPending
+		}
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() || c.deferredPhase != deferredTurnPreparing {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+func (c *Controller) markDeferredPrepared(providerTurnID string) {
+	c.mu.Lock()
+	c.deferredPhase = deferredTurnPrepared
+	c.deferredProviderTurnID = providerTurnID
+	c.mu.Unlock()
+}
+
+// admitDeferredProvider is the real deferred provider boundary. Only this call
+// marks provider ownership, and it must happen immediately before
+// StartDeferredTurn.
+func (c *Controller) admitDeferredProvider(ctx context.Context, expected uint64) providerAdmission {
+	for {
+		if ctx.Err() != nil {
+			return providerAdmissionPending
+		}
+		c.mu.Lock()
+		if c.stopEpoch != expected {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		if ch, pending := c.waitForPendingStopsLocked(); pending {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return providerAdmissionPending
+			}
+		}
+		if !c.stopHandoffAllowedLocked() || c.deferredPhase != deferredTurnPrepared {
+			c.mu.Unlock()
+			return providerAdmissionStopped
+		}
+		c.deferredPhase = deferredTurnNone
+		c.deferredProviderTurnID = ""
+		c.providerCallActive = true
+		c.providerCallUnresolved = false
+		c.mu.Unlock()
+		return providerAdmissionAllowed
+	}
+}
+
+func (c *Controller) finishProviderCall() {
+	c.mu.Lock()
+	c.providerCallActive = false
+	c.mu.Unlock()
+}
+
+func (c *Controller) clearDeferredPreparation() {
+	c.mu.Lock()
+	c.deferredPhase = deferredTurnNone
+	c.deferredProviderTurnID = ""
+	c.mu.Unlock()
+}
+
+// releaseDeferredTracking discards the prepared adapter turn and clears every
+// in-memory marker. Callers may use it only after settleUnadmittedDispatch proves
+// a safe durable result.
+func (c *Controller) releaseDeferredTracking(preparedProviderTurnID string) {
+	if preparedProviderTurnID != "" {
+		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+			deferred.DiscardDeferredTurn(preparedProviderTurnID)
+		}
+	}
+	c.clearDeferredPreparation()
+	c.mu.Lock()
+	// Dispatch/finalization runs under sendMu. No other Send can own these
+	// markers, so clearing them also removes a stale sending marker.
+	c.dispatchingTurnID = ""
+	c.sendingTurnID = ""
+	c.mu.Unlock()
+}
+
+func (c *Controller) markProviderCallUnresolved() {
+	c.mu.Lock()
+	c.providerCallUnresolved = true
+	c.mu.Unlock()
+}
+
+func (c *Controller) markProviderBound() {
+	c.mu.Lock()
+	c.providerCallUnresolved = false
+	c.mu.Unlock()
+}
+
+// interruptUnadmittedDispatch settles a claimed running turn if Stop won before
+// provider admission. It is not a tracking-cleanup authority: Interrupt,
+// TerminateForStop, and the eager admission fallback keep their existing terminal
+// semantics and never use this call to clear deferred tracking. Deferred callers
+// use finalizeUnadmittedDeferredDispatch, which classifies the durable result.
+func (c *Controller) interruptUnadmittedDispatch(ctx context.Context) {
+	c.mu.Lock()
+	turnID := c.dispatchingTurnID
+	phase := c.deferredPhase
+	providerTurnID := c.deferredProviderTurnID
+	c.mu.Unlock()
+	if turnID == "" {
+		return
+	}
+	result, err := c.settleUnadmittedDispatch(ctx, turnID, phase, providerTurnID)
+	if err != nil {
+		c.log.Error("failed to settle unadmitted dispatch after Stop",
+			"session", c.sessionID, "turn", turnID, "result", result, "error", err)
+		return
+	}
+	if result == unadmittedDispatchProviderOwned {
+		// Provider termination/interrupt owns this turn, not undispatched cleanup.
+		return
+	}
+	if !result.safeToForget() {
+		c.log.Error("unadmitted dispatch remains unresolved after Stop",
+			"session", c.sessionID, "turn", turnID, "result", result)
+	}
+}
+
 // dispatch hands a recorded turn to the provider. Callers must hold sendMu.
 func (c *Controller) dispatch(
 	ctx context.Context,
 	turnID string,
 	msg ports.ChatUserMessage,
 	requestedAt time.Time,
+	admissionEpoch uint64,
 ) (domain.ConversationTurn, error) {
-	return c.dispatchTurn(ctx, turnID, msg, requestedAt, false)
+	return c.dispatchTurn(ctx, turnID, msg, requestedAt, false, admissionEpoch)
+}
+
+// abortEagerDispatchBeforeProvider handles only eager admission failure. Deferred
+// dispatches use finalizeUnadmittedDeferredDispatch so their tracking is never
+// discarded without a safe durable result.
+func (c *Controller) abortEagerDispatchBeforeProvider(
+	ctx context.Context,
+	turnID string,
+	admission providerAdmission,
+) error {
+	if admission == providerAdmissionStopped {
+		c.interruptUnadmittedDispatch(ctx)
+	}
+	c.mu.Lock()
+	if c.dispatchingTurnID == turnID {
+		c.dispatchingTurnID = ""
+	}
+	c.mu.Unlock()
+	if admission == providerAdmissionPending {
+		return fmt.Errorf("%w: stop transaction still pending", ErrProviderDispatchStopped)
+	}
+	return ErrProviderDispatchStopped
 }
 
 // dispatchTurn is dispatch with an explicit claim precondition. preClaimed means
@@ -1884,6 +2528,7 @@ func (c *Controller) dispatchTurn(
 	msg ports.ChatUserMessage,
 	requestedAt time.Time,
 	preClaimed bool,
+	admissionEpoch uint64,
 ) (domain.ConversationTurn, error) {
 	// Every dispatch carries the conversation's choices, including one AO makes on
 	// the user's behalf: a queued message draining, or a relay from `ao send`. A
@@ -1897,18 +2542,50 @@ func (c *Controller) dispatchTurn(
 	// deferred start crosses the provider boundary only after binding succeeds.
 	// A pre-claimed turn (explicit resume) already made that move with a
 	// conditional compare-and-set, so it is not marked again here.
-	if !hasDeferredStart && !preClaimed {
-		if err := c.store.MarkTurnDispatching(ctx, turnID); err != nil {
-			return domain.ConversationTurn{}, fmt.Errorf("mark turn dispatching: %w", err)
-		}
-	}
-
 	c.mu.Lock()
 	c.dispatchingTurnID = turnID
 	c.dispatchedApproval, c.hasDispatchedApproval = msg.Settings.Approval, true
 	c.mu.Unlock()
+
+	if !hasDeferredStart && !preClaimed {
+		if _, err := c.store.ClaimQueuedTurnForDispatch(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, c.now(),
+		); err != nil {
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
+			return domain.ConversationTurn{}, fmt.Errorf("claim turn dispatching: %w", err)
+		}
+	}
+
+	var admission providerAdmission
+	if hasDeferredStart {
+		admission = c.admitDeferredPrepare(ctx, admissionEpoch)
+	} else {
+		admission = c.admitProviderCall(ctx, admissionEpoch)
+	}
+	if admission != providerAdmissionAllowed {
+		if hasDeferredStart {
+			return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+				ctx, turnID, "", admission)
+		}
+		return domain.ConversationTurn{}, c.abortEagerDispatchBeforeProvider(ctx, turnID, admission)
+	}
+	if !hasDeferredStart {
+		defer c.finishProviderCall()
+	}
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
+		if hasDeferredStart {
+			// A prepared turn that raced Stop is not a failed provider turn. The
+			// safe finalizer owns settlement, discard, and tracking cleanup.
+			if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
+				return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+					ctx, turnID, ref.ProviderTurnID, admission)
+			}
+		}
 		// A turn is definitive only when the adapter can prove the provider never
 		// received it, when the provider explicitly rejected it, or when the driver
 		// is deferred and SendTurn is still the prepare step (no boundary crossed).
@@ -1926,6 +2603,7 @@ func (c *Controller) dispatchTurn(
 			// stays armed; the queue cannot advance. Return the AO turn so callers can
 			// still navigate it.
 			c.archiveDispatchError(ctx, turnID, err)
+			c.markProviderCallUnresolved()
 			return domain.ConversationTurn{
 				ID:                 turnID,
 				ConversationID:     c.conversation.ID,
@@ -1934,20 +2612,30 @@ func (c *Controller) dispatchTurn(
 				RequestedAt:        requestedAt,
 			}, fmt.Errorf("%w: send turn: %w", errUncertainDelivery, err)
 		}
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
-		}
-		c.mu.Unlock()
 		// Definitive: the provider cannot have accepted the turn. Settle it failed
 		// rather than retrying; settling by AO's own turn id avoids looking up an
 		// empty provider id after the error. Archiving is deliberately after this
 		// durable transition: a crash must not leave a definitive failure running
 		// merely because the diagnostic write was attempted first.
 		completedAt := c.now()
-		if settleErr := c.store.SettleTurnByID(
-			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
-			c.log.Error("failed to settle turn after send error", "error", settleErr)
+		settleErr := c.store.SettleTurnByID(
+			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt)
+		if hasDeferredStart {
+			if settleErr != nil {
+				return domain.ConversationTurn{}, fmt.Errorf(
+					"%w: settle failed deferred prepare: %w",
+					ErrDeferredDispatchCleanupIncomplete, settleErr)
+			}
+			c.releaseDeferredTracking(ref.ProviderTurnID)
+		} else {
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
+			if settleErr != nil {
+				c.log.Error("failed to settle turn after send error", "error", settleErr)
+			}
 		}
 		c.archiveDispatchError(ctx, turnID, err)
 		return domain.ConversationTurn{
@@ -1959,6 +2647,15 @@ func (c *Controller) dispatchTurn(
 			RequestedAt:        requestedAt,
 			CompletedAt:        &completedAt,
 		}, fmt.Errorf("send turn: %w", err)
+	}
+
+	if hasDeferredStart {
+		// SendTurn prepared locally, but Stop may have won while it was running.
+		// Never bind or start that prepared turn in that case.
+		if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
+			return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+				ctx, turnID, ref.ProviderTurnID, admission)
+		}
 	}
 
 	// Eager drivers cross the provider boundary inside SendTurn. Record the
@@ -1973,22 +2670,51 @@ func (c *Controller) dispatchTurn(
 		c.mu.Unlock()
 	}
 
-	if err := c.store.BindTurnToProvider(ctx, turnID, ref.ProviderTurnID, c.now()); err != nil {
+	var bindErr error
+	switch {
+	case hasDeferredStart && !preClaimed:
+		_, bindErr = c.store.BindPreparedDeferredTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, ref.ProviderTurnID, c.now(),
+		)
+	default:
+		// Eager already claimed queued -> running. A deferred explicit resume
+		// preclaimed through ClaimQueuedTurnForResume; both only need the provider
+		// id attached to the running row.
+		bindErr = c.store.BindClaimedEagerTurn(
+			ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, turnID, ref.ProviderTurnID, c.now(),
+		)
+	}
+	if bindErr != nil {
 		if hasDeferredStart {
-			// Deferred: the provider never received the prompt, so no boundary was
-			// crossed. Discard the prepared turn and settle the row failed; the
-			// caller clears the one-shot because there is nothing in flight.
-			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
+			// Deferred: the provider never received the prompt. A Stop/ownership
+			// fence is settled through the exact claimed/prepared transition; any
+			// other bind failure is settled failed. Neither discards the prepared
+			// turn or clears tracking until the durable settle succeeds.
+			if errors.Is(bindErr, store.ErrTurnDispatchFenced) || errors.Is(bindErr, store.ErrChatOwnershipLost) {
+				c.mu.Lock()
+				phase := c.deferredPhase
+				c.mu.Unlock()
+				result, settleErr := c.settleUnadmittedDispatch(ctx, turnID, phase, ref.ProviderTurnID)
+				if settleErr != nil {
+					return domain.ConversationTurn{}, fmt.Errorf(
+						"%w: %w", ErrDeferredDispatchCleanupIncomplete, settleErr)
+				}
+				if !result.safeToForget() {
+					return domain.ConversationTurn{}, fmt.Errorf(
+						"%w: turn %s remains %s",
+						ErrDeferredDispatchCleanupIncomplete, turnID, result)
+				}
+				c.releaseDeferredTracking(ref.ProviderTurnID)
+				return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
+			}
 			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
-				c.log.Error("failed to settle deferred turn after bind error", "error", settleErr)
+				ctx, turnID, domain.TurnStateFailed, bindErr.Error(), c.now()); settleErr != nil {
+				return domain.ConversationTurn{}, fmt.Errorf(
+					"%w: settle failed deferred bind: %w",
+					ErrDeferredDispatchCleanupIncomplete, settleErr)
 			}
-			c.mu.Lock()
-			if c.dispatchingTurnID == turnID {
-				c.dispatchingTurnID = ""
-			}
-			c.mu.Unlock()
-			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", err)
+			c.releaseDeferredTracking(ref.ProviderTurnID)
+			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
 		}
 		// Eager: SendTurn already crossed the provider boundary, so the provider
 		// may have accepted and run the instruction even though AO could not record
@@ -1999,11 +2725,25 @@ func (c *Controller) dispatchTurn(
 		// consumes it. Recovery settles the orphan.
 		c.mu.Lock()
 		c.pendingTurnID = ref.ProviderTurnID
+		c.providerCallUnresolved = true
 		c.mu.Unlock()
-		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, err)
+		return domain.ConversationTurn{}, fmt.Errorf("%w: %w", errUncertainDelivery, bindErr)
+	}
+
+	if hasDeferredStart {
+		// The durable bind only prepared the turn. StartDeferredTurn is the real
+		// provider boundary, so admit it again after the bind.
+		c.markDeferredPrepared(ref.ProviderTurnID)
+		admission := c.admitDeferredProvider(ctx, admissionEpoch)
+		if admission != providerAdmissionAllowed {
+			return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+				ctx, turnID, ref.ProviderTurnID, admission)
+		}
+		defer c.finishProviderCall()
 	}
 
 	c.mu.Lock()
+	c.providerCallUnresolved = false
 	c.pendingTurnID = ref.ProviderTurnID
 	if c.dispatchingTurnID == turnID {
 		c.dispatchingTurnID = ""
@@ -2028,25 +2768,18 @@ func (c *Controller) dispatchTurn(
 	if hasDeferredStart {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
 			if errors.Is(err, ports.ErrDeferredTurnNotStarted) {
-				// The driver proved the provider boundary was not crossed: the
-				// prompt cannot have reached the provider. Settle it failed and let
-				// the caller clear the one-shot. Archive only after that durable
-				// transition so a crash cannot strand a definitive failure running.
-				c.mu.Lock()
-				c.pendingTurnID = ""
-				c.mu.Unlock()
-				if settleErr := c.store.SettleTurnByID(
-					ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
-					c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
-				}
-				c.archiveDispatchError(ctx, turnID, err)
-				return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
+				// The driver proved the provider boundary was not crossed. Settlement
+				// must commit before pending tracking or the diagnostic archive is
+				// touched; otherwise the running row would be forgotten.
+				return domain.ConversationTurn{}, c.settleDeferredNotStarted(
+					ctx, turnID, ref.ProviderTurnID, err)
 			}
 			// Ambiguous: the request may already have been written to the provider.
 			// Keep the durable binding, the in-memory pending turn and the one-shot,
 			// and do not settle, retry or drain. A late terminal settles it. The
 			// diagnostic is archive-only and must not change that outcome.
 			c.archiveDispatchError(ctx, turnID, err)
+			c.markProviderCallUnresolved()
 			return domain.ConversationTurn{}, fmt.Errorf("%w: start turn: %w", errUncertainDelivery, err)
 		}
 	}
@@ -2117,7 +2850,7 @@ func (c *Controller) drain(ctx context.Context) error {
 // allowDispatch gates sending the next queued turn. A pending Stop cutoff forces
 // it true so messages typed after Stop still send.
 func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error {
-	return c.drainLockedFor(ctx, allowDispatch, "", "", false)
+	return c.drainLockedFor(ctx, allowDispatch, "", "", false, c.providerAdmissionEpoch())
 }
 
 // drainLockedFor is drainLocked with an explicit-resume precondition. When
@@ -2127,22 +2860,37 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 // the row is moved queued -> running with a durable compare-and-set before the
 // provider is contacted, so a row another path already claimed is never sent.
 // Callers must hold sendMu.
-func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, expectedTurnID, expectedGeneration string, claim bool) error {
+func (c *Controller) drainLockedFor(
+	ctx context.Context,
+	allowDispatch bool,
+	expectedTurnID, expectedGeneration string,
+	claim bool,
+	admissionEpoch uint64,
+) error {
 	c.mu.Lock()
 	cutoff := c.cancelQueuedAt
 	c.cancelQueuedAt = time.Time{}
 	busy := c.pendingTurnID != ""
 	handoff := c.handoff
+	dispatchAfterStop := c.dispatchAfterStop
 	c.mu.Unlock()
 
 	if busy {
 		// Something already claimed the agent, so this drain has nothing to do.
 		return nil
 	}
+	if dispatchAfterStop {
+		c.mu.Lock()
+		c.dispatchAfterStop = false
+		c.mu.Unlock()
+		// The pre-Stop rows were already cancelled in the durable Stop
+		// transaction. Rows accepted after that cutoff are new work and may run.
+		allowDispatch = true
+	}
 
 	if !cutoff.IsZero() {
-		// The user stopped the agent. Everything queued at that moment is
-		// cancelled; anything typed afterwards is still theirs to send.
+		// Compatibility path for a caller that staged an in-memory cutoff. The
+		// production Stop path writes the intent and rowid cutoff atomically.
 		if err := c.store.CancelQueuedTurns(ctx, c.conversation.ID, cutoff, c.now()); err != nil {
 			c.log.Error("failed to cancel queued turns", "session", c.sessionID, "error", err)
 			return err
@@ -2153,6 +2901,13 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 		return nil
 	}
 	if !allowDispatch {
+		return nil
+	}
+
+	// A queue adopted after a lost controller stays held until a person
+	// explicitly resumes its head. This check runs before the ordinary terminal
+	// drain so a completed turn cannot release preserved work on its own.
+	if !claim && c.queueRecoveryHeld() {
 		return nil
 	}
 
@@ -2192,13 +2947,26 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 			return errResumeStaleQueueState
 		}
 		if claim {
+			// Publish the dispatching marker before the durable claim. Stop can then
+			// settle a claimed-but-unadmitted turn before the provider boundary.
+			c.mu.Lock()
+			c.dispatchingTurnID = queued.TurnID
+			c.mu.Unlock()
 			claimed, claimErr := c.store.ClaimQueuedTurnForResume(ctx, c.conversation.ID, queued.TurnID, expectedGeneration, c.now())
 			if claimErr != nil {
+				c.mu.Lock()
+				if c.dispatchingTurnID == queued.TurnID {
+					c.dispatchingTurnID = ""
+				}
+				c.mu.Unlock()
 				return claimErr
 			}
 			if !claimed {
-				// The row is no longer an unsent, unpromoted, unrolled-back
-				// queue item; the durable compare-and-set refused it.
+				c.mu.Lock()
+				if c.dispatchingTurnID == queued.TurnID {
+					c.dispatchingTurnID = ""
+				}
+				c.mu.Unlock()
 				return errResumeStaleQueueState
 			}
 		}
@@ -2245,7 +3013,7 @@ func (c *Controller) drainLockedFor(ctx context.Context, allowDispatch bool, exp
 				return err
 			}
 		}
-		if _, err := c.dispatchTurn(ctx, queued.TurnID, queuedMessage, c.now(), claim); err != nil {
+		if _, err := c.dispatchTurn(ctx, queued.TurnID, queuedMessage, c.now(), claim, admissionEpoch); err != nil {
 			// dispatch already settled this turn as failed. Stopping here rather than
 			// walking the rest of the queue: whatever broke the send is likely to break
 			// the next one too, and failing them all on one bad provider state would
@@ -2318,7 +3086,14 @@ func (c *Controller) BeginHandoff(
 		c.mu.Lock()
 		active := c.pendingTurnID != ""
 		c.mu.Unlock()
-		err := c.store.CancelAllQueuedTurns(ctx, c.conversation.ID, c.now())
+		err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonHandoffInterrupt, false)
+		if err == nil {
+			c.mu.Lock()
+			// An interrupt handoff settles the whole source queue and never
+			// dispatches a post-stop survivor from this controller.
+			c.dispatchAfterStop = false
+			c.mu.Unlock()
+		}
 		c.sendMu.Unlock()
 		if err != nil {
 			c.AbortHandoff()
@@ -2569,6 +3344,14 @@ func (c *Controller) Compact(ctx context.Context) (ports.ChatCompactionResult, e
 // the wrong thing.
 const turnAckWait = 3 * time.Second
 
+// A deferred dispatch that observed a pending Stop must finish that Stop's
+// outcome even when the Send context is canceled. These bounds keep the cleanup
+// finite while using a detached context for the durable transition.
+const (
+	deferredPendingStopWaitLimit    = 10 * time.Second
+	deferredPendingStopCleanupLimit = 10 * time.Second
+)
+
 // interruptForHandoff cancels only the provider turn. BeginHandoff has already
 // cancelled the durable queue under the dispatch lock, so reusing Interrupt here
 // would reintroduce a second, callback-ordered cancellation path.
@@ -2608,6 +3391,44 @@ func (c *Controller) interruptForHandoff(ctx context.Context) error {
 //     The provider is the authority that the work already ended; surfacing a bare
 //     "no active turn" would leave the user staring at a Working bar they cannot
 //     dismiss. Reconcile the durable row instead.
+//
+// recordStopIntentLocked writes the durable Stop episode and cancels exactly the
+// queued rows that existed at the cutoff. User Stop and handoff interrupt hold
+// sendMu; explicit termination deliberately does not, so Kill can outrun a stuck
+// provider SendTurn. The store transaction is BEGIN IMMEDIATE either way, so
+// intent and cancellation cannot split; a row appended after the cutoff is
+// unambiguously post-stop.
+func (c *Controller) recordStopIntentLocked(ctx context.Context, reason domain.ChatStopReason, terminate bool) error {
+	// A pending Stop token closes provider admission while the durable
+	// transaction runs. Only a confirmed transaction publishes a new epoch; a
+	// failed Stop retracts its own token so it cannot leave a phantom closure.
+	attempt := c.beginStopAttempt()
+	intent, err := c.store.RecordStopIntentAndCancelQueued(
+		ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, reason, c.newID(), c.now())
+	if err != nil {
+		c.finishStopAttempt(attempt, false)
+		return fmt.Errorf("record %s stop intent: %w", reason, err)
+	}
+	if terminate {
+		c.mu.Lock()
+		if c.handoff == controllerHandoffNone {
+			c.handoff = controllerHandoffTerminated
+		}
+		c.mu.Unlock()
+	}
+	c.finishStopAttempt(attempt, true)
+	c.mu.Lock()
+	c.cancelQueuedAt = time.Time{}
+	c.dispatchAfterStop = true
+	c.queueRecoveryRequired = false
+	c.mu.Unlock()
+	c.log.Info("chat queue stop recorded",
+		"session", c.sessionID, "reason", reason, "episode", intent.EpisodeID,
+		"cutoffRowId", intent.CutoffRowID, "cancelled", intent.CancelledRows)
+	return nil
+}
+
+// Interrupt records a durable user Stop and cancels the active provider turn.
 func (c *Controller) Interrupt(ctx context.Context) error {
 	c.mu.Lock()
 	c.interrupts++
@@ -2627,13 +3448,14 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 	cutoff := c.now()
 	c.mu.Lock()
 	turn := c.pendingTurnID
-	if turn != "" {
-		// Publish the queue cutoff before releasing sendMu. A completion can then
-		// win the provider race, but it cannot drain pre-Stop work as if Stop had
-		// never happened.
-		c.cancelQueuedAt = cutoff
-	}
 	c.mu.Unlock()
+	// Local durable state is the Stop linearization point. No provider call may
+	// happen if the queue cancellation or its intent did not commit.
+	if err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonUserStop, false); err != nil {
+		c.sendMu.Unlock()
+		return err
+	}
+	c.interruptUnadmittedDispatch(ctx)
 
 	if turn == "" {
 		providerTurnIDs, err := c.store.ListVisibleRunningTurnProviderIDs(ctx, c.conversation.ID)
@@ -2688,11 +3510,9 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 			}
 			return c.reconcileDurableTurnsLocked(ctx, turn, providerTurnIDs, cutoff)
 		}
-		// The interrupt did not happen, so the queue it was going to cancel is
-		// still the user's to send.
-		c.mu.Lock()
-		c.cancelQueuedAt = time.Time{}
-		c.mu.Unlock()
+		// The provider did not cancel. The durable Stop and its queue cutoff have
+		// already committed, so they remain authoritative; only the provider-side
+		// cancellation is reported as failed.
 		return fmt.Errorf("interrupt turn %s: %w", turn, err)
 	}
 	return nil
@@ -2702,14 +3522,14 @@ func (c *Controller) Interrupt(ctx context.Context) error {
 // through the normal path but durable state still shows as running. Every visible
 // running row is settled because nested provider turns can coexist with the root;
 // leaving any one of them running would leave the same Working bar behind. Callers
-// hold sendMu so settlement, memory cleanup, queue cancellation, and survivor
-// dispatch are one serialized transition. The cutoff is the original Stop time: a
-// prompt submitted while provider cancellation was pending is new work and survives.
+// hold sendMu so settlement, memory cleanup, durable queue cancellation, and
+// survivor dispatch are one serialized transition. The original Stop cutoff is
+// already durable; this path dispatches only rows accepted after it.
 func (c *Controller) reconcileDurableTurnsLocked(
 	ctx context.Context,
 	targetProviderTurnID string,
 	visibleProviderTurnIDs []string,
-	cutoff time.Time,
+	_ time.Time,
 ) error {
 	now := c.now()
 	providerTurnIDs := make([]string, 0, len(visibleProviderTurnIDs)+1)
@@ -2729,7 +3549,6 @@ func (c *Controller) reconcileDurableTurnsLocked(
 	}
 
 	c.mu.Lock()
-	c.cancelQueuedAt = cutoff
 	if c.pendingTurnID == targetProviderTurnID {
 		c.pendingTurnID = ""
 	}
@@ -2742,8 +3561,8 @@ func (c *Controller) reconcileDurableTurnsLocked(
 	c.mu.Unlock()
 
 	c.reportActivity(ctx, domain.ActivityIdle, "chat.interrupt.reconciled", now)
-	// drainLocked consumes cancelQueuedAt, cancels only the pre-Stop queue, and
-	// immediately dispatches the oldest surviving post-Stop prompt.
+	// The durable Stop already cancelled the pre-cutoff queue. dispatchAfterStop
+	// lets this drain release only the oldest post-Stop survivor.
 	return c.drainLocked(ctx, true)
 }
 
@@ -2891,9 +3710,25 @@ func (c *Controller) Close(ctx context.Context) error {
 	}
 }
 
+// TerminateForStop records an intentional termination and cancels the whole
+// durable queue before closing the provider. The sendMu fence means no message
+// accepted after the reason is written can be mistaken for pre-termination work.
+func (c *Controller) TerminateForStop(ctx context.Context, reason domain.ChatStopReason) error {
+	// Do not take sendMu: a provider SendTurn may be stuck, and Kill must remain
+	// able to stop the controller. The pending Stop token closes provider
+	// admission; only a confirmed transaction publishes the epoch and terminal
+	// handoff. The durable rowid cutoff makes a concurrent append post-stop.
+	if err := c.recordStopIntentLocked(ctx, reason, true); err != nil {
+		return err
+	}
+	c.interruptUnadmittedDispatch(ctx)
+	return c.Terminate(ctx)
+}
+
 // Terminate closes the controller and explicitly destroys a persistent provider
 // host. Daemon shutdown uses Close so the host survives; user/session teardown
-// and controller replacement use Terminate.
+// and controller replacement use Terminate. Termination paths that represent a
+// user-visible stop use TerminateForStop so the queue decision is durable.
 func (c *Controller) Terminate(ctx context.Context) error {
 	c.mu.Lock()
 	c.resumeHold = nil
@@ -2985,10 +3820,11 @@ func (c *Controller) project() {
 		if preserveWork && event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
 			continue
 		}
-		// A lifecycle event and a concurrent Send must agree on whether the root
-		// conversation is busy. Holding the same lock Send/dispatch use closes the
-		// window between the durable projection and the in-memory ownership update.
-		lifecycle := event.Kind == ports.ChatEventTurnStarted || event.Kind == ports.ChatEventTurnCompleted || event.Kind == ports.ChatEventCompacted
+		// A terminal or compaction must serialize with dispatch/drain. TurnStarted
+		// intentionally does not take sendMu: an eager provider may emit it before
+		// SendTurn returns, and the idempotent eager bind must be allowed to record
+		// that provider id first.
+		lifecycle := event.Kind == ports.ChatEventTurnCompleted || event.Kind == ports.ChatEventCompacted
 		if lifecycle {
 			c.sendMu.Lock()
 		}
@@ -3214,6 +4050,7 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 		c.pendingTurnID = event.ProviderTurnID
 		c.compactionPending = false
 		c.ackedTurnID = event.ProviderTurnID
+		c.providerCallUnresolved = false
 		c.state = ports.ChatControllerBusy
 		return true
 	case ports.ChatEventTurnCompleted:
@@ -3228,6 +4065,7 @@ func (c *Controller) applyCommittedTurnLifecycle(event ports.ChatEvent) bool {
 		c.compactionPending = false
 		c.pendingTurnID = ""
 		c.dispatchingTurnID = ""
+		c.providerCallUnresolved = false
 		if c.ackedTurnID == event.ProviderTurnID {
 			c.ackedTurnID = ""
 		}
@@ -3249,9 +4087,10 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 		if event.ProviderTurnID != "" {
 			rootConversation := event.ProviderConversationID == "" || event.ProviderConversationID == c.conv.ProviderConversationID()
 			if dispatchingTurnID != "" && rootConversation {
-				if err := c.store.BindTurnToProvider(ctx, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
+				if err := c.store.BindClaimedEagerTurn(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, dispatchingTurnID, event.ProviderTurnID, now); err != nil {
 					return fmt.Errorf("bind early provider-started turn %s: %w", event.ProviderTurnID, err)
 				}
+				c.markProviderBound()
 				// A late TurnStarted is the only correlation a driver can offer after
 				// an ambiguous eager send. Bind it onto the one-shot too, so a later
 				// terminal is recognized and cannot drain the queue.

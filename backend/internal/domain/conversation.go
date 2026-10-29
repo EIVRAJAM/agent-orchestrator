@@ -632,7 +632,73 @@ type ConversationQueueFacts struct {
 	// LatestTerminalState is the state of the newest terminal turn, empty when
 	// the conversation has none.
 	LatestTerminalState TurnState
+	// QueueRecoveryRequired is a durable operational hold written when a
+	// replacement controller preserves queued work left by a lost controller.
+	// It is never a display state: the snapshot derives that from this fact.
+	QueueRecoveryRequired bool
 }
+
+// ChatStopReason is the closed set of durable reasons a Chat queue can be
+// stopped or cancelled. Free-form text is never the authority.
+type ChatStopReason string
+
+const (
+	// ChatStopReasonUserStop records an explicit user-requested Stop.
+	ChatStopReasonUserStop ChatStopReason = "user_stop"
+	// ChatStopReasonInterfaceInterrupt records an interrupt from a chat interface.
+	ChatStopReasonInterfaceInterrupt ChatStopReason = "interface_interrupt"
+	// ChatStopReasonHandoffInterrupt records an interrupting provider handoff.
+	ChatStopReasonHandoffInterrupt ChatStopReason = "handoff_interrupt"
+	// ChatStopReasonAgentSwitch records a switch to another agent owner.
+	ChatStopReasonAgentSwitch ChatStopReason = "agent_switch"
+	// ChatStopReasonSessionTerminated records terminal session shutdown.
+	ChatStopReasonSessionTerminated ChatStopReason = "session_terminated"
+)
+
+// Valid reports whether r is one of the closed stop reasons.
+func (r ChatStopReason) Valid() bool {
+	switch r {
+	case ChatStopReasonUserStop, ChatStopReasonInterfaceInterrupt,
+		ChatStopReasonHandoffInterrupt, ChatStopReasonAgentSwitch,
+		ChatStopReasonSessionTerminated:
+		return true
+	default:
+		return false
+	}
+}
+
+// ChatStopIntent is the durable result of atomically recording a stop and
+// cancelling the queued turns that existed at that instant.
+type ChatStopIntent struct {
+	Reason        ChatStopReason
+	EpisodeID     string
+	IntentAt      time.Time
+	CutoffRowID   int64
+	CancelledRows int64
+}
+
+// ChatControllerClaim requests an atomic controller-generation claim and,
+// optionally, adoption of the queued turns left for it. SettleRunning is used
+// only by cold recovery; ordinary replacement refuses while a running turn
+// exists. RecoveryRequired writes the durable manual-resume hold only when
+// queued rows were actually adopted.
+type ChatControllerClaim struct {
+	SessionID          SessionID
+	ConversationID     string
+	ExpectedGeneration string
+	Generation         string
+	SettleRunning      bool
+	AdoptQueued        bool
+	RecoveryRequired   bool
+	Now                time.Time
+}
+
+// Claim errors are durable conflicts, not provider failures.
+var (
+	ErrChatControllerGenerationChanged = errors.New("chat controller generation changed")
+	ErrChatControllerSessionTerminated = errors.New("chat session is terminated")
+	ErrChatControllerRunningTurn       = errors.New("chat conversation still has a running turn")
+)
 
 // RetryPrompt is the durable human-authored content of a failed turn that may
 // be dispatched again. Unlike QueuedTurn, its source was already sent and

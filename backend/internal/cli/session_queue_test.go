@@ -230,6 +230,39 @@ func TestSessionQueuePrintsDerivedState(t *testing.T) {
 	}
 }
 
+// A controller that adopted queued work after a restart reports
+// controller_recovery_required while still available. The CLI must offer the
+// same explicit resume as any other held state.
+func TestSessionQueuePrintsRecoveryHoldResumeHint(t *testing.T) {
+	cfg := setConfigEnv(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/internal/") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path != "/api/v1/sessions/demo-1/conversation" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"queue":{"queueState":"controller_recovery_required","pendingCount":1,"headTurnId":"turn-recovered","controllerGeneration":"gen-new","controllerAvailable":true,"resumeSafety":"resumed"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	writeRunFileFor(t, cfg, srv)
+
+	out, errOut, err := executeCLI(t, Deps{ProcessAlive: func(int) bool { return true }},
+		"session", "queue", "demo-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nstderr=%s", err, errOut)
+	}
+	if !strings.Contains(out, "controller_recovery_required") || !strings.Contains(out, "turn-recovered") {
+		t.Fatalf("output = %q, want the recovery state and head", out)
+	}
+	if !strings.Contains(out, "ao session resume-queue demo-1 --turn turn-recovered --generation gen-new") {
+		t.Fatalf("output missing the recovery resume hint: %q", out)
+	}
+}
+
 // TestSessionQueuePrintsHeldAfterManualResume proves the CLI surfaces the
 // one-shot retention distinctly and offers the explicit resume.
 func TestSessionQueuePrintsHeldAfterManualResume(t *testing.T) {

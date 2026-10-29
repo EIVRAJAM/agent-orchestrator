@@ -1131,9 +1131,7 @@ func TestStartRestoresSourceAfterCrashBeforeEditedPromptWasRecorded(t *testing.T
 		ctx, testSession, child, "crashed-empty-generation", h.clock); err != nil {
 		t.Fatalf("CreateAndActivateConversationBranch: %v", err)
 	}
-	if err := h.svc.Stop(ctx, testSession); err != nil {
-		t.Fatalf("Stop before restart: %v", err)
-	}
+	h.svc.StopAll(ctx)
 	record, found, err := h.st.GetSession(ctx, testSession)
 	if err != nil || !found {
 		t.Fatalf("GetSession: found=%v err=%v", found, err)
@@ -1206,9 +1204,7 @@ func TestStartLinksDurableEditedPromptAfterCrashBeforeBranchLink(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("AppendUserMessage: created=%v err=%v", created, err)
 	}
-	if err := h.svc.Stop(ctx, testSession); err != nil {
-		t.Fatalf("Stop before restart: %v", err)
-	}
+	h.svc.StopAll(ctx)
 	record, found, err := h.st.GetSession(ctx, testSession)
 	if err != nil || !found {
 		t.Fatalf("GetSession: found=%v err=%v", found, err)
@@ -1296,9 +1292,7 @@ func TestEditMessageAmbiguousApproximateFailureRemainsNavigableAcrossRestart(t *
 	requireMessageTexts(t, failedSnapshot.Messages, []string{"A", "reply to A", "B edited"})
 	requireBranchPoint(t, failedSnapshot, failed.Turn.ID, failed.SourceBranchID, "")
 
-	if err := h.svc.Stop(ctx, testSession); err != nil {
-		t.Fatalf("Stop before restart: %v", err)
-	}
+	h.svc.StopAll(ctx)
 	record, found, err := h.st.GetSession(ctx, testSession)
 	if err != nil || !found {
 		t.Fatalf("GetSession: found=%v err=%v", found, err)
@@ -1413,9 +1407,11 @@ type failEditOperationStore struct {
 	branchInstallFailures int
 }
 
-func (s *failEditOperationStore) BindTurnToProvider(
+func (s *failEditOperationStore) BindClaimedEagerTurn(
 	ctx context.Context,
-	turnID, providerTurnID string,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
 	now time.Time,
 ) error {
 	s.mu.Lock()
@@ -1427,7 +1423,26 @@ func (s *failEditOperationStore) BindTurnToProvider(
 	if err != nil {
 		return err
 	}
-	return s.Store.BindTurnToProvider(ctx, turnID, providerTurnID, now)
+	return s.Store.BindClaimedEagerTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
+}
+
+func (s *failEditOperationStore) BindPreparedDeferredTurn(
+	ctx context.Context,
+	conversationID string,
+	session domain.SessionID,
+	reviewID, generation, turnID, providerTurnID string,
+	now time.Time,
+) (bool, error) {
+	s.mu.Lock()
+	err := s.bindErr
+	if err != nil {
+		s.bindFailures++
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	return s.Store.BindPreparedDeferredTurn(ctx, conversationID, session, reviewID, generation, turnID, providerTurnID, now)
 }
 
 func (s *failEditOperationStore) CreateAndActivateConversationBranch(
@@ -2709,9 +2724,7 @@ func TestApproximateBranchScopePersistsAcrossServiceRestartAndSwitching(t *testi
 	if activeBranch.ProviderScopeID == "" {
 		t.Fatal("approximate branch has no durable provider scope")
 	}
-	if err := h.svc.Stop(ctx, testSession); err != nil {
-		t.Fatalf("Stop before restart: %v", err)
-	}
+	h.svc.StopAll(ctx)
 	record, found, err := h.st.GetSession(ctx, testSession)
 	if err != nil || !found {
 		t.Fatalf("GetSession: found=%v err=%v", found, err)

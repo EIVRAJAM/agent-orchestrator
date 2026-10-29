@@ -1066,6 +1066,39 @@ func TestCommitChatSpawnAtomicallyPublishesProviderBoundaryAndOwner(t *testing.T
 	}
 }
 
+func TestCommitChatSpawnAdoptsQueuedTurnsForNewBoundary(t *testing.T) {
+	ctx := context.Background()
+	s, session, conversation := seededChatConversation(t)
+	seedQueuedTurn(t, s, session, conversation.ID, "boundary-queued", "generation-root")
+	committedAt := testNow.Add(time.Minute)
+	session.Metadata.ProviderConversationID = "thread-boundary"
+	session.Metadata.ControllerGeneration = "generation-boundary"
+	session.UpdatedAt = committedAt
+	boundary := domain.ConversationBranch{
+		ID: "queue-boundary", ConversationID: conversation.ID, SessionID: session.ID,
+		ProviderConversationID: "thread-boundary", ParentBranchID: conversation.ActiveBranchID,
+		ForkAfterSequence: conversation.LatestSequence, ProviderScopeID: "queue-boundary",
+		CreatedAt: committedAt,
+	}
+	if err := s.CommitChatSpawn(ctx, session, boundary); err != nil {
+		t.Fatalf("CommitChatSpawn: %v", err)
+	}
+	turn, err := s.TurnByID(ctx, "boundary-queued")
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateQueued {
+		t.Fatalf("queued turn = %+v, want queued", turn)
+	}
+	facts, err := s.ConversationQueueFacts(ctx, conversation.ID)
+	if err != nil || !facts.QueueRecoveryRequired || facts.PendingCount != 1 {
+		t.Fatalf("queue facts = %+v err=%v, want held queued turn", facts, err)
+	}
+	if claimed, err := s.ClaimQueuedTurnForResume(ctx, conversation.ID, "boundary-queued", "generation-boundary", testNow); err != nil || !claimed {
+		t.Fatalf("queued turn was not associated with the new generation: claimed=%v err=%v", claimed, err)
+	}
+}
+
 func TestCommitChatSpawnRollsBackProviderBoundaryWhenOwnerWriteFails(t *testing.T) {
 	ctx := context.Background()
 	s, session, conversation := seededChatConversation(t)

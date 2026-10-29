@@ -154,6 +154,47 @@ func (q *Queries) AdoptProviderConversationTurn(ctx context.Context, arg AdoptPr
 	return err
 }
 
+const adoptQueuedConversationTurnsForController = `-- name: AdoptQueuedConversationTurnsForController :execrows
+UPDATE conversation_turns
+SET controller_generation = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.handled_by_session_id = ?3
+  AND conversation_turns.handled_by_review_id IS NULL
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.rowid > COALESCE((
+      SELECT conversations.stop_cutoff_rowid FROM conversations
+      WHERE conversations.id = ?2
+  ), 0)
+  AND conversation_turns.rowid <= COALESCE((
+      SELECT MAX(conversation_turns.rowid) FROM conversation_turns
+      WHERE conversation_turns.conversation_id = ?2
+        AND conversation_turns.handled_by_session_id = ?3
+        AND conversation_turns.handled_by_review_id IS NULL
+  ), 0)
+`
+
+type AdoptQueuedConversationTurnsForControllerParams struct {
+	ControllerGeneration string
+	ConversationID       string
+	HandledBySessionID   domain.SessionID
+}
+
+// Claim queued turns for the new controller generation without changing their
+// identity, requested_at, rowid ordering, promotion or rollback facts. Rows
+// created concurrently after the claim are excluded by the rowid high-water
+// mark, and rows deliberately cancelled by an earlier Stop are excluded by its
+// durable cutoff. The caller runs this inside the same transaction as the
+// generation CAS.
+func (q *Queries) AdoptQueuedConversationTurnsForController(ctx context.Context, arg AdoptQueuedConversationTurnsForControllerParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, adoptQueuedConversationTurnsForController, arg.ControllerGeneration, arg.ConversationID, arg.HandledBySessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const adoptReviewProviderConversationTurn = `-- name: AdoptReviewProviderConversationTurn :exec
 INSERT OR IGNORE INTO conversation_turns (
     id, conversation_id, handled_by_session_id, handled_by_review_id,
@@ -435,6 +476,43 @@ func (q *Queries) BeginConversationEditProviderWork(ctx context.Context, arg Beg
 	return result.RowsAffected()
 }
 
+const bindClaimedEagerConversationTurn = `-- name: BindClaimedEagerConversationTurn :execrows
+UPDATE conversation_turns
+SET provider_turn_id = ?1,
+    started_at = COALESCE(started_at, ?2)
+WHERE conversation_turns.id = ?3
+  AND conversation_turns.conversation_id = ?4
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = ?5
+`
+
+type BindClaimedEagerConversationTurnParams struct {
+	ProviderTurnID       string
+	StartedAt            sql.NullTime
+	ID                   string
+	ConversationID       string
+	ControllerGeneration string
+}
+
+// Eager binding happens only after the strict dispatch claim crossed the
+// provider boundary. It associates an id with an already-running row and never
+// claims the row again.
+func (q *Queries) BindClaimedEagerConversationTurn(ctx context.Context, arg BindClaimedEagerConversationTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, bindClaimedEagerConversationTurn,
+		arg.ProviderTurnID,
+		arg.StartedAt,
+		arg.ID,
+		arg.ConversationID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const bindConversationTurnProviderID = `-- name: BindConversationTurnProviderID :exec
 UPDATE conversation_turns
 SET provider_turn_id = ?, started_at = COALESCE(started_at, ?)
@@ -450,6 +528,71 @@ type BindConversationTurnProviderIDParams struct {
 func (q *Queries) BindConversationTurnProviderID(ctx context.Context, arg BindConversationTurnProviderIDParams) error {
 	_, err := q.db.ExecContext(ctx, bindConversationTurnProviderID, arg.ProviderTurnID, arg.StartedAt, arg.ID)
 	return err
+}
+
+const bindConversationTurnProviderIDForQueuedTurn = `-- name: BindConversationTurnProviderIDForQueuedTurn :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    provider_turn_id = ?1,
+    started_at = COALESCE(started_at, ?2)
+WHERE id = ?3
+  AND state = 'queued'
+  AND provider_turn_id = ''
+`
+
+type BindConversationTurnProviderIDForQueuedTurnParams struct {
+	ProviderTurnID string
+	StartedAt      sql.NullTime
+	ID             string
+}
+
+// Test/setup compatibility only; production dispatch uses the split operations
+// above. It is still a single atomic queued -> running bind, never a rebind of a
+// running row.
+func (q *Queries) BindConversationTurnProviderIDForQueuedTurn(ctx context.Context, arg BindConversationTurnProviderIDForQueuedTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, bindConversationTurnProviderIDForQueuedTurn, arg.ProviderTurnID, arg.StartedAt, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const bindPreparedDeferredConversationTurn = `-- name: BindPreparedDeferredConversationTurn :execrows
+UPDATE conversation_turns
+SET state = 'running',
+    provider_turn_id = ?1,
+    started_at = COALESCE(started_at, ?2)
+WHERE conversation_turns.id = ?3
+  AND conversation_turns.conversation_id = ?4
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = ?5
+`
+
+type BindPreparedDeferredConversationTurnParams struct {
+	ProviderTurnID       string
+	StartedAt            sql.NullTime
+	ID                   string
+	ConversationID       string
+	ControllerGeneration string
+}
+
+// Deferred binding is one atomic transition: queued -> running plus provider id
+// and started_at. It must not expose a partially bound row if Stop wins.
+func (q *Queries) BindPreparedDeferredConversationTurn(ctx context.Context, arg BindPreparedDeferredConversationTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, bindPreparedDeferredConversationTurn,
+		arg.ProviderTurnID,
+		arg.StartedAt,
+		arg.ID,
+		arg.ConversationID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const bindProjectConversationSession = `-- name: BindProjectConversationSession :exec
@@ -533,6 +676,75 @@ func (q *Queries) CancelQueuedConversationTurns(ctx context.Context, arg CancelQ
 	return err
 }
 
+const cancelQueuedConversationTurnsThroughRowID = `-- name: CancelQueuedConversationTurnsThroughRowID :execrows
+UPDATE conversation_turns
+SET state = 'interrupted', completed_at = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.handled_by_session_id = ?3
+  AND (
+      (?4 = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = ?4
+  )
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.rowid <= CAST(?5 AS INTEGER)
+`
+
+type CancelQueuedConversationTurnsThroughRowIDParams struct {
+	CompletedAt        sql.NullTime
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+	ReviewID           interface{}
+	CutoffRowid        int64
+}
+
+func (q *Queries) CancelQueuedConversationTurnsThroughRowID(ctx context.Context, arg CancelQueuedConversationTurnsThroughRowIDParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, cancelQueuedConversationTurnsThroughRowID,
+		arg.CompletedAt,
+		arg.ConversationID,
+		arg.HandledBySessionID,
+		arg.ReviewID,
+		arg.CutoffRowid,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const claimQueuedConversationTurnForDispatch = `-- name: ClaimQueuedConversationTurnForDispatch :execrows
+UPDATE conversation_turns
+SET state = 'running', started_at = COALESCE(started_at, ?1)
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = ?4
+`
+
+type ClaimQueuedConversationTurnForDispatchParams struct {
+	Now                  sql.NullTime
+	ID                   string
+	ConversationID       string
+	ControllerGeneration string
+}
+
+// The strict eager claim. A second claim over the same running row must fail:
+// accepting running here would make dispatch non-exclusive. The owner check is
+// also required inside the store transaction, not only in Go.
+func (q *Queries) ClaimQueuedConversationTurnForDispatch(ctx context.Context, arg ClaimQueuedConversationTurnForDispatchParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, claimQueuedConversationTurnForDispatch,
+		arg.Now,
+		arg.ID,
+		arg.ConversationID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const claimQueuedConversationTurnForResume = `-- name: ClaimQueuedConversationTurnForResume :execrows
 UPDATE conversation_turns
 SET state = 'running',
@@ -591,6 +803,28 @@ func (q *Queries) ClaimQueuedConversationTurnForResume(ctx context.Context, arg 
 	return result.RowsAffected()
 }
 
+const clearConversationQueueRecoveryIfEmpty = `-- name: ClearConversationQueueRecoveryIfEmpty :exec
+UPDATE conversations
+SET queue_recovery_required = 0
+WHERE conversations.id = ?1
+  AND NOT EXISTS (
+      SELECT 1 FROM conversation_turns
+      WHERE conversation_turns.conversation_id = ?1
+        AND conversation_turns.handled_by_session_id = (
+            SELECT conversations.current_session_id FROM conversations
+            WHERE conversations.id = ?1
+        )
+        AND conversation_turns.handled_by_review_id IS NULL
+        AND conversation_turns.state = 'queued'
+  )
+`
+
+// Clear the hold when a cancellation or explicit resume leaves no queued work.
+func (q *Queries) ClearConversationQueueRecoveryIfEmpty(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, clearConversationQueueRecoveryIfEmpty, id)
+	return err
+}
+
 const completeQueuedConversationTurnPromotion = `-- name: CompleteQueuedConversationTurnPromotion :execrows
 UPDATE conversation_turns
 SET state = 'completed',
@@ -626,6 +860,80 @@ func (q *Queries) CompleteQueuedConversationTurnPromotion(ctx context.Context, a
 	return result.RowsAffected()
 }
 
+const conversationAcceptsReviewTurnAppend = `-- name: ConversationAcceptsReviewTurnAppend :one
+SELECT CAST(COUNT(*) AS INTEGER) AS accepted
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = ?1
+  AND c.scope = 'review'
+  AND c.review_id = ?2
+  AND c.current_review_id = ?2
+  AND r.id = ?2
+  AND r.session_id = ?3
+  AND r.controller_generation = ?4
+  AND r.is_archived = FALSE
+  AND r.interface_mode = 'chat'
+  AND c.stop_episode_id = ?5
+`
+
+type ConversationAcceptsReviewTurnAppendParams struct {
+	ConversationID       string
+	ReviewID             sql.NullString
+	SessionID            domain.SessionID
+	ControllerGeneration string
+	StopEpisodeID        string
+}
+
+// Reviewer Chat has its own controller generation and a conversation that is
+// owned by review_id/current_review_id, not current_session_id. This is the
+// equivalent durable append fence for that owner.
+func (q *Queries) ConversationAcceptsReviewTurnAppend(ctx context.Context, arg ConversationAcceptsReviewTurnAppendParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationAcceptsReviewTurnAppend,
+		arg.ConversationID,
+		arg.ReviewID,
+		arg.SessionID,
+		arg.ControllerGeneration,
+		arg.StopEpisodeID,
+	)
+	var accepted int64
+	err := row.Scan(&accepted)
+	return accepted, err
+}
+
+const conversationAcceptsTurnAppend = `-- name: ConversationAcceptsTurnAppend :one
+SELECT CAST(COUNT(*) AS INTEGER) AS accepted
+FROM sessions AS s
+JOIN conversations AS c ON c.id = ?1
+WHERE s.id = ?2
+  AND s.session_mode = 'chat'
+  AND s.is_terminated = 0
+  AND s.controller_generation = ?3
+  AND c.current_session_id = s.id
+  AND c.current_review_id IS NULL
+  AND c.stop_episode_id = ?4
+`
+
+type ConversationAcceptsTurnAppendParams struct {
+	ConversationID       string
+	SessionID            domain.SessionID
+	ControllerGeneration string
+	StopEpisodeID        string
+}
+
+// The same durable fence also verifies that the handling session still owns the
+// conversation and the controller generation observed by the sender is live.
+func (q *Queries) ConversationAcceptsTurnAppend(ctx context.Context, arg ConversationAcceptsTurnAppendParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationAcceptsTurnAppend,
+		arg.ConversationID,
+		arg.SessionID,
+		arg.ControllerGeneration,
+		arg.StopEpisodeID,
+	)
+	var accepted int64
+	err := row.Scan(&accepted)
+	return accepted, err
+}
+
 const conversationActivityExistsForProviderItem = `-- name: ConversationActivityExistsForProviderItem :one
 SELECT EXISTS(
     SELECT 1
@@ -651,6 +959,153 @@ func (q *Queries) ConversationActivityExistsForProviderItem(ctx context.Context,
 	return exists, err
 }
 
+const conversationOwnedByPrimarySession = `-- name: ConversationOwnedByPrimarySession :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN sessions AS s ON s.id = c.current_session_id
+WHERE c.id = ?1
+  AND c.current_session_id = ?2
+  AND c.current_review_id IS NULL
+  AND c.scope IN ('session', 'project')
+  AND s.id = ?2
+  AND s.controller_generation = ?3
+`
+
+type ConversationOwnedByPrimarySessionParams struct {
+	ConversationID       string
+	SessionID            *domain.SessionID
+	ControllerGeneration string
+}
+
+// Current ownership proofs used by mutation transactions.
+// Cleanup ownership can survive is_terminated=1 / archived review, but it must
+// still prove the conversation has not moved to another owner.
+func (q *Queries) ConversationOwnedByPrimarySession(ctx context.Context, arg ConversationOwnedByPrimarySessionParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationOwnedByPrimarySession, arg.ConversationID, arg.SessionID, arg.ControllerGeneration)
+	var owned int64
+	err := row.Scan(&owned)
+	return owned, err
+}
+
+const conversationOwnedByPrimarySessionActive = `-- name: ConversationOwnedByPrimarySessionActive :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN sessions AS s ON s.id = c.current_session_id
+WHERE c.id = ?1
+  AND c.current_session_id = ?2
+  AND c.current_review_id IS NULL
+  AND c.scope IN ('session', 'project')
+  AND s.id = ?2
+  AND s.session_mode = 'chat'
+  AND s.is_terminated = 0
+  AND s.controller_generation = ?3
+`
+
+type ConversationOwnedByPrimarySessionActiveParams struct {
+	ConversationID       string
+	SessionID            *domain.SessionID
+	ControllerGeneration string
+}
+
+// Active dispatch ownership additionally requires a live Chat session.
+func (q *Queries) ConversationOwnedByPrimarySessionActive(ctx context.Context, arg ConversationOwnedByPrimarySessionActiveParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationOwnedByPrimarySessionActive, arg.ConversationID, arg.SessionID, arg.ControllerGeneration)
+	var owned int64
+	err := row.Scan(&owned)
+	return owned, err
+}
+
+const conversationOwnedByReview = `-- name: ConversationOwnedByReview :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = ?1
+  AND c.scope = 'review'
+  AND c.review_id = ?2
+  AND c.current_review_id = ?2
+  AND r.id = ?2
+  AND r.session_id = ?3
+  AND r.controller_generation = ?4
+`
+
+type ConversationOwnedByReviewParams struct {
+	ConversationID       string
+	ReviewID             sql.NullString
+	SessionID            domain.SessionID
+	ControllerGeneration string
+}
+
+func (q *Queries) ConversationOwnedByReview(ctx context.Context, arg ConversationOwnedByReviewParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationOwnedByReview,
+		arg.ConversationID,
+		arg.ReviewID,
+		arg.SessionID,
+		arg.ControllerGeneration,
+	)
+	var owned int64
+	err := row.Scan(&owned)
+	return owned, err
+}
+
+const conversationOwnedByReviewActive = `-- name: ConversationOwnedByReviewActive :one
+SELECT CAST(COUNT(*) AS INTEGER) AS owned
+FROM conversations AS c
+JOIN review AS r ON r.id = c.current_review_id
+WHERE c.id = ?1
+  AND c.scope = 'review'
+  AND c.review_id = ?2
+  AND c.current_review_id = ?2
+  AND r.id = ?2
+  AND r.session_id = ?3
+  AND r.controller_generation = ?4
+  AND r.is_archived = FALSE
+  AND r.interface_mode = 'chat'
+`
+
+type ConversationOwnedByReviewActiveParams struct {
+	ConversationID       string
+	ReviewID             sql.NullString
+	SessionID            domain.SessionID
+	ControllerGeneration string
+}
+
+func (q *Queries) ConversationOwnedByReviewActive(ctx context.Context, arg ConversationOwnedByReviewActiveParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, conversationOwnedByReviewActive,
+		arg.ConversationID,
+		arg.ReviewID,
+		arg.SessionID,
+		arg.ControllerGeneration,
+	)
+	var owned int64
+	err := row.Scan(&owned)
+	return owned, err
+}
+
+const countRunningConversationTurnsForSession = `-- name: CountRunningConversationTurnsForSession :one
+SELECT CAST(COUNT(*) AS INTEGER) AS running_count
+FROM conversation_turns
+WHERE conversation_id = ?1
+  AND handled_by_session_id = ?2
+  AND handled_by_review_id IS NULL
+  AND state = 'running'
+  AND rolled_back_at IS NULL
+`
+
+type CountRunningConversationTurnsForSessionParams struct {
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+}
+
+// A replacement controller may only adopt queued rows after proving there is no
+// running turn in this conversation. This is the NOT EXISTS precondition the
+// claim transaction evaluates under its single writer lock.
+func (q *Queries) CountRunningConversationTurnsForSession(ctx context.Context, arg CountRunningConversationTurnsForSessionParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunningConversationTurnsForSession, arg.ConversationID, arg.HandledBySessionID)
+	var running_count int64
+	err := row.Scan(&running_count)
+	return running_count, err
+}
+
 const detachSessionConversation = `-- name: DetachSessionConversation :exec
 UPDATE conversations SET current_session_id = NULL, updated_at = ?
 WHERE id = ? AND scope = 'session' AND current_session_id = ?
@@ -667,27 +1122,31 @@ func (q *Queries) DetachSessionConversation(ctx context.Context, arg DetachSessi
 	return err
 }
 
-const failOrphanedConversationActivities = `-- name: FailOrphanedConversationActivities :exec
+const failOrphanedConversationActivitiesForConversation = `-- name: FailOrphanedConversationActivitiesForConversation :exec
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = ?1
-WHERE status = 'running'
+WHERE conversation_activities.conversation_id = ?2
+  AND status = 'running'
   AND turn_id IN (
       SELECT id FROM conversation_turns
-      WHERE handled_by_session_id = ?2
-        AND state IN ('queued', 'running')
+      WHERE conversation_turns.conversation_id = ?2
+        AND conversation_turns.handled_by_session_id = ?3
+        AND conversation_turns.handled_by_review_id IS NULL
+        AND conversation_turns.state = 'running'
   )
 `
 
-type FailOrphanedConversationActivitiesParams struct {
+type FailOrphanedConversationActivitiesForConversationParams struct {
 	UpdatedAt          time.Time
+	ConversationID     string
 	HandledBySessionID domain.SessionID
 }
 
-// The same invariant applies when startup discovers work abandoned by a dead
-// controller. This runs before SettleOrphanedConversationTurns while their turn
-// states still identify the affected rows.
-func (q *Queries) FailOrphanedConversationActivities(ctx context.Context, arg FailOrphanedConversationActivitiesParams) error {
-	_, err := q.db.ExecContext(ctx, failOrphanedConversationActivities, arg.UpdatedAt, arg.HandledBySessionID)
+// Controller claim is conversation-scoped: an unrelated project/session
+// conversation or a review turn handled by the same worker session must not be
+// settled by this replacement.
+func (q *Queries) FailOrphanedConversationActivitiesForConversation(ctx context.Context, arg FailOrphanedConversationActivitiesForConversationParams) error {
+	_, err := q.db.ExecContext(ctx, failOrphanedConversationActivitiesForConversation, arg.UpdatedAt, arg.ConversationID, arg.HandledBySessionID)
 	return err
 }
 
@@ -803,6 +1262,34 @@ type FailPendingReviewRequestsParams struct {
 
 func (q *Queries) FailPendingReviewRequests(ctx context.Context, arg FailPendingReviewRequestsParams) error {
 	_, err := q.db.ExecContext(ctx, failPendingReviewRequests, arg.UpdatedAt, arg.ConversationID, arg.ReviewID)
+	return err
+}
+
+const failRetiredConversationActivities = `-- name: FailRetiredConversationActivities :exec
+UPDATE conversation_activities
+SET status = 'failed', revision = revision + 1, updated_at = ?1
+WHERE conversation_activities.conversation_id = ?2
+  AND status = 'running'
+  AND conversation_activities.turn_id IN (
+      SELECT conversation_turns.id FROM conversation_turns
+      WHERE conversation_turns.conversation_id = ?2
+        AND conversation_turns.handled_by_session_id = ?3
+        AND conversation_turns.handled_by_review_id IS NULL
+        AND conversation_turns.state IN ('queued', 'running')
+  )
+`
+
+type FailRetiredConversationActivitiesParams struct {
+	UpdatedAt          time.Time
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+}
+
+// The activities belonging to those retired turns must settle in the same
+// transaction. The target, other sessions, other conversations and reviews are
+// excluded by the same owner scope as the turn settlement above.
+func (q *Queries) FailRetiredConversationActivities(ctx context.Context, arg FailRetiredConversationActivitiesParams) error {
+	_, err := q.db.ExecContext(ctx, failRetiredConversationActivities, arg.UpdatedAt, arg.ConversationID, arg.HandledBySessionID)
 	return err
 }
 
@@ -1314,6 +1801,100 @@ func (q *Queries) InsertReviewConversationTurn(ctx context.Context, arg InsertRe
 	return err
 }
 
+const interruptClaimedUndeliveredTurn = `-- name: InterruptClaimedUndeliveredTurn :execrows
+UPDATE conversation_turns
+SET state = 'interrupted',
+    error_message = '',
+    completed_at = ?1,
+    started_at = NULL
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.handled_by_session_id = ?4
+  AND (
+      (?5 = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = ?5
+  )
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ''
+  AND conversation_turns.controller_generation = ?6
+`
+
+type InterruptClaimedUndeliveredTurnParams struct {
+	CompletedAt          sql.NullTime
+	ID                   string
+	ConversationID       string
+	HandledBySessionID   domain.SessionID
+	ReviewID             interface{}
+	ControllerGeneration string
+}
+
+// A dispatch that claimed a turn but had not yet called the provider can settle
+// it as interrupted when Stop wins admission. It must have no provider id, and
+// the claim's started_at must not survive as a false provider-start timestamp.
+func (q *Queries) InterruptClaimedUndeliveredTurn(ctx context.Context, arg InterruptClaimedUndeliveredTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, interruptClaimedUndeliveredTurn,
+		arg.CompletedAt,
+		arg.ID,
+		arg.ConversationID,
+		arg.HandledBySessionID,
+		arg.ReviewID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const interruptPreparedDeferredTurn = `-- name: InterruptPreparedDeferredTurn :execrows
+UPDATE conversation_turns
+SET state = 'interrupted',
+    error_message = '',
+    completed_at = ?1,
+    provider_turn_id = '',
+    started_at = NULL
+WHERE conversation_turns.id = ?2
+  AND conversation_turns.conversation_id = ?3
+  AND conversation_turns.handled_by_session_id = ?4
+  AND (
+      (?5 = '' AND conversation_turns.handled_by_review_id IS NULL)
+      OR conversation_turns.handled_by_review_id = ?5
+  )
+  AND conversation_turns.state = 'running'
+  AND conversation_turns.provider_turn_id = ?6
+  AND conversation_turns.rolled_back_at IS NULL
+  AND conversation_turns.controller_generation = ?7
+`
+
+type InterruptPreparedDeferredTurnParams struct {
+	CompletedAt          sql.NullTime
+	ID                   string
+	ConversationID       string
+	HandledBySessionID   domain.SessionID
+	ReviewID             interface{}
+	ProviderTurnID       string
+	ControllerGeneration string
+}
+
+// A deferred turn can be durably bound before StartDeferredTurn crosses the
+// provider boundary. If Stop wins that second admission, clear the prepared id
+// and started_at so the row never claims an unstarted provider turn.
+func (q *Queries) InterruptPreparedDeferredTurn(ctx context.Context, arg InterruptPreparedDeferredTurnParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, interruptPreparedDeferredTurn,
+		arg.CompletedAt,
+		arg.ID,
+		arg.ConversationID,
+		arg.HandledBySessionID,
+		arg.ReviewID,
+		arg.ProviderTurnID,
+		arg.ControllerGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const interruptRolledBackQueuedTurns = `-- name: InterruptRolledBackQueuedTurns :exec
 UPDATE conversation_turns
 SET state = 'interrupted', completed_at = ?
@@ -1541,22 +2122,6 @@ func (q *Queries) MarkConversationCompacted(ctx context.Context, arg MarkConvers
 	return err
 }
 
-const markConversationTurnStarted = `-- name: MarkConversationTurnStarted :exec
-UPDATE conversation_turns
-SET state = 'running', started_at = COALESCE(started_at, ?)
-WHERE id = ?
-`
-
-type MarkConversationTurnStartedParams struct {
-	StartedAt sql.NullTime
-	ID        string
-}
-
-func (q *Queries) MarkConversationTurnStarted(ctx context.Context, arg MarkConversationTurnStartedParams) error {
-	_, err := q.db.ExecContext(ctx, markConversationTurnStarted, arg.StartedAt, arg.ID)
-	return err
-}
-
 const markConversationTurnsRolledBack = `-- name: MarkConversationTurnsRolledBack :execrows
 UPDATE conversation_turns
 SET rolled_back_at = ?
@@ -1583,6 +2148,28 @@ type MarkConversationTurnsRolledBackParams struct {
 // ordinary; two turns sharing a rowid is impossible.
 func (q *Queries) MarkConversationTurnsRolledBack(ctx context.Context, arg MarkConversationTurnsRolledBackParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, markConversationTurnsRolledBack, arg.RolledBackAt, arg.ConversationID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markQueuedConversationTurnRunning = `-- name: MarkQueuedConversationTurnRunning :execrows
+UPDATE conversation_turns
+SET state = 'running', started_at = COALESCE(started_at, ?1)
+WHERE id = ?2
+  AND state = 'queued'
+`
+
+type MarkQueuedConversationTurnRunningParams struct {
+	StartedAt sql.NullTime
+	ID        string
+}
+
+// Test/setup compatibility only; production dispatch uses the split operations
+// above. It is still a strict queued -> running claim, never a running rebind.
+func (q *Queries) MarkQueuedConversationTurnRunning(ctx context.Context, arg MarkQueuedConversationTurnRunningParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markQueuedConversationTurnRunning, arg.StartedAt, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -1743,6 +2330,80 @@ type RecomputeConversationCompactedAtParams struct {
 func (q *Queries) RecomputeConversationCompactedAt(ctx context.Context, arg RecomputeConversationCompactedAtParams) error {
 	_, err := q.db.ExecContext(ctx, recomputeConversationCompactedAt, arg.UpdatedAt, arg.TargetConversationID)
 	return err
+}
+
+const recordPrimaryConversationStopIntent = `-- name: RecordPrimaryConversationStopIntent :execrows
+UPDATE conversations
+SET stop_reason = ?1,
+    stop_episode_id = ?2,
+    stop_intent_at = ?3,
+    stop_cutoff_rowid = ?4,
+    queue_recovery_required = 0
+WHERE conversations.id = ?5
+  AND conversations.current_session_id = ?6
+  AND conversations.current_review_id IS NULL
+  AND conversations.scope IN ('session', 'project')
+`
+
+type RecordPrimaryConversationStopIntentParams struct {
+	StopReason       string
+	StopEpisodeID    string
+	StopIntentAt     sql.NullTime
+	StopCutoffRowid  int64
+	ID               string
+	CurrentSessionID *domain.SessionID
+}
+
+func (q *Queries) RecordPrimaryConversationStopIntent(ctx context.Context, arg RecordPrimaryConversationStopIntentParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recordPrimaryConversationStopIntent,
+		arg.StopReason,
+		arg.StopEpisodeID,
+		arg.StopIntentAt,
+		arg.StopCutoffRowid,
+		arg.ID,
+		arg.CurrentSessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const recordReviewConversationStopIntent = `-- name: RecordReviewConversationStopIntent :execrows
+UPDATE conversations
+SET stop_reason = ?1,
+    stop_episode_id = ?2,
+    stop_intent_at = ?3,
+    stop_cutoff_rowid = ?4,
+    queue_recovery_required = 0
+WHERE conversations.id = ?5
+  AND conversations.scope = 'review'
+  AND conversations.review_id = ?6
+  AND conversations.current_review_id = ?6
+`
+
+type RecordReviewConversationStopIntentParams struct {
+	StopReason      string
+	StopEpisodeID   string
+	StopIntentAt    sql.NullTime
+	StopCutoffRowid int64
+	ID              string
+	ReviewID        sql.NullString
+}
+
+func (q *Queries) RecordReviewConversationStopIntent(ctx context.Context, arg RecordReviewConversationStopIntentParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, recordReviewConversationStopIntent,
+		arg.StopReason,
+		arg.StopEpisodeID,
+		arg.StopIntentAt,
+		arg.StopCutoffRowid,
+		arg.ID,
+		arg.ReviewID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const rejectConversationEditDelivery = `-- name: RejectConversationEditDelivery :execrows
@@ -2416,7 +3077,7 @@ func (q *Queries) SelectConversationBranches(ctx context.Context, conversationID
 }
 
 const selectConversationByID = `-- name: SelectConversationByID :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE id = ? LIMIT 1
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE id = ? LIMIT 1
 `
 
 func (q *Queries) SelectConversationByID(ctx context.Context, id string) (Conversation, error) {
@@ -2458,12 +3119,17 @@ func (q *Queries) SelectConversationByID(ctx context.Context, id string) (Conver
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
 
 const selectConversationByReview = `-- name: SelectConversationByReview :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE current_review_id = ? LIMIT 1
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE current_review_id = ? LIMIT 1
 `
 
 func (q *Queries) SelectConversationByReview(ctx context.Context, currentReviewID sql.NullString) (Conversation, error) {
@@ -2505,12 +3171,17 @@ func (q *Queries) SelectConversationByReview(ctx context.Context, currentReviewI
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
 
 const selectConversationBySession = `-- name: SelectConversationBySession :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE current_session_id = ?
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE current_session_id = ?
 ORDER BY scope = 'project' DESC, created_at DESC, id DESC
 LIMIT 1
 `
@@ -2558,6 +3229,11 @@ func (q *Queries) SelectConversationBySession(ctx context.Context, currentSessio
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
@@ -3200,15 +3876,18 @@ SELECT
         WHERE t.conversation_id = ?1
           AND t.rolled_back_at IS NULL
           AND t.state IN ('completed','recovered','interrupted','failed','cancelled')
-        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state
+        ORDER BY t.requested_at DESC, t.rowid DESC LIMIT 1), '') AS TEXT) AS latest_terminal_state,
+    CAST(COALESCE((SELECT c.queue_recovery_required FROM conversations AS c
+        WHERE c.id = ?1), 0) AS INTEGER) AS queue_recovery_required
 `
 
 type SelectConversationQueueFactsRow struct {
-	PendingCount        int64
-	RunningCount        int64
-	RunningUnboundCount int64
-	ActiveTurnID        string
-	LatestTerminalState string
+	PendingCount          int64
+	RunningCount          int64
+	RunningUnboundCount   int64
+	ActiveTurnID          string
+	LatestTerminalState   string
+	QueueRecoveryRequired int64
 }
 
 // Aggregate, window-independent facts for the derived observable queue view.
@@ -3231,6 +3910,7 @@ func (q *Queries) SelectConversationQueueFacts(ctx context.Context, conversation
 		&i.RunningUnboundCount,
 		&i.ActiveTurnID,
 		&i.LatestTerminalState,
+		&i.QueueRecoveryRequired,
 	)
 	return i, err
 }
@@ -3334,6 +4014,22 @@ func (q *Queries) SelectConversationSteerDelivery(ctx context.Context, arg Selec
 		&i.SettledAt,
 	)
 	return i, err
+}
+
+const selectConversationStopEpisode = `-- name: SelectConversationStopEpisode :one
+SELECT stop_episode_id
+FROM conversations
+WHERE id = ?1
+`
+
+// Send captures the durable Stop episode before it begins its append work. The
+// append transaction compares this value again, so a Stop that commits while a
+// Send is paused before the insert wins and the Send creates no turn.
+func (q *Queries) SelectConversationStopEpisode(ctx context.Context, id string) (string, error) {
+	row := q.db.QueryRowContext(ctx, selectConversationStopEpisode, id)
+	var stop_episode_id string
+	err := row.Scan(&stop_episode_id)
+	return stop_episode_id, err
 }
 
 const selectConversationTurnByID = `-- name: SelectConversationTurnByID :one
@@ -3721,6 +4417,34 @@ func (q *Queries) SelectLatestConversationTurn(ctx context.Context, conversation
 	return i, err
 }
 
+const selectMaxQueuedConversationTurnRowID = `-- name: SelectMaxQueuedConversationTurnRowID :one
+SELECT CAST(COALESCE(MAX(rowid), 0) AS INTEGER) AS cutoff_rowid
+FROM conversation_turns
+WHERE conversation_id = ?1
+  AND handled_by_session_id = ?2
+  AND (
+      (?3 = '' AND handled_by_review_id IS NULL)
+      OR handled_by_review_id = ?3
+  )
+  AND state = 'queued'
+`
+
+type SelectMaxQueuedConversationTurnRowIDParams struct {
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+	ReviewID           interface{}
+}
+
+// Stop is a durable episode. The cutoff is the max queued rowid observed inside
+// the same IMMEDIATE transaction that cancels rows through it; rows inserted
+// after the cutoff are post-Stop work and survive.
+func (q *Queries) SelectMaxQueuedConversationTurnRowID(ctx context.Context, arg SelectMaxQueuedConversationTurnRowIDParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, selectMaxQueuedConversationTurnRowID, arg.ConversationID, arg.HandledBySessionID, arg.ReviewID)
+	var cutoff_rowid int64
+	err := row.Scan(&cutoff_rowid)
+	return cutoff_rowid, err
+}
+
 const selectNextQueuedConversationTurn = `-- name: SelectNextQueuedConversationTurn :one
 SELECT conversation_turns.id,
        conversation_messages.text,
@@ -3769,7 +4493,7 @@ func (q *Queries) SelectNextQueuedConversationTurn(ctx context.Context, conversa
 }
 
 const selectProjectConversation = `-- name: SelectProjectConversation :one
-SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode FROM conversations WHERE project_id = ? AND scope = 'project' LIMIT 1
+SELECT id, scope, project_id, session_id, review_id, current_session_id, current_review_id, latest_sequence, created_at, updated_at, model, reasoning_effort, approval_mode, compacted_at, context_used, context_window, usage_input_tokens, usage_output_tokens, usage_cached_tokens, usage_total_tokens, rate_limit_primary_percent, rate_limit_secondary_percent, rate_limit_primary_resets_in, rate_limit_secondary_resets_in, rate_limit_plan, provider_title, applied_title, model_reroute_json, account_json, thread_state_json, mcp_servers_json, usage_cost, usage_currency, active_branch_id, opencode_mode, queue_recovery_required, stop_reason, stop_episode_id, stop_intent_at, stop_cutoff_rowid FROM conversations WHERE project_id = ? AND scope = 'project' LIMIT 1
 `
 
 func (q *Queries) SelectProjectConversation(ctx context.Context, projectID *domain.ProjectID) (Conversation, error) {
@@ -3811,6 +4535,11 @@ func (q *Queries) SelectProjectConversation(ctx context.Context, projectID *doma
 		&i.UsageCurrency,
 		&i.ActiveBranchID,
 		&i.OpencodeMode,
+		&i.QueueRecoveryRequired,
+		&i.StopReason,
+		&i.StopEpisodeID,
+		&i.StopIntentAt,
+		&i.StopCutoffRowid,
 	)
 	return i, err
 }
@@ -4131,6 +4860,20 @@ func (q *Queries) SetConversationMessageDeliveryContent(ctx context.Context, arg
 	return err
 }
 
+const setConversationQueueRecoveryRequired = `-- name: SetConversationQueueRecoveryRequired :exec
+UPDATE conversations
+SET queue_recovery_required = 1
+WHERE id = ?1
+`
+
+// The durable recovery hold is set only when queued turns were actually
+// adopted. It is not a scheduler or a retry budget; it exists so a restart
+// cannot auto-drain work that must be released explicitly.
+func (q *Queries) SetConversationQueueRecoveryRequired(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, setConversationQueueRecoveryRequired, id)
+	return err
+}
+
 const settleConversationActivity = `-- name: SettleConversationActivity :exec
 UPDATE conversation_activities
 SET status = ?, summary = ?, detail_json = ?, revision = revision + 1, updated_at = ?
@@ -4239,27 +4982,6 @@ func (q *Queries) SettleConversationTurn(ctx context.Context, arg SettleConversa
 	return err
 }
 
-const settleOrphanedConversationTurns = `-- name: SettleOrphanedConversationTurns :exec
-UPDATE conversation_turns
-SET state = 'failed',
-    error_message = 'controller ended before the turn completed',
-    completed_at = ?
-WHERE handled_by_session_id = ? AND state IN ('queued', 'running')
-`
-
-type SettleOrphanedConversationTurnsParams struct {
-	CompletedAt        sql.NullTime
-	HandledBySessionID domain.SessionID
-}
-
-// Restart reconciliation: a turn left running by a dead controller is not
-// evidence the work finished, so it is settled honestly rather than silently
-// completed.
-func (q *Queries) SettleOrphanedConversationTurns(ctx context.Context, arg SettleOrphanedConversationTurnsParams) error {
-	_, err := q.db.ExecContext(ctx, settleOrphanedConversationTurns, arg.CompletedAt, arg.HandledBySessionID)
-	return err
-}
-
 const settleOrphanedReviewTurns = `-- name: SettleOrphanedReviewTurns :exec
 UPDATE conversation_turns
 SET state = 'failed',
@@ -4278,6 +5000,54 @@ type SettleOrphanedReviewTurnsParams struct {
 
 func (q *Queries) SettleOrphanedReviewTurns(ctx context.Context, arg SettleOrphanedReviewTurnsParams) error {
 	_, err := q.db.ExecContext(ctx, settleOrphanedReviewTurns, arg.CompletedAt, arg.ConversationID, arg.ReviewID)
+	return err
+}
+
+const settleOrphanedRunningTurnsForConversation = `-- name: SettleOrphanedRunningTurnsForConversation :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'controller ended before the turn completed',
+    completed_at = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.handled_by_session_id = ?3
+  AND conversation_turns.handled_by_review_id IS NULL
+  AND conversation_turns.state = 'running'
+`
+
+type SettleOrphanedRunningTurnsForConversationParams struct {
+	CompletedAt        sql.NullTime
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+}
+
+func (q *Queries) SettleOrphanedRunningTurnsForConversation(ctx context.Context, arg SettleOrphanedRunningTurnsForConversationParams) error {
+	_, err := q.db.ExecContext(ctx, settleOrphanedRunningTurnsForConversation, arg.CompletedAt, arg.ConversationID, arg.HandledBySessionID)
+	return err
+}
+
+const settleRetiredConversationTurns = `-- name: SettleRetiredConversationTurns :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'session was retired during provider handoff',
+    completed_at = ?1
+WHERE conversation_turns.conversation_id = ?2
+  AND conversation_turns.handled_by_session_id = ?3
+  AND conversation_turns.handled_by_review_id IS NULL
+  AND conversation_turns.state IN ('queued', 'running')
+`
+
+type SettleRetiredConversationTurnsParams struct {
+	CompletedAt        sql.NullTime
+	ConversationID     string
+	HandledBySessionID domain.SessionID
+}
+
+// A native provider handoff retires the predecessor session and continues in a
+// different provider context. Its queued rows cannot be replayed into that
+// context, so this explicit handoff policy settles the whole accepted set. This
+// is deliberately not used by crash/restart reconciliation.
+func (q *Queries) SettleRetiredConversationTurns(ctx context.Context, arg SettleRetiredConversationTurnsParams) error {
+	_, err := q.db.ExecContext(ctx, settleRetiredConversationTurns, arg.CompletedAt, arg.ConversationID, arg.HandledBySessionID)
 	return err
 }
 
