@@ -2200,22 +2200,25 @@ func (c *Controller) settleUnadmittedDispatch(
 	return c.classifyUnadmittedTurn(ctx, turnID, phase)
 }
 
-// finalizeDeferredDispatchAfterPendingStop owns cleanup when the Send context is
-// canceled while a Stop transaction is still pending. It only discards the
-// prepared turn and clears tracking after the exact terminal transition (or a
-// demonstrated concurrent terminal/ownership result) succeeds.
-func (c *Controller) finalizeDeferredDispatchAfterPendingStop(
+// finalizeUnadmittedDeferredDispatch owns cleanup for every deferred dispatch
+// that ended before StartDeferredTurn. Pending Stop wait for their tokens first;
+// a confirmed Stop is already authoritative. Tracking is released only after a
+// safe durable result.
+func (c *Controller) finalizeUnadmittedDeferredDispatch(
 	ctx context.Context,
 	turnID, preparedProviderTurnID string,
+	admission providerAdmission,
 ) error {
-	waitCtx, cancelWait := context.WithTimeout(
-		context.WithoutCancel(ctx), c.deferredPendingStopWaitTimeout())
-	c.waitForPendingStops(waitCtx)
-	waitErr := waitCtx.Err()
-	cancelWait()
-	if waitErr != nil {
-		return fmt.Errorf("%w: pending Stop did not resolve: %w",
-			ErrDeferredDispatchCleanupIncomplete, waitErr)
+	if admission == providerAdmissionPending {
+		waitCtx, cancelWait := context.WithTimeout(
+			context.WithoutCancel(ctx), c.deferredPendingStopWaitTimeout())
+		c.waitForPendingStops(waitCtx)
+		waitErr := waitCtx.Err()
+		cancelWait()
+		if waitErr != nil {
+			return fmt.Errorf("%w: pending Stop did not resolve: %w",
+				ErrDeferredDispatchCleanupIncomplete, waitErr)
+		}
 	}
 
 	c.mu.Lock()
@@ -2234,25 +2237,16 @@ func (c *Controller) finalizeDeferredDispatchAfterPendingStop(
 			ErrDeferredDispatchCleanupIncomplete, turnID, result)
 	}
 
-	if preparedProviderTurnID != "" {
-		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
-			deferred.DiscardDeferredTurn(preparedProviderTurnID)
-		}
-	}
-	c.clearDeferredPreparation()
-	c.mu.Lock()
-	// The finalizer runs under sendMu for this dispatch. No other Send can own
-	// these markers, so clearing them here also removes a stale sending marker
-	// from an earlier completed Send.
-	c.dispatchingTurnID = ""
-	c.sendingTurnID = ""
-	c.mu.Unlock()
+	c.releaseDeferredTracking(turnID, preparedProviderTurnID)
 
-	cause := context.Cause(ctx)
-	if cause == nil {
-		cause = context.Canceled
+	if admission == providerAdmissionPending {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = context.Canceled
+		}
+		return fmt.Errorf("%w: %w", ErrProviderDispatchStopped, cause)
 	}
-	return fmt.Errorf("%w: %w", ErrProviderDispatchStopped, cause)
+	return ErrProviderDispatchStopped
 }
 
 // admitProviderCall is the eager provider boundary. It holds c.mu only for the
@@ -2403,6 +2397,24 @@ func (c *Controller) clearDeferredPreparation() {
 	c.mu.Unlock()
 }
 
+// releaseDeferredTracking discards the prepared adapter turn and clears every
+// in-memory marker. Callers may use it only after settleUnadmittedDispatch proves
+// a safe durable result.
+func (c *Controller) releaseDeferredTracking(turnID, preparedProviderTurnID string) {
+	if preparedProviderTurnID != "" {
+		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
+			deferred.DiscardDeferredTurn(preparedProviderTurnID)
+		}
+	}
+	c.clearDeferredPreparation()
+	c.mu.Lock()
+	// Dispatch/finalization runs under sendMu. No other Send can own these
+	// markers, so clearing them also removes a stale sending marker.
+	c.dispatchingTurnID = ""
+	c.sendingTurnID = ""
+	c.mu.Unlock()
+}
+
 func (c *Controller) markProviderCallUnresolved() {
 	c.mu.Lock()
 	c.providerCallUnresolved = true
@@ -2416,9 +2428,10 @@ func (c *Controller) markProviderBound() {
 }
 
 // interruptUnadmittedDispatch settles a claimed running turn if Stop won before
-// provider admission. A turn whose provider call was already admitted is left to
-// the provider termination/interrupt path. It returns no success signal: callers
-// retain tracking unless a later explicit settlement proves the row terminal.
+// provider admission. It is not a tracking-cleanup authority: Interrupt,
+// TerminateForStop, and the eager admission fallback keep their existing terminal
+// semantics and never use this call to clear deferred tracking. Deferred callers
+// use finalizeUnadmittedDeferredDispatch, which classifies the durable result.
 func (c *Controller) interruptUnadmittedDispatch(ctx context.Context) {
 	c.mu.Lock()
 	turnID := c.dispatchingTurnID
@@ -2455,7 +2468,10 @@ func (c *Controller) dispatch(
 	return c.dispatchTurn(ctx, turnID, msg, requestedAt, false, admissionEpoch)
 }
 
-func (c *Controller) abortDispatchBeforeProvider(
+// abortEagerDispatchBeforeProvider handles only eager admission failure. Deferred
+// dispatches use finalizeUnadmittedDeferredDispatch so their tracking is never
+// discarded without a safe durable result.
+func (c *Controller) abortEagerDispatchBeforeProvider(
 	ctx context.Context,
 	turnID string,
 	admission providerAdmission,
@@ -2463,7 +2479,6 @@ func (c *Controller) abortDispatchBeforeProvider(
 	if admission == providerAdmissionStopped {
 		c.interruptUnadmittedDispatch(ctx)
 	}
-	c.clearDeferredPreparation()
 	c.mu.Lock()
 	if c.dispatchingTurnID == turnID {
 		c.dispatchingTurnID = ""
@@ -2525,10 +2540,11 @@ func (c *Controller) dispatchTurn(
 		admission = c.admitProviderCall(ctx, admissionEpoch)
 	}
 	if admission != providerAdmissionAllowed {
-		if hasDeferredStart && admission == providerAdmissionPending {
-			return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(ctx, turnID, "")
+		if hasDeferredStart {
+			return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+				ctx, turnID, "", admission)
 		}
-		return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
+		return domain.ConversationTurn{}, c.abortEagerDispatchBeforeProvider(ctx, turnID, admission)
 	}
 	if !hasDeferredStart {
 		defer c.finishProviderCall()
@@ -2536,15 +2552,11 @@ func (c *Controller) dispatchTurn(
 	ref, err := c.conv.SendTurn(ctx, excerptDeliveryMessage(msg))
 	if err != nil {
 		if hasDeferredStart {
-			// A prepared turn that raced Stop is not a failed provider turn. Discard
-			// it and let the Stop transition own the durable outcome.
+			// A prepared turn that raced Stop is not a failed provider turn. The
+			// safe finalizer owns settlement, discard, and tracking cleanup.
 			if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
-				if admission == providerAdmissionPending {
-					return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(
-						ctx, turnID, ref.ProviderTurnID)
-				}
-				deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-				return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
+				return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+					ctx, turnID, ref.ProviderTurnID, admission)
 			}
 		}
 		// A turn is definitive only when the adapter can prove the provider never
@@ -2573,24 +2585,30 @@ func (c *Controller) dispatchTurn(
 				RequestedAt:        requestedAt,
 			}, fmt.Errorf("%w: send turn: %w", errUncertainDelivery, err)
 		}
-		c.mu.Lock()
-		if c.dispatchingTurnID == turnID {
-			c.dispatchingTurnID = ""
-		}
-		c.mu.Unlock()
-		if hasDeferredStart {
-			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-			c.clearDeferredPreparation()
-		}
 		// Definitive: the provider cannot have accepted the turn. Settle it failed
 		// rather than retrying; settling by AO's own turn id avoids looking up an
 		// empty provider id after the error. Archiving is deliberately after this
 		// durable transition: a crash must not leave a definitive failure running
 		// merely because the diagnostic write was attempted first.
 		completedAt := c.now()
-		if settleErr := c.store.SettleTurnByID(
-			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
-			c.log.Error("failed to settle turn after send error", "error", settleErr)
+		settleErr := c.store.SettleTurnByID(
+			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt)
+		if hasDeferredStart {
+			if settleErr != nil {
+				return domain.ConversationTurn{}, fmt.Errorf(
+					"%w: settle failed deferred prepare: %w",
+					ErrDeferredDispatchCleanupIncomplete, settleErr)
+			}
+			c.releaseDeferredTracking(turnID, ref.ProviderTurnID)
+		} else {
+			c.mu.Lock()
+			if c.dispatchingTurnID == turnID {
+				c.dispatchingTurnID = ""
+			}
+			c.mu.Unlock()
+			if settleErr != nil {
+				c.log.Error("failed to settle turn after send error", "error", settleErr)
+			}
 		}
 		c.archiveDispatchError(ctx, turnID, err)
 		return domain.ConversationTurn{
@@ -2608,12 +2626,8 @@ func (c *Controller) dispatchTurn(
 		// SendTurn prepared locally, but Stop may have won while it was running.
 		// Never bind or start that prepared turn in that case.
 		if admission := c.deferredPreparationAuthorized(ctx, admissionEpoch); admission != providerAdmissionAllowed {
-			if admission == providerAdmissionPending {
-				return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(
-					ctx, turnID, ref.ProviderTurnID)
-			}
-			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-			return domain.ConversationTurn{}, c.abortDispatchBeforeProvider(ctx, turnID, admission)
+			return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+				ctx, turnID, ref.ProviderTurnID, admission)
 		}
 	}
 
@@ -2646,22 +2660,33 @@ func (c *Controller) dispatchTurn(
 	if bindErr != nil {
 		if hasDeferredStart {
 			// Deferred: the provider never received the prompt. A Stop/ownership
-			// fence means the queued row is already terminal; do not settle it or
-			// start the prepared turn.
-			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-			c.clearDeferredPreparation()
-			c.mu.Lock()
-			if c.dispatchingTurnID == turnID {
-				c.dispatchingTurnID = ""
-			}
-			c.mu.Unlock()
+			// fence is settled through the exact claimed/prepared transition; any
+			// other bind failure is settled failed. Neither discards the prepared
+			// turn or clears tracking until the durable settle succeeds.
 			if errors.Is(bindErr, store.ErrTurnDispatchFenced) || errors.Is(bindErr, store.ErrChatOwnershipLost) {
+				c.mu.Lock()
+				phase := c.deferredPhase
+				c.mu.Unlock()
+				result, settleErr := c.settleUnadmittedDispatch(ctx, turnID, phase, ref.ProviderTurnID)
+				if settleErr != nil {
+					return domain.ConversationTurn{}, fmt.Errorf(
+						"%w: %w", ErrDeferredDispatchCleanupIncomplete, settleErr)
+				}
+				if !result.safeToForget() {
+					return domain.ConversationTurn{}, fmt.Errorf(
+						"%w: turn %s remains %s",
+						ErrDeferredDispatchCleanupIncomplete, turnID, result)
+				}
+				c.releaseDeferredTracking(turnID, ref.ProviderTurnID)
 				return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
 			}
 			if settleErr := c.store.SettleTurnByID(
 				ctx, turnID, domain.TurnStateFailed, bindErr.Error(), c.now()); settleErr != nil {
-				c.log.Error("failed to settle deferred turn after bind error", "error", settleErr)
+				return domain.ConversationTurn{}, fmt.Errorf(
+					"%w: settle failed deferred bind: %w",
+					ErrDeferredDispatchCleanupIncomplete, settleErr)
 			}
+			c.releaseDeferredTracking(turnID, ref.ProviderTurnID)
 			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
 		}
 		// Eager: SendTurn already crossed the provider boundary, so the provider
@@ -2684,19 +2709,8 @@ func (c *Controller) dispatchTurn(
 		c.markDeferredPrepared(ref.ProviderTurnID)
 		admission := c.admitDeferredProvider(ctx, admissionEpoch)
 		if admission != providerAdmissionAllowed {
-			if admission == providerAdmissionPending {
-				return domain.ConversationTurn{}, c.finalizeDeferredDispatchAfterPendingStop(
-					ctx, turnID, ref.ProviderTurnID)
-			}
-			deferred.DiscardDeferredTurn(ref.ProviderTurnID)
-			c.interruptUnadmittedDispatch(ctx)
-			c.clearDeferredPreparation()
-			c.mu.Lock()
-			if c.dispatchingTurnID == turnID {
-				c.dispatchingTurnID = ""
-			}
-			c.mu.Unlock()
-			return domain.ConversationTurn{}, ErrProviderDispatchStopped
+			return domain.ConversationTurn{}, c.finalizeUnadmittedDeferredDispatch(
+				ctx, turnID, ref.ProviderTurnID, admission)
 		}
 		defer c.finishProviderCall()
 	}

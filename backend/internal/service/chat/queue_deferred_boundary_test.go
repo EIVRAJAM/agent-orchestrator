@@ -72,6 +72,7 @@ func TestDeferredStopAfterBindBeforeStartDiscardsPreparedTurn(t *testing.T) {
 	if got := turnStateByID(t, h, "turn-after-prepared"); got != domain.TurnStateInterrupted {
 		t.Fatalf("next queued turn state = %q, want interrupted by Stop", got)
 	}
+	assertNoDispatchingTurn(t, h)
 }
 
 func TestDeferredPreclaimedStopAfterBindBeforeStart(t *testing.T) {
@@ -118,6 +119,7 @@ func TestDeferredPreclaimedStopAfterBindBeforeStart(t *testing.T) {
 	if got := turnStateByID(t, h, second.ID); got != domain.TurnStateInterrupted {
 		t.Fatalf("next head state = %q, want interrupted by the same Stop cutoff", got)
 	}
+	assertNoDispatchingTurn(t, h)
 }
 
 func TestDeferredStopDuringPrepareDiscardsAndNeverStarts(t *testing.T) {

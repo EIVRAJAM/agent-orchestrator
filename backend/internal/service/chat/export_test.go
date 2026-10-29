@@ -1,6 +1,11 @@
 package chat
 
-import "time"
+import (
+	"context"
+	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+)
 
 // SetNativeHistoryLoadAttemptLimit shortens the per-attempt provider load bound
 // for tests and returns a restore function.
@@ -74,4 +79,11 @@ func (c *Controller) DeferredDispatchTrackingForTest() (dispatchingTurnID, provi
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.dispatchingTurnID, c.deferredProviderTurnID, c.deferredPhase.String()
+}
+
+// RecordStopIntentForTest commits a confirmed Stop episode without terminating
+// the provider. Tests use it to exercise providerAdmissionStopped with a live
+// Send context and an observable running row.
+func (c *Controller) RecordStopIntentForTest(ctx context.Context, reason domain.ChatStopReason) error {
+	return c.recordStopIntentLocked(ctx, reason, false)
 }

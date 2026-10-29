@@ -765,14 +765,15 @@ settling it `interrupted`. If `StartDeferredTurn` wins, Stop may terminate the
 provider concurrently; the durable binding and provider id remain, and the turn
 is never resent.
 
-If the Send context is canceled while a Stop transaction is still pending, the
-deferred dispatch does not clear its tracking and return. It waits for the
-pending Stop tokens with a detached, bounded cleanup context, then applies the
-exact claimed or prepared terminal transition before discarding the prepared
-turn or clearing the dispatch marker. A confirmed Stop and a failed Stop converge
-to `interrupted` here because no provider boundary was crossed; only a confirmed
-Stop writes the durable episode. This also prevents a canceled preclaimed head
-from remaining `running/unbound` when Stop fails.
+Every deferred dispatch that ends before `StartDeferredTurn` uses the same
+finalizer, whether admission returned `stopped` or `pending`. A pending Stop is
+awaited through its token with a detached, bounded context; a confirmed Stop is
+already authoritative. The finalizer applies the exact claimed or prepared
+transition before discarding the prepared turn or clearing the dispatch marker.
+A confirmed Stop and a failed Stop converge to `interrupted` here because no
+provider boundary was crossed; only a confirmed Stop writes the durable episode.
+This also prevents a canceled preclaimed head from remaining `running/unbound`
+when Stop fails.
 
 The finalizer classifies the durable outcome before forgetting anything:
 `finalized`, `already_terminal`, `not_running`, or `ownership_lost` allow

@@ -394,3 +394,213 @@ func assertDeferredTrackingRetained(t *testing.T, h *harness, turnID, providerTu
 			dispatchingTurnID, gotProvider, gotPhase, turnID, providerTurnID, phase)
 	}
 }
+
+func TestDeferredStoppedPreparedCleanupFailureRetainsTracking(t *testing.T) {
+	conv, startCalls, discarded := newCountingDeferredConversation()
+	cleanup := newCleanupFailureStore(false)
+	close(cleanup.stopRelease) // Stop is called synchronously via the test helper.
+	cleanup.failPrepared = errors.New("injected stopped prepared transition failure")
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		cleanup.Store = st
+		return cleanup
+	})
+	bound, releaseBind := make(chan struct{}), make(chan struct{})
+	cleanup.afterDeferred = func() { close(bound); <-releaseBind }
+	sent := make(chan deferredSendResult, 1)
+	go func() {
+		turn, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+			Text: "stopped prepared cleanup failure", ClientMessageID: "stopped-prepared-failure",
+		})
+		sent <- deferredSendResult{turn: turn, err: err}
+	}()
+	<-bound
+	if created, err := h.st.AppendUserMessage(context.Background(), h.ctrl.ConversationID(), testSession,
+		currentGeneration(h), domain.ConversationMessage{
+			ID: "message-behind-stopped-prepared", Origin: domain.MessageOriginHuman,
+			Text: "must not dispatch", ClientMessageID: "behind-stopped-prepared",
+		}, "turn-behind-stopped-prepared", h.now()); err != nil || !created {
+		t.Fatalf("AppendUserMessage: created=%v err=%v", created, err)
+	}
+	if err := h.ctrl.RecordStopIntentForTest(context.Background(), domain.ChatStopReasonUserStop); err != nil {
+		t.Fatalf("RecordStopIntentForTest: %v", err)
+	}
+	close(releaseBind)
+	result := <-sent
+	assertCleanupIncomplete(t, result.err)
+	if *startCalls != 0 || *discarded != 0 {
+		t.Fatalf("start=%d discard=%d, want no start/discard on stopped cleanup failure", *startCalls, *discarded)
+	}
+	turnID := turnIDByClientID(t, h, "stopped-prepared-failure")
+	turn, err := h.st.TurnByID(context.Background(), turnID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID == "" || turn.StartedAt == nil {
+		t.Fatalf("turn after stopped cleanup failure = %+v, want running/prepared", turn)
+	}
+	assertDeferredTrackingRetained(t, h, turnID, turn.ProviderTurnID, "prepared")
+	if got := turnStateByID(t, h, "turn-behind-stopped-prepared"); got != domain.TurnStateInterrupted {
+		t.Fatalf("next queued = %q, want interrupted by confirmed Stop", got)
+	}
+}
+
+func TestDeferredStoppedPreclaimedClaimedCleanupFailureRetainsTracking(t *testing.T) {
+	conv, startCalls, discarded := newCountingDeferredConversation()
+	cleanup := newCleanupFailureStore(false)
+	close(cleanup.stopRelease)
+	cleanup.failClaimed = errors.New("injected stopped claimed transition failure")
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		cleanup.Store = st
+		return cleanup
+	})
+	first, second := queueTwoBehindFailingRoot(t, h, conv.emit)
+	*startCalls, *discarded = 0, 0
+	beforeSends := conv.sendCallCount()
+	claimed, releaseClaim := make(chan struct{}), make(chan struct{})
+	cleanup.afterResumeClaim = func() { close(claimed); <-releaseClaim }
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
+		result <- err
+	}()
+	<-claimed
+	if err := h.ctrl.RecordStopIntentForTest(context.Background(), domain.ChatStopReasonUserStop); err != nil {
+		t.Fatalf("RecordStopIntentForTest: %v", err)
+	}
+	close(releaseClaim)
+	assertCleanupIncomplete(t, <-result)
+	if got := conv.sendCallCount(); got != beforeSends {
+		t.Fatalf("SendTurn calls = %d, want %d (no prepare after stopped admission)", got, beforeSends)
+	}
+	if *startCalls != 0 || *discarded != 0 {
+		t.Fatalf("start=%d discard=%d, want no start/discard", *startCalls, *discarded)
+	}
+	turn, err := h.st.TurnByID(context.Background(), first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" || turn.StartedAt == nil {
+		t.Fatalf("stopped claimed turn = %+v, want running/unbound", turn)
+	}
+	assertDeferredTrackingRetained(t, h, first.ID, "", "none")
+	if got := turnStateByID(t, h, second.ID); got != domain.TurnStateInterrupted {
+		t.Fatalf("next head = %q, want interrupted by confirmed Stop", got)
+	}
+}
+
+func TestDeferredStoppedDuringPrepareCleanupFailureRetainsTracking(t *testing.T) {
+	conv, startCalls, discarded := newCountingDeferredConversation()
+	cleanup := newCleanupFailureStore(false)
+	close(cleanup.stopRelease)
+	cleanup.failClaimed = errors.New("injected prepare claimed transition failure")
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		cleanup.Store = st
+		return cleanup
+	})
+	first, second := queueTwoBehindFailingRoot(t, h, conv.emit)
+	*startCalls, *discarded = 0, 0
+	preparing, releasePrepare := make(chan struct{}), make(chan struct{})
+	conv.onSend = func(string) { close(preparing); <-releasePrepare }
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.svc.ResumeHeldQueue(context.Background(), testSession, first.ID, currentGeneration(h))
+		result <- err
+	}()
+	<-preparing
+	if err := h.ctrl.RecordStopIntentForTest(context.Background(), domain.ChatStopReasonUserStop); err != nil {
+		t.Fatalf("RecordStopIntentForTest: %v", err)
+	}
+	close(releasePrepare)
+	assertCleanupIncomplete(t, <-result)
+	if *startCalls != 0 || *discarded != 0 {
+		t.Fatalf("start=%d discard=%d, want no start/discard", *startCalls, *discarded)
+	}
+	turn, err := h.st.TurnByID(context.Background(), first.ID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" || turn.StartedAt == nil {
+		t.Fatalf("stopped during prepare turn = %+v, want running/unbound claim", turn)
+	}
+	assertDeferredTrackingRetained(t, h, first.ID, "", "preparing")
+	if got := turnStateByID(t, h, second.ID); got != domain.TurnStateInterrupted {
+		t.Fatalf("next head = %q, want interrupted by confirmed Stop", got)
+	}
+}
+
+func TestDeferredStoppedZeroRowsTerminalClearsTracking(t *testing.T) {
+	conv, startCalls, discarded := newCountingDeferredConversation()
+	cleanup := newCleanupFailureStore(false)
+	close(cleanup.stopRelease)
+	cleanup.zeroPreparedTerminal = true
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		cleanup.Store = st
+		return cleanup
+	})
+	bound, releaseBind := make(chan struct{}), make(chan struct{})
+	cleanup.afterDeferred = func() { close(bound); <-releaseBind }
+	sent := make(chan deferredSendResult, 1)
+	go func() {
+		turn, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+			Text: "stopped zero rows terminal", ClientMessageID: "stopped-zero-terminal",
+		})
+		sent <- deferredSendResult{turn: turn, err: err}
+	}()
+	<-bound
+	if err := h.ctrl.RecordStopIntentForTest(context.Background(), domain.ChatStopReasonUserStop); err != nil {
+		t.Fatalf("RecordStopIntentForTest: %v", err)
+	}
+	close(releaseBind)
+	result := <-sent
+	if !errors.Is(result.err, chatsvc.ErrProviderDispatchStopped) {
+		t.Fatalf("Send error = %v, want ErrProviderDispatchStopped", result.err)
+	}
+	if *startCalls != 0 || *discarded != 1 {
+		t.Fatalf("start=%d discard=%d, want 0/1 for terminal stopped cleanup", *startCalls, *discarded)
+	}
+	turn, err := h.st.TurnByID(context.Background(), turnIDByClientID(t, h, "stopped-zero-terminal"))
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	assertInterruptedUnstarted(t, turn)
+	assertNoDispatchingTurn(t, h)
+}
+
+func TestDeferredStoppedZeroRowsRunningRetainsTracking(t *testing.T) {
+	conv, startCalls, discarded := newCountingDeferredConversation()
+	cleanup := newCleanupFailureStore(false)
+	close(cleanup.stopRelease)
+	cleanup.zeroPrepared = true
+	h := newHarnessWithConversationAndStore(t, conv, func(st *sqlite.Store) chatsvc.Store {
+		cleanup.Store = st
+		return cleanup
+	})
+	bound, releaseBind := make(chan struct{}), make(chan struct{})
+	cleanup.afterDeferred = func() { close(bound); <-releaseBind }
+	sent := make(chan deferredSendResult, 1)
+	go func() {
+		turn, err := h.svc.Send(context.Background(), testSession, ports.ChatUserMessage{
+			Text: "stopped zero rows running", ClientMessageID: "stopped-zero-running",
+		})
+		sent <- deferredSendResult{turn: turn, err: err}
+	}()
+	<-bound
+	if err := h.ctrl.RecordStopIntentForTest(context.Background(), domain.ChatStopReasonUserStop); err != nil {
+		t.Fatalf("RecordStopIntentForTest: %v", err)
+	}
+	close(releaseBind)
+	result := <-sent
+	assertCleanupIncomplete(t, result.err)
+	if *startCalls != 0 || *discarded != 0 {
+		t.Fatalf("start=%d discard=%d, want 0/0 for unresolved stopped cleanup", *startCalls, *discarded)
+	}
+	turnID := turnIDByClientID(t, h, "stopped-zero-running")
+	turn, err := h.st.TurnByID(context.Background(), turnID)
+	if err != nil {
+		t.Fatalf("TurnByID: %v", err)
+	}
+	if turn.State != domain.TurnStateRunning || turn.ProviderTurnID == "" {
+		t.Fatalf("stopped zero-row running turn = %+v, want observable", turn)
+	}
+	assertDeferredTrackingRetained(t, h, turnID, turn.ProviderTurnID, "prepared")
+}
