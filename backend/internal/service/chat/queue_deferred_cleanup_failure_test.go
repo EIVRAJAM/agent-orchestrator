@@ -22,6 +22,31 @@ type deferredCleanupFailureStore struct {
 	zeroPrepared         bool
 	zeroPreparedTerminal bool
 	blockPrepared        bool
+	settleErr            error
+	settleBlocked        bool
+	settleEntered        chan struct{}
+	settleRelease        chan struct{}
+	settleOnce           sync.Once
+}
+
+func (s *deferredCleanupFailureStore) SettleTurnByID(
+	ctx context.Context, turnID string, state domain.TurnState, errMessage string, now time.Time,
+) error {
+	s.mu.Lock()
+	blocked, settleErr := s.settleBlocked, s.settleErr
+	s.mu.Unlock()
+	if blocked {
+		s.settleOnce.Do(func() { close(s.settleEntered) })
+		select {
+		case <-s.settleRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if settleErr != nil {
+		return settleErr
+	}
+	return s.Store.SettleTurnByID(ctx, turnID, state, errMessage, now)
 }
 
 func (s *deferredCleanupFailureStore) InterruptPreparedDeferredTurn(

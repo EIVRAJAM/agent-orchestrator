@@ -81,8 +81,9 @@ var ErrStaleControllerGeneration = errors.New("chat controller generation change
 var ErrSessionTerminated = errors.New("session is terminated")
 
 // ErrQueueDispatchFailed reports that the released turn could not be handed to
-// the provider. dispatch already settled that turn failed; the rest of the queue
-// is untouched.
+// the provider. When the durable settlement succeeded the turn is failed; when
+// it did not, ErrDeferredDispatchCleanupIncomplete is joined and tracking remains
+// retained. The rest of the queue is untouched in either case.
 var ErrQueueDispatchFailed = errors.New("the released turn was not accepted by the provider")
 
 // errUncertainDelivery reports a dispatch that may have crossed the provider
@@ -316,6 +317,13 @@ func (c *Controller) ResumeQueuedTurn(
 			// provider id still holds the queue instead of releasing the next turn.
 			// The durable running row keeps the snapshot at state_uncertain.
 			return QueueResumeResult{Outcome: QueueResumeStateUncertain}, nil
+		}
+		if errors.Is(err, ErrDeferredDispatchCleanupIncomplete) {
+			// The adapter proved StartDeferredTurn did not cross the boundary, but
+			// the durable settlement failed. Keep the one-shot armed and surface the
+			// cleanup failure rather than treating the row as a settled provider
+			// failure that may release the next head.
+			return QueueResumeResult{}, errors.Join(ErrQueueDispatchFailed, err)
 		}
 		c.clearResumeHold()
 		switch {

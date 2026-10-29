@@ -785,6 +785,15 @@ timeout/error, or a still-running row returns
 id. Recovery may settle the row conservatively; the controller must not silently
 forget it.
 
+`ErrDeferredTurnNotStarted` follows the same rule even though the adapter proved
+the provider never received the prompt. The controller settles the row `failed`
+first, clears `pendingTurnID` only if it still names that provider turn, and only
+then writes the diagnostic archive. If settlement fails, `pendingTurnID` and the
+durable provider binding remain, the controller stays busy, and the call returns
+`ErrDeferredDispatchCleanupIncomplete`. A resume keeps its one-shot hold in that
+case; the running/provider-bound row may be rendered as `state_uncertain` until
+restart or later cleanup settles it.
+
 There is no generic production bind that mixes these boundaries. The same
 transaction also verifies that the conversation's current primary or review
 owner is still the caller; a Stop, claim, branch publication, or dispatch after

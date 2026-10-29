@@ -2200,6 +2200,32 @@ func (c *Controller) settleUnadmittedDispatch(
 	return c.classifyUnadmittedTurn(ctx, turnID, phase)
 }
 
+// settleDeferredNotStarted handles the adapter-proven "provider never received
+// the prompt" result. It settles failed first, clears pendingTurnID only on
+// success, and keeps all tracking when the durable settlement fails.
+func (c *Controller) settleDeferredNotStarted(
+	ctx context.Context,
+	turnID, providerTurnID string,
+	startErr error,
+) error {
+	settleErr := c.store.SettleTurnByID(
+		ctx, turnID, domain.TurnStateFailed, startErr.Error(), c.now())
+	if settleErr != nil {
+		return fmt.Errorf("%w: %w", ErrDeferredDispatchCleanupIncomplete,
+			errors.Join(startErr, settleErr))
+	}
+	c.mu.Lock()
+	if c.pendingTurnID == providerTurnID {
+		c.pendingTurnID = ""
+	}
+	// Settlement succeeded under sendMu, so no other Send can own these markers.
+	c.dispatchingTurnID = ""
+	c.sendingTurnID = ""
+	c.mu.Unlock()
+	c.archiveDispatchError(ctx, turnID, startErr)
+	return fmt.Errorf("start turn: %w", startErr)
+}
+
 // finalizeUnadmittedDeferredDispatch owns cleanup for every deferred dispatch
 // that ended before StartDeferredTurn. Pending Stop wait for their tokens first;
 // a confirmed Stop is already authoritative. Tracking is released only after a
@@ -2741,19 +2767,11 @@ func (c *Controller) dispatchTurn(
 	if hasDeferredStart {
 		if err := deferred.StartDeferredTurn(ref.ProviderTurnID); err != nil {
 			if errors.Is(err, ports.ErrDeferredTurnNotStarted) {
-				// The driver proved the provider boundary was not crossed: the
-				// prompt cannot have reached the provider. Settle it failed and let
-				// the caller clear the one-shot. Archive only after that durable
-				// transition so a crash cannot strand a definitive failure running.
-				c.mu.Lock()
-				c.pendingTurnID = ""
-				c.mu.Unlock()
-				if settleErr := c.store.SettleTurnByID(
-					ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
-					c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
-				}
-				c.archiveDispatchError(ctx, turnID, err)
-				return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
+				// The driver proved the provider boundary was not crossed. Settlement
+				// must commit before pending tracking or the diagnostic archive is
+				// touched; otherwise the running row would be forgotten.
+				return domain.ConversationTurn{}, c.settleDeferredNotStarted(
+					ctx, turnID, ref.ProviderTurnID, err)
 			}
 			// Ambiguous: the request may already have been written to the provider.
 			// Keep the durable binding, the in-memory pending turn and the one-shot,
