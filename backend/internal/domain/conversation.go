@@ -643,11 +643,16 @@ type ConversationQueueFacts struct {
 type ChatStopReason string
 
 const (
-	ChatStopReasonUserStop           ChatStopReason = "user_stop"
+	// ChatStopReasonUserStop records an explicit user-requested Stop.
+	ChatStopReasonUserStop ChatStopReason = "user_stop"
+	// ChatStopReasonInterfaceInterrupt records an interrupt from a chat interface.
 	ChatStopReasonInterfaceInterrupt ChatStopReason = "interface_interrupt"
-	ChatStopReasonHandoffInterrupt   ChatStopReason = "handoff_interrupt"
-	ChatStopReasonAgentSwitch        ChatStopReason = "agent_switch"
-	ChatStopReasonSessionTerminated  ChatStopReason = "session_terminated"
+	// ChatStopReasonHandoffInterrupt records an interrupting provider handoff.
+	ChatStopReasonHandoffInterrupt ChatStopReason = "handoff_interrupt"
+	// ChatStopReasonAgentSwitch records a switch to another agent owner.
+	ChatStopReasonAgentSwitch ChatStopReason = "agent_switch"
+	// ChatStopReasonSessionTerminated records terminal session shutdown.
+	ChatStopReasonSessionTerminated ChatStopReason = "session_terminated"
 )
 
 // Valid reports whether r is one of the closed stop reasons.

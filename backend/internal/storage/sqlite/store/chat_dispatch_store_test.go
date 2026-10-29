@@ -237,7 +237,6 @@ func TestConcurrentControllerClaimsHaveOneWinner(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make(chan error, 2)
 	for _, generation := range []string{"generation-a", "generation-b"} {
-		generation := generation
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -503,7 +503,7 @@ func newController(
 	generation string,
 	harness domain.AgentHarness,
 	conv ports.ChatConversation,
-	store Store,
+	st Store,
 	activity ActivityRecorder,
 	log *slog.Logger,
 	newID IDFactory,
@@ -519,7 +519,7 @@ func newController(
 		generation:             generation,
 		harness:                harness,
 		conv:                   conv,
-		store:                  store,
+		store:                  st,
 		continuationReader:     reader,
 		activity:               activity,
 		log:                    log,
@@ -2264,7 +2264,7 @@ func (c *Controller) finalizeUnadmittedDeferredDispatch(
 			ErrDeferredDispatchCleanupIncomplete, turnID, result)
 	}
 
-	c.releaseDeferredTracking(turnID, preparedProviderTurnID)
+	c.releaseDeferredTracking(preparedProviderTurnID)
 
 	if admission == providerAdmissionPending {
 		cause := context.Cause(ctx)
@@ -2427,7 +2427,7 @@ func (c *Controller) clearDeferredPreparation() {
 // releaseDeferredTracking discards the prepared adapter turn and clears every
 // in-memory marker. Callers may use it only after settleUnadmittedDispatch proves
 // a safe durable result.
-func (c *Controller) releaseDeferredTracking(turnID, preparedProviderTurnID string) {
+func (c *Controller) releaseDeferredTracking(preparedProviderTurnID string) {
 	if preparedProviderTurnID != "" {
 		if deferred, ok := c.conv.(ports.ChatDeferredTurnStarter); ok {
 			deferred.DiscardDeferredTurn(preparedProviderTurnID)
@@ -2626,7 +2626,7 @@ func (c *Controller) dispatchTurn(
 					"%w: settle failed deferred prepare: %w",
 					ErrDeferredDispatchCleanupIncomplete, settleErr)
 			}
-			c.releaseDeferredTracking(turnID, ref.ProviderTurnID)
+			c.releaseDeferredTracking(ref.ProviderTurnID)
 		} else {
 			c.mu.Lock()
 			if c.dispatchingTurnID == turnID {
@@ -2704,7 +2704,7 @@ func (c *Controller) dispatchTurn(
 						"%w: turn %s remains %s",
 						ErrDeferredDispatchCleanupIncomplete, turnID, result)
 				}
-				c.releaseDeferredTracking(turnID, ref.ProviderTurnID)
+				c.releaseDeferredTracking(ref.ProviderTurnID)
 				return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
 			}
 			if settleErr := c.store.SettleTurnByID(
@@ -2713,7 +2713,7 @@ func (c *Controller) dispatchTurn(
 					"%w: settle failed deferred bind: %w",
 					ErrDeferredDispatchCleanupIncomplete, settleErr)
 			}
-			c.releaseDeferredTracking(turnID, ref.ProviderTurnID)
+			c.releaseDeferredTracking(ref.ProviderTurnID)
 			return domain.ConversationTurn{}, fmt.Errorf("bind turn: %w", bindErr)
 		}
 		// Eager: SendTurn already crossed the provider boundary, so the provider
@@ -3428,6 +3428,7 @@ func (c *Controller) recordStopIntentLocked(ctx context.Context, reason domain.C
 	return nil
 }
 
+// Interrupt records a durable user Stop and cancels the active provider turn.
 func (c *Controller) Interrupt(ctx context.Context) error {
 	c.mu.Lock()
 	c.interrupts++

@@ -58,12 +58,6 @@ func (s *pendingDeferredStopStore) ClaimQueuedTurnForResume(
 	return claimed, err
 }
 
-func (s *pendingDeferredStopStore) callCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
-}
-
 func newPendingDeferredStopStore(failFirst bool) *pendingDeferredStopStore {
 	return &pendingDeferredStopStore{
 		dispatchFenceHookStore: &dispatchFenceHookStore{},

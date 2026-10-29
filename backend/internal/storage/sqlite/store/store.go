@@ -154,7 +154,7 @@ func (s *Store) inImmediateTx(ctx context.Context, what string, fn func(*gen.Que
 	if err != nil {
 		return fmt.Errorf("open %s connection: %w", what, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return fmt.Errorf("begin immediate %s: %w", what, err)
 	}

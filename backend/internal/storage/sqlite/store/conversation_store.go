@@ -653,8 +653,7 @@ func (s *Store) CreateAndActivateConversationBranchAndAdoptQueued(
 		if sessionRows != 1 {
 			return fmt.Errorf("move session controller: live chat session %s not found", sessionID)
 		}
-		_, err = settleAndAdoptQueuedTx(ctx, q, sessionID, branch.ConversationID, generation, now)
-		return err
+		return settleAndAdoptQueuedTx(ctx, q, sessionID, branch.ConversationID, generation, now)
 	})
 }
 
@@ -701,12 +700,12 @@ func settleAndAdoptQueuedTx(
 	sessionID domain.SessionID,
 	conversationID, generation string,
 	now time.Time,
-) (int, error) {
+) error {
 	if err := q.FailOrphanedConversationActivitiesForConversation(ctx,
 		gen.FailOrphanedConversationActivitiesForConversationParams{
 			UpdatedAt: now, ConversationID: conversationID, HandledBySessionID: sessionID,
 		}); err != nil {
-		return 0, fmt.Errorf("fail orphaned activities before adoption: %w", err)
+		return fmt.Errorf("fail orphaned activities before adoption: %w", err)
 	}
 	if err := q.SettleOrphanedRunningTurnsForConversation(ctx,
 		gen.SettleOrphanedRunningTurnsForConversationParams{
@@ -714,7 +713,7 @@ func settleAndAdoptQueuedTx(
 			ConversationID:     conversationID,
 			HandledBySessionID: sessionID,
 		}); err != nil {
-		return 0, fmt.Errorf("settle orphaned running turns before adoption: %w", err)
+		return fmt.Errorf("settle orphaned running turns before adoption: %w", err)
 	}
 	rows, err := q.AdoptQueuedConversationTurnsForController(ctx,
 		gen.AdoptQueuedConversationTurnsForControllerParams{
@@ -723,14 +722,14 @@ func settleAndAdoptQueuedTx(
 			HandledBySessionID:   sessionID,
 		})
 	if err != nil {
-		return 0, fmt.Errorf("adopt queued turns for %s: %w", conversationID, err)
+		return fmt.Errorf("adopt queued turns for %s: %w", conversationID, err)
 	}
 	if rows > 0 {
 		if err := q.SetConversationQueueRecoveryRequired(ctx, conversationID); err != nil {
-			return 0, fmt.Errorf("record queue recovery hold for %s: %w", conversationID, err)
+			return fmt.Errorf("record queue recovery hold for %s: %w", conversationID, err)
 		}
 	}
-	return int(rows), nil
+	return nil
 }
 
 func insertAndActivateConversationBranchTx(ctx context.Context, q *gen.Queries, branch domain.ConversationBranch, now time.Time) error {
@@ -883,7 +882,7 @@ func (s *Store) commitChatSpawn(
 		if rows != 1 {
 			return fmt.Errorf("claim Chat controller generation: session %s changed", rec.ID)
 		}
-		if _, err := settleAndAdoptQueuedTx(
+		if err := settleAndAdoptQueuedTx(
 			ctx, q, rec.ID, branch.ConversationID, rec.Metadata.ControllerGeneration, rec.UpdatedAt,
 		); err != nil {
 			return err
