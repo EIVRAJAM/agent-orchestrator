@@ -289,7 +289,7 @@ func awaitACPReplay(ctx context.Context, t *testing.T, stage string, ready func(
 
 func readACPReplayDiagnostics(dir string) string {
 	var out strings.Builder
-	for _, name := range []string{"host.events.log", "host.stderr.log", "host.stdout.log", "provider.stderr.log"} {
+	for _, name := range []string{"host.events.log", "host.stderr.log", "host.stdout.log"} {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
 		if err != nil {

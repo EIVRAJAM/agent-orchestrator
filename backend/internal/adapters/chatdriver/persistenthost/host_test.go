@@ -47,6 +47,9 @@ func TestProviderHelper(t *testing.T) {
 	if os.Getenv("AO_CHAT_HOST_PROVIDER_HELPER") != "1" {
 		return
 	}
+	if sentinel := os.Getenv("AO_CHAT_HOST_DIAGNOSTIC_STDERR_SENTINEL"); sentinel != "" {
+		_, _ = fmt.Fprintln(os.Stderr, sentinel)
+	}
 	if os.Getenv("AO_CHAT_HOST_ACP_HELPER") == "1" {
 		runACPProviderHelper()
 		return

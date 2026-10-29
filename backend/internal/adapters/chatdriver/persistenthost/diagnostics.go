@@ -3,7 +3,6 @@ package persistenthost
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,11 +11,14 @@ import (
 // DiagnosticsDirEnv opts a single test into persistent-host startup diagnostics.
 // It is intentionally unset by default: production hosts keep their normal
 // stdout/stderr behavior and create no diagnostic files.
+//
+// Only the detached host's stdout/stderr and sanitized lifecycle events are
+// captured. Provider stderr is deliberately discarded: it is arbitrary provider
+// output and may contain credentials or prompt material.
 const DiagnosticsDirEnv = "AO_CHAT_HOST_DIAGNOSTICS_DIR"
 
 type hostDiagnostics struct {
-	events         *os.File
-	providerStderr *os.File
+	events *os.File
 }
 
 func diagnosticsDirFromEnv() (string, bool, error) {
@@ -70,12 +72,7 @@ func openHostDiagnostics() (*hostDiagnostics, error) {
 	if err != nil {
 		return nil, err
 	}
-	providerStderr, err := openDiagnosticFile(dir, "provider.stderr.log")
-	if err != nil {
-		_ = events.Close()
-		return nil, err
-	}
-	return &hostDiagnostics{events: events, providerStderr: providerStderr}, nil
+	return &hostDiagnostics{events: events}, nil
 }
 
 func (d *hostDiagnostics) Event(format string, args ...any) {
@@ -85,16 +82,9 @@ func (d *hostDiagnostics) Event(format string, args ...any) {
 	_, _ = fmt.Fprintf(d.events, format+"\n", args...)
 }
 
-func (d *hostDiagnostics) ProviderStderr() io.Writer {
-	if d == nil {
-		return io.Discard
-	}
-	return d.providerStderr
-}
-
 func (d *hostDiagnostics) Close() error {
 	if d == nil {
 		return nil
 	}
-	return errors.Join(d.events.Close(), d.providerStderr.Close())
+	return d.events.Close()
 }

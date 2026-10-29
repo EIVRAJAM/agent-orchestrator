@@ -1,6 +1,7 @@
 package persistenthost
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -39,7 +40,6 @@ func TestHostDiagnosticsWritesOnlyConfiguredFiles(t *testing.T) {
 	diagnostics.Event("host lock acquired")
 	diagnostics.Event("provider started")
 	diagnostics.Event("descriptor published")
-	_, _ = io.WriteString(diagnostics.ProviderStderr(), "provider startup failure\n")
 	if err := diagnostics.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestHostDiagnosticsWritesOnlyConfiguredFiles(t *testing.T) {
 	for _, entry := range entries {
 		names = append(names, entry.Name())
 	}
-	want := []string{"host.events.log", "host.stderr.log", "host.stdout.log", "provider.stderr.log"}
+	want := []string{"host.events.log", "host.stderr.log", "host.stdout.log"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("diagnostic files = %v, want exactly %v", names, want)
 	}
@@ -72,13 +72,6 @@ func TestHostDiagnosticsWritesOnlyConfiguredFiles(t *testing.T) {
 	if got := string(events); got != "host lock acquired\nprovider started\ndescriptor published\n" {
 		t.Fatalf("events = %q", got)
 	}
-	providerStderr, err := os.ReadFile(filepath.Join(dir, "provider.stderr.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(providerStderr) != "provider startup failure\n" {
-		t.Fatalf("provider stderr = %q", providerStderr)
-	}
 	for _, name := range names {
 		data, readErr := os.ReadFile(filepath.Join(dir, name))
 		if readErr != nil {
@@ -88,6 +81,64 @@ func TestHostDiagnosticsWritesOnlyConfiguredFiles(t *testing.T) {
 			if strings.Contains(string(data), sensitive) {
 				t.Fatalf("%s contains sensitive data %q: %q", name, sensitive, data)
 			}
+		}
+	}
+}
+
+func TestHostDiagnosticsNeverCreatesProviderStderrFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(DiagnosticsDirEnv, dir)
+	diagnostics, err := openHostDiagnostics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostics.Event("provider started")
+	if err := diagnostics.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "host.events.log" {
+		t.Fatalf("provider diagnostics unexpectedly persisted files: %v", entries)
+	}
+}
+
+func TestHostDiagnosticsDiscardArbitraryProviderStderr(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(DiagnosticsDirEnv, dir)
+	const sentinel = "SECRET_PROVIDER_STDERR_SENTINEL"
+	cfg := Config{
+		SessionID: "diagnostic-provider", DataDir: t.TempDir(), Workdir: t.TempDir(),
+		Env: append(os.Environ(),
+			"AO_CHAT_HOST_PROVIDER_HELPER=1",
+			"AO_CHAT_HOST_DIAGNOSTIC_STDERR_SENTINEL="+sentinel),
+		Argv: []string{os.Args[0], "-test.run=TestProviderHelper"},
+	}
+	transport, err := ConnectOrStart(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Shutdown(context.Background(), cfg.DataDir, cfg.SessionID) })
+	_ = transport.Stdin.Close()
+	if err := Shutdown(context.Background(), cfg.DataDir, cfg.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "provider.stderr.log" {
+			t.Fatal("arbitrary provider stderr was persisted")
+		}
+		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if strings.Contains(string(data), sentinel) {
+			t.Fatalf("sentinel leaked into %s", entry.Name())
 		}
 	}
 }

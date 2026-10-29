@@ -607,7 +607,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	child.Stderr = diagnostics.ProviderStderr()
+	child.Stderr = io.Discard
 	closeProviderTree, err := startProviderProcess(child)
 	if err != nil {
 		diagnostics.Event("provider start failed: %v", err)
