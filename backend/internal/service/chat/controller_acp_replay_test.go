@@ -93,13 +93,29 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	st := openStore(t)
 	dataDir, workspace := t.TempDir(), t.TempDir()
 	diagnosticsDir := t.TempDir()
-	t.Setenv(persistenthost.DiagnosticsDirEnv, diagnosticsDir)
+	openDiagnostic := func(name string) *os.File {
+		file, openErr := os.OpenFile(filepath.Join(diagnosticsDir, name),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if openErr != nil {
+			t.Fatalf("open %s: %v", name, openErr)
+		}
+		return file
+	}
+	diagnostics := &persistenthost.HostDiagnostics{
+		Stdout: openDiagnostic("host.stdout.log"),
+		Stderr: openDiagnostic("host.stderr.log"),
+		Events: openDiagnostic("host.events.log"),
+	}
 	t.Cleanup(func() {
 		if t.Failed() {
 			t.Logf("ACP host diagnostics:\n%s", readACPReplayDiagnostics(diagnosticsDir))
-			return
 		}
-		_ = os.RemoveAll(diagnosticsDir)
+		_ = diagnostics.Stdout.Close()
+		_ = diagnostics.Stderr.Close()
+		_ = diagnostics.Events.Close()
+		if !t.Failed() {
+			_ = os.RemoveAll(diagnosticsDir)
+		}
 	})
 	logPath := filepath.Join(dataDir, "acp.log")
 	logFile, err := os.Create(logPath)
@@ -116,7 +132,8 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(logFile, nil))
 	releasePath := filepath.Join(dataDir, "release")
 	cfg := acp.Config{
-		Harness: domain.HarnessOpenCode,
+		Harness:         domain.HarnessOpenCode,
+		HostDiagnostics: diagnostics,
 		Capabilities: ports.ChatCapabilities{
 			ports.ChatCapabilityStreaming: true, ports.ChatCapabilityResume: true,
 			ports.ChatCapabilityApprovals: true, ports.ChatCapabilityInterrupt: true,

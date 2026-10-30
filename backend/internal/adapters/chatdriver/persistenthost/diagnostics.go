@@ -3,88 +3,134 @@ package persistenthost
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
-	"strings"
+	"strconv"
+	"sync"
 )
 
-// DiagnosticsDirEnv opts a single test into persistent-host startup diagnostics.
-// It is intentionally unset by default: production hosts keep their normal
-// stdout/stderr behavior and create no diagnostic files.
-//
-// Only the detached host's stdout/stderr and sanitized lifecycle events are
-// captured. Provider stderr is deliberately discarded: it is arbitrary provider
-// output and may contain credentials or prompt material.
-const DiagnosticsDirEnv = "AO_CHAT_HOST_DIAGNOSTICS_DIR"
+const (
+	// maxDiagnosticLogBytes caps every diagnostic file opened by the test.
+	maxDiagnosticLogBytes int64 = 64 << 10
+	hostEventsFDEnv             = "AO_CHAT_HOST_EVENTS_FD"
+)
+
+// HostDiagnostics is an explicit, test-owned set of already-open files. The
+// test opens these under its own t.TempDir(); the detached host receives the
+// event descriptor through ExtraFiles and never receives a writable path.
+type HostDiagnostics struct {
+	Stdout *os.File
+	Stderr *os.File
+	Events *os.File
+}
 
 type hostDiagnostics struct {
-	events *os.File
+	events    *os.File
+	remaining int64
 }
 
-func diagnosticsDirFromEnv() (string, bool, error) {
-	raw := strings.TrimSpace(os.Getenv(DiagnosticsDirEnv))
+// validateHostDiagnostics only checks that handles are usable. Confinement does
+// not come from this check; it comes from the test owning the handles and
+// opening them under t.TempDir(). A closed handle simply disables diagnostics.
+func validateHostDiagnostics(diagnostics *HostDiagnostics) error {
+	if diagnostics == nil {
+		return nil
+	}
+	for name, file := range map[string]*os.File{
+		"host stdout": diagnostics.Stdout,
+		"host stderr": diagnostics.Stderr,
+		"host events": diagnostics.Events,
+	} {
+		if file == nil {
+			continue
+		}
+		if _, err := file.Stat(); err != nil {
+			return fmt.Errorf("%s diagnostic handle: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func openHostDiagnosticsFromFD() (*hostDiagnostics, error) {
+	raw := os.Getenv(hostEventsFDEnv)
 	if raw == "" {
-		return "", false, nil
+		return nil, nil
 	}
-	if !filepath.IsAbs(raw) {
-		return "", false, errors.New("chat host diagnostics directory must be absolute")
+	fd, err := strconv.Atoi(raw)
+	if err != nil || fd != 3 {
+		return nil, fmt.Errorf("invalid chat host events fd %q", raw)
 	}
-	return filepath.Clean(raw), true, nil
+	events := os.NewFile(uintptr(fd), "host.events.log")
+	if events == nil {
+		return nil, errors.New("invalid chat host events descriptor")
+	}
+	remaining := maxDiagnosticLogBytes
+	if info, err := events.Stat(); err == nil && info.Size() < remaining {
+		remaining -= info.Size()
+	} else if err == nil {
+		remaining = 0
+	}
+	return &hostDiagnostics{events: events, remaining: remaining}, nil
 }
 
-func openDiagnosticFile(dir, name string) (*os.File, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create chat host diagnostics directory: %w", err)
-	}
-	file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open chat host diagnostic %s: %w", name, err)
-	}
-	return file, nil
-}
-
-func openHostStreams() (stdout, stderr *os.File, closeFiles func(), err error) {
-	dir, enabled, err := diagnosticsDirFromEnv()
-	if err != nil || !enabled {
-		return nil, nil, func() {}, err
-	}
-	stdout, err = openDiagnosticFile(dir, "host.stdout.log")
-	if err != nil {
-		return nil, nil, func() {}, err
-	}
-	stderr, err = openDiagnosticFile(dir, "host.stderr.log")
-	if err != nil {
-		_ = stdout.Close()
-		return nil, nil, func() {}, err
-	}
-	return stdout, stderr, func() {
-		_ = stdout.Close()
-		_ = stderr.Close()
-	}, nil
-}
-
-func openHostDiagnostics() (*hostDiagnostics, error) {
-	dir, enabled, err := diagnosticsDirFromEnv()
-	if err != nil || !enabled {
-		return nil, err
-	}
-	events, err := openDiagnosticFile(dir, "host.events.log")
-	if err != nil {
-		return nil, err
-	}
-	return &hostDiagnostics{events: events}, nil
-}
-
-func (d *hostDiagnostics) Event(format string, args ...any) {
-	if d == nil || d.events == nil {
+// Event writes a closed, caller-selected lifecycle name. It never accepts an
+// error value, path, prompt, argument vector, or environment.
+func (d *hostDiagnostics) Event(name string) {
+	if d == nil || d.events == nil || d.remaining <= 0 {
 		return
 	}
-	_, _ = fmt.Fprintf(d.events, format+"\n", args...)
+	line := name + "\n"
+	if int64(len(line)) > d.remaining {
+		line = line[:d.remaining]
+	}
+	n, _ := io.WriteString(d.events, line)
+	d.remaining -= int64(n)
 }
 
 func (d *hostDiagnostics) Close() error {
-	if d == nil {
+	if d == nil || d.events == nil {
 		return nil
 	}
 	return d.events.Close()
+}
+
+// limitedWriter keeps the host's stdout/stderr bounded without changing the
+// provider's ACP stdout pipe. Extra bytes are drained and discarded.
+type limitedWriter struct {
+	mu        sync.Mutex
+	dst       io.Writer
+	remaining int64
+}
+
+func newLimitedWriter(dst io.Writer) io.Writer {
+	if dst == nil {
+		return nil
+	}
+	remaining := maxDiagnosticLogBytes
+	if file, ok := dst.(*os.File); ok {
+		if info, err := file.Stat(); err == nil && info.Size() < remaining {
+			remaining -= info.Size()
+		} else if err == nil {
+			remaining = 0
+		}
+	}
+	return &limitedWriter{dst: dst, remaining: remaining}
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	original := len(p)
+	if w.remaining <= 0 {
+		return original, nil
+	}
+	if int64(len(p)) > w.remaining {
+		p = p[:w.remaining]
+	}
+	n, err := w.dst.Write(p)
+	w.remaining -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	return original, nil
 }

@@ -105,6 +105,9 @@ type Config struct {
 	Protocol             Protocol
 	OwnershipFingerprint string
 	Prepare              func(context.Context) (PreparedProvider, error)
+	// Diagnostics is an explicit, test-owned opt-in. The files are already open;
+	// the detached child receives descriptors, never a writable path.
+	Diagnostics *HostDiagnostics
 }
 
 // PreparedProvider is resolved only when no compatible live host can be
@@ -572,7 +575,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if len(cfg.Argv) == 0 || !filepath.IsAbs(cfg.Workdir) {
 		return errors.New("chat host requires provider argv and absolute workdir")
 	}
-	diagnostics, diagnosticsErr := openHostDiagnostics()
+	diagnostics, diagnosticsErr := openHostDiagnosticsFromFD()
 	if diagnosticsErr != nil {
 		fmt.Fprintf(os.Stderr, "chat host diagnostics unavailable: %v\n", diagnosticsErr)
 	}
@@ -580,7 +583,7 @@ func Run(ctx context.Context, cfg Config) error {
 	diagnostics.Event("startup")
 	releaseLock, err := acquireHostLock(cfg.DataDir, cfg.SessionID)
 	if err != nil {
-		diagnostics.Event("host lock failed: %v", err)
+		diagnostics.Event("host lock failed")
 		return err
 	}
 	diagnostics.Event("host lock acquired")
@@ -610,7 +613,7 @@ func Run(ctx context.Context, cfg Config) error {
 	child.Stderr = io.Discard
 	closeProviderTree, err := startProviderProcess(child)
 	if err != nil {
-		diagnostics.Event("provider start failed: %v", err)
+		diagnostics.Event("provider start failed")
 		return err
 	}
 	diagnostics.Event("provider started")
@@ -624,7 +627,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Address:              listener.Addr().String(), Token: token, PID: os.Getpid(), StartedAt: time.Now().UTC(),
 	}
 	if err := writeDescriptor(cfg.DataDir, d); err != nil {
-		diagnostics.Event("descriptor write failed: %v", err)
+		diagnostics.Event("descriptor write failed")
 		_ = killProviderProcess(context.WithoutCancel(ctx), child)
 		return err
 	}
@@ -640,7 +643,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Protocol == ProtocolACP {
 		h.acp, err = newACPRelay(ctx, filepath.Join(filepath.Dir(path), "acp-prompt.journal"))
 		if err != nil {
-			diagnostics.Event("ACP relay failed: %v", err)
+			diagnostics.Event("ACP relay failed")
 			_ = killProviderProcess(context.WithoutCancel(ctx), child)
 			return err
 		}
