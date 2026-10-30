@@ -83,7 +83,7 @@ func (d *hostDiagnostics) Event(name string) {
 	if int64(len(line)) > d.remaining {
 		line = line[:d.remaining]
 	}
-	n, _ := io.WriteString(d.events, line)
+	n, _ := d.events.WriteString(line)
 	d.remaining -= int64(n)
 }
 

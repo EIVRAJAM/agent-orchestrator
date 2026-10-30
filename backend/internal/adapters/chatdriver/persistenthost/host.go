@@ -598,7 +598,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if diagnosticsErr != nil {
 		fmt.Fprintf(os.Stderr, "chat host diagnostics unavailable: %v\n", diagnosticsErr)
 	}
-	defer diagnostics.Close()
+	defer func() { _ = diagnostics.Close() }()
 	diagnostics.Event("startup")
 	releaseLock, err := acquireHostLock(cfg.DataDir, cfg.SessionID)
 	if err != nil {
