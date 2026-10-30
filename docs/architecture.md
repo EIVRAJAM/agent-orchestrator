@@ -18,6 +18,16 @@ Chat, but both controllers are never live at once. The daemon coordinates both
 modes through the same session, lifecycle, workspace, storage, and observation
 boundaries.
 
+The ACP host is launched as a detached process. `ConnectOrStart` waits for the
+host to publish `host.json` before it can attach. If the provider fails before
+that descriptor is published, the parent does not receive the provider's
+original error; it observes the descriptor/connection failure after its current
+wait expires. `TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsHostError`
+pins that observable contract. The test-only host diagnostics on this branch
+capture bounded, sanitized lifecycle evidence and host streams under the test's
+temporary directory (provider stderr remains discarded), but they neither prove
+nor fix the intermittent `host.json` failure.
+
 ## Table of contents
 
 - [Mental model](#mental-model)
