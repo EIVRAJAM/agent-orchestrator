@@ -72,6 +72,11 @@ func TestProviderHelper(t *testing.T) {
 			_, _ = fmt.Fprintln(os.Stdout, `{"id":700,"method":"item/commandExecution/requestApproval","params":{"turnId":"turn-live"}}`)
 			continue
 		}
+		if frame.Method == "env-check" {
+			_, present := os.LookupEnv(hostEventsFDEnv)
+			_, _ = fmt.Fprintf(os.Stdout, `{"id":%d,"result":{"eventsFdPresent":%t}}`+"\n", frame.ID, present)
+			continue
+		}
 		if frame.Method == "" && frame.ID == 700 {
 			_, _ = fmt.Fprintln(os.Stdout, `{"method":"approval/received","params":{"turnId":"turn-live"}}`)
 			continue

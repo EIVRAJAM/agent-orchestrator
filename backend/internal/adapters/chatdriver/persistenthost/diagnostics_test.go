@@ -1,12 +1,14 @@
 package persistenthost
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHostDiagnosticsDisabledByDefault(t *testing.T) {
@@ -210,5 +212,80 @@ func TestRunReportsProviderErrorWhenDiagnosticsInvalid(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "diagnostics") {
 		t.Fatalf("diagnostic failure replaced the provider error: %v", err)
+	}
+}
+
+func TestProviderEnvironmentRemovesHostDiagnosticFD(t *testing.T) {
+	got := providerEnvironment([]string{
+		"PATH=/bin",
+		hostEventsFDEnv + "=3",
+		"AO_CHAT_HOST_PROVIDER_HELPER=1",
+		hostEventsFDEnv + "=4",
+	})
+	want := []string{"PATH=/bin", "AO_CHAT_HOST_PROVIDER_HELPER=1"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("provider environment = %v, want %v", got, want)
+	}
+}
+
+func TestProviderDoesNotInheritDiagnosticFD(t *testing.T) {
+	dir := t.TempDir()
+	events, err := os.OpenFile(filepath.Join(dir, "host.events.log"),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = events.Close() })
+	cfg := Config{
+		SessionID: "diagnostic-env-filter", DataDir: t.TempDir(), Workdir: t.TempDir(),
+		Env:         append(os.Environ(), "AO_CHAT_HOST_PROVIDER_HELPER=1"),
+		Argv:        []string{os.Args[0], "-test.run=TestProviderHelper"},
+		Diagnostics: &HostDiagnostics{Events: events},
+	}
+	transport, err := ConnectOrStart(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Shutdown(context.Background(), cfg.DataDir, cfg.SessionID) })
+	reader := bufio.NewReader(transport.Stdout)
+	sendFrame(t, transport, `{"id":11,"method":"env-check"}`)
+	response := readFrame(t, reader)
+	if !bytes.Contains(response, []byte(`"eventsFdPresent":false`)) {
+		t.Fatalf("provider inherited internal diagnostic fd: %s", response)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, "host.events.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte("provider started")) {
+		t.Fatalf("host diagnostic events were not written: %q", body)
+	}
+}
+
+func TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsHostError(t *testing.T) {
+	dir := t.TempDir()
+	closed, err := os.Create(filepath.Join(dir, "closed.events.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	_, err = ConnectOrStart(ctx, Config{
+		SessionID: "diagnostic-provider-failure", DataDir: t.TempDir(), Workdir: t.TempDir(),
+		Argv:        []string{"/definitely/missing-provider-binary"},
+		Diagnostics: &HostDiagnostics{Events: closed},
+	})
+	if err == nil {
+		t.Fatal("ConnectOrStart succeeded with a missing provider")
+	}
+	message := err.Error()
+	if strings.Contains(message, "chat host diagnostics") {
+		t.Fatalf("diagnostic failure replaced the host result: %v", err)
+	}
+	if !strings.Contains(message, "start chat host") || !strings.Contains(message, "host.json") {
+		t.Fatalf("ConnectOrStart error = %v, want the current host-descriptor error", err)
 	}
 }

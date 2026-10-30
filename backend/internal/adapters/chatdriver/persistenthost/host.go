@@ -570,6 +570,25 @@ func Shutdown(ctx context.Context, dataDir, sessionID string) error {
 	}
 }
 
+// providerEnvironment removes the host-only diagnostic descriptor variable
+// before starting the provider. Duplicate entries are all removed; every other
+// variable and its order is preserved. The provider never receives the internal
+// descriptor number or any diagnostic path.
+func providerEnvironment(env []string) []string {
+	if env == nil {
+		return nil
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && name == hostEventsFDEnv {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // Run owns the provider until it exits or an authenticated shutdown arrives.
 func Run(ctx context.Context, cfg Config) error {
 	if len(cfg.Argv) == 0 || !filepath.IsAbs(cfg.Workdir) {
@@ -600,7 +619,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	child := aoprocess.Command(cfg.Argv[0], cfg.Argv[1:]...) //nolint:gosec // provider argv is constructed by AO's driver.
 	child.Dir = cfg.Workdir
-	child.Env = cfg.Env
+	childEnv := cfg.Env
+	if childEnv == nil {
+		if _, diagnosticEnv := os.LookupEnv(hostEventsFDEnv); diagnosticEnv {
+			childEnv = os.Environ()
+		}
+	}
+	child.Env = providerEnvironment(childEnv)
 	configureProviderProcess(child)
 	stdin, err := child.StdinPipe()
 	if err != nil {
