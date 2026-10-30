@@ -47,6 +47,9 @@ func TestProviderHelper(t *testing.T) {
 	if os.Getenv("AO_CHAT_HOST_PROVIDER_HELPER") != "1" {
 		return
 	}
+	if sentinel := os.Getenv("AO_CHAT_HOST_DIAGNOSTIC_STDERR_SENTINEL"); sentinel != "" {
+		_, _ = fmt.Fprintln(os.Stderr, sentinel)
+	}
 	if os.Getenv("AO_CHAT_HOST_ACP_HELPER") == "1" {
 		runACPProviderHelper()
 		return
@@ -67,6 +70,11 @@ func TestProviderHelper(t *testing.T) {
 		}
 		if frame.Method == "request-approval" {
 			_, _ = fmt.Fprintln(os.Stdout, `{"id":700,"method":"item/commandExecution/requestApproval","params":{"turnId":"turn-live"}}`)
+			continue
+		}
+		if frame.Method == "env-check" {
+			_, present := os.LookupEnv(hostEventsFDEnv)
+			_, _ = fmt.Fprintf(os.Stdout, `{"id":%d,"result":{"eventsFdPresent":%t}}`+"\n", frame.ID, present)
 			continue
 		}
 		if frame.Method == "" && frame.ID == 700 {

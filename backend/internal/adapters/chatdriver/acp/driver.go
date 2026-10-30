@@ -54,6 +54,9 @@ type Config struct {
 	Capabilities ports.ChatCapabilities
 	Probe        func(context.Context) error
 	Launch       func(context.Context, LaunchConfig) (Launch, error)
+	// HostDiagnostics is an explicit test-only opt-in for persistent-host
+	// startup evidence. Files must already be open under the test's temp dir.
+	HostDiagnostics *persistenthost.HostDiagnostics
 	// ValidateInitialize optionally admits only the tested ACP distribution and
 	// version after the protocol handshake identifies it. This is preferable to
 	// invoking an adapter-specific version flag, which many stdio agents do not
@@ -684,7 +687,7 @@ func (d *Driver) connectProcess(
 	hostConfig := persistenthost.Config{
 		SessionID: string(cfg.SessionID), DataDir: cfg.DataDir, Workdir: cfg.WorkspacePath,
 		Protocol: persistenthost.ProtocolACP, OwnershipFingerprint: identity,
-		ReconnectOnly: cfg.ReconnectOnly,
+		ReconnectOnly: cfg.ReconnectOnly, Diagnostics: d.cfg.HostDiagnostics,
 		Prepare: func(prepareCtx context.Context) (persistenthost.PreparedProvider, error) {
 			if prepareEnv != nil {
 				env, err := prepareEnv(prepareCtx)

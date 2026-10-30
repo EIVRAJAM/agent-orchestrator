@@ -105,6 +105,9 @@ type Config struct {
 	Protocol             Protocol
 	OwnershipFingerprint string
 	Prepare              func(context.Context) (PreparedProvider, error)
+	// Diagnostics is an explicit, test-owned opt-in. The files are already open;
+	// the detached child receives descriptors, never a writable path.
+	Diagnostics *HostDiagnostics
 }
 
 // PreparedProvider is resolved only when no compatible live host can be
@@ -567,15 +570,42 @@ func Shutdown(ctx context.Context, dataDir, sessionID string) error {
 	}
 }
 
+// providerEnvironment removes the host-only diagnostic descriptor variable
+// before starting the provider. Duplicate entries are all removed; every other
+// variable and its order is preserved. The provider never receives the internal
+// descriptor number or any diagnostic path.
+func providerEnvironment(env []string) []string {
+	if env == nil {
+		return nil
+	}
+	out := make([]string, 0, len(env))
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && name == hostEventsFDEnv {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // Run owns the provider until it exits or an authenticated shutdown arrives.
 func Run(ctx context.Context, cfg Config) error {
 	if len(cfg.Argv) == 0 || !filepath.IsAbs(cfg.Workdir) {
 		return errors.New("chat host requires provider argv and absolute workdir")
 	}
+	diagnostics, diagnosticsErr := openHostDiagnosticsFromFD()
+	if diagnosticsErr != nil {
+		fmt.Fprintf(os.Stderr, "chat host diagnostics unavailable: %v\n", diagnosticsErr)
+	}
+	defer func() { _ = diagnostics.Close() }()
+	diagnostics.Event("startup")
 	releaseLock, err := acquireHostLock(cfg.DataDir, cfg.SessionID)
 	if err != nil {
+		diagnostics.Event("host lock failed")
 		return err
 	}
+	diagnostics.Event("host lock acquired")
 	defer releaseLock()
 	token, err := randomToken()
 	if err != nil {
@@ -589,7 +619,13 @@ func Run(ctx context.Context, cfg Config) error {
 
 	child := aoprocess.Command(cfg.Argv[0], cfg.Argv[1:]...) //nolint:gosec // provider argv is constructed by AO's driver.
 	child.Dir = cfg.Workdir
-	child.Env = cfg.Env
+	childEnv := cfg.Env
+	if childEnv == nil {
+		if _, diagnosticEnv := os.LookupEnv(hostEventsFDEnv); diagnosticEnv {
+			childEnv = os.Environ()
+		}
+	}
+	child.Env = providerEnvironment(childEnv)
 	configureProviderProcess(child)
 	stdin, err := child.StdinPipe()
 	if err != nil {
@@ -602,8 +638,10 @@ func Run(ctx context.Context, cfg Config) error {
 	child.Stderr = io.Discard
 	closeProviderTree, err := startProviderProcess(child)
 	if err != nil {
+		diagnostics.Event("provider start failed")
 		return err
 	}
+	diagnostics.Event("provider started")
 	// The job owns descendants even if the direct provider exits first. Close
 	// it before releasing the host lock so Shutdown follows the kill request.
 	defer closeProviderTree()
@@ -614,9 +652,11 @@ func Run(ctx context.Context, cfg Config) error {
 		Address:              listener.Addr().String(), Token: token, PID: os.Getpid(), StartedAt: time.Now().UTC(),
 	}
 	if err := writeDescriptor(cfg.DataDir, d); err != nil {
+		diagnostics.Event("descriptor write failed")
 		_ = killProviderProcess(context.WithoutCancel(ctx), child)
 		return err
 	}
+	diagnostics.Event("descriptor published")
 	path, _ := descriptorPath(cfg.DataDir, cfg.SessionID)
 	defer func() { _ = os.Remove(path) }()
 
@@ -628,10 +668,12 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Protocol == ProtocolACP {
 		h.acp, err = newACPRelay(ctx, filepath.Join(filepath.Dir(path), "acp-prompt.journal"))
 		if err != nil {
+			diagnostics.Event("ACP relay failed")
 			_ = killProviderProcess(context.WithoutCancel(ctx), child)
 			return err
 		}
 		defer func() { _ = h.acp.close(context.WithoutCancel(ctx)) }()
+		diagnostics.Event("ACP relay started")
 	}
 	h.cond = sync.NewCond(&h.mu)
 	providerDone := make(chan error, 1)
@@ -643,6 +685,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	acceptDone := make(chan error, 1)
 	go func() { acceptDone <- h.accept() }()
+	diagnostics.Event("accept started")
 
 	stopProvider := func() {
 		_ = stdin.Close()

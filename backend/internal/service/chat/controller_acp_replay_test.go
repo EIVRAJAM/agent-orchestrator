@@ -92,6 +92,31 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	defer cancel()
 	st := openStore(t)
 	dataDir, workspace := t.TempDir(), t.TempDir()
+	diagnosticsDir := t.TempDir()
+	openDiagnostic := func(name string) *os.File {
+		file, openErr := os.OpenFile(filepath.Join(diagnosticsDir, name),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if openErr != nil {
+			t.Fatalf("open %s: %v", name, openErr)
+		}
+		return file
+	}
+	diagnostics := &persistenthost.HostDiagnostics{
+		Stdout: openDiagnostic("host.stdout.log"),
+		Stderr: openDiagnostic("host.stderr.log"),
+		Events: openDiagnostic("host.events.log"),
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("ACP host diagnostics:\n%s", readACPReplayDiagnostics(diagnosticsDir))
+		}
+		_ = diagnostics.Stdout.Close()
+		_ = diagnostics.Stderr.Close()
+		_ = diagnostics.Events.Close()
+		if !t.Failed() {
+			_ = os.RemoveAll(diagnosticsDir)
+		}
+	})
 	logPath := filepath.Join(dataDir, "acp.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
@@ -107,7 +132,8 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(logFile, nil))
 	releasePath := filepath.Join(dataDir, "release")
 	cfg := acp.Config{
-		Harness: domain.HarnessOpenCode,
+		Harness:         domain.HarnessOpenCode,
+		HostDiagnostics: diagnostics,
 		Capabilities: ports.ChatCapabilities{
 			ports.ChatCapabilityStreaming: true, ports.ChatCapabilityResume: true,
 			ports.ChatCapabilityApprovals: true, ports.ChatCapabilityInterrupt: true,
@@ -148,7 +174,7 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	}
 	first, err := firstService.Start(ctx, start)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("first Start: %v\n%s", err, readACPReplayDiagnostics(diagnosticsDir))
 	}
 	hostBefore := readACPReplayHost(t, dataDir)
 	turn, err := first.Send(ctx, ports.ChatUserMessage{Text: "burst while AO is detached"})
@@ -183,7 +209,7 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	secondService := newService()
 	second, err := secondService.Start(ctx, start)
 	if err != nil {
-		t.Fatalf("reconnect: %v", err)
+		t.Fatalf("reconnect: %v\n%s", err, readACPReplayDiagnostics(diagnosticsDir))
 	}
 	hostAfter := readACPReplayHost(t, dataDir)
 	if hostAfter.PID != hostBefore.PID || !hostAfter.StartedAt.Equal(hostBefore.StartedAt) ||
@@ -259,7 +285,7 @@ func TestACPReplayProjectsExactlyOnceAcrossDaemonRestarts(t *testing.T) {
 	stopCancel()
 	third, err := newService().Start(ctx, start)
 	if err != nil {
-		t.Fatalf("restart after completion ACK: %v", err)
+		t.Fatalf("restart after completion ACK: %v\n%s", err, readACPReplayDiagnostics(diagnosticsDir))
 	}
 	if third.State() != ports.ChatControllerReady || third.ProviderConversationID() != first.ProviderConversationID() {
 		t.Fatal("restart after completion ACK did not retain a ready native conversation")
@@ -276,6 +302,22 @@ func awaitACPReplay(ctx context.Context, t *testing.T, stage string, ready func(
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
+}
+
+func readACPReplayDiagnostics(dir string) string {
+	var out strings.Builder
+	for _, name := range []string{"host.events.log", "host.stderr.log", "host.stdout.log"} {
+		path := filepath.Join(dir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if len(data) > 64<<10 {
+			data = data[:64<<10]
+		}
+		fmt.Fprintf(&out, "--- %s ---\n%s\n", path, data)
+	}
+	return out.String()
 }
 
 func readACPReplayHost(t *testing.T, dataDir string) persistenthost.Descriptor {
