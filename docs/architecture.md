@@ -702,6 +702,13 @@ publication or projector start. That includes live reconnect. The restored
 running turn is not treated as a reason to clear the hold; only an explicit
 resume, empty queue, or cancellation can do that.
 
+The distinction is durable: a hold means queued work was adopted after a
+controller was lost. Live reconnect without a pre-existing hold is not a
+recovery claim: it reuses the generation and restores the provider turn that
+stayed alive, and after that turn completes the ordinary FIFO queue resumes. A
+live reconnect with an existing hold keeps the hold even while that restored
+turn runs, and the held head remains blocked until `resume-queue` names it.
+
 `queue_recovery_required` is an operational hold, not a display status. The
 snapshot derives `controller_recovery_required` while a queued head exists; the
 new controller cannot auto-drain it. `resume-queue` releases exactly one named

@@ -6916,8 +6916,13 @@ func TestProviderStartedTurnIsAdoptedSoItsItemsCorrelate(t *testing.T) {
 		},
 	)
 
+	// LoadConversationSnapshot reads turns and activities in separate queries.
+	// Waiting only for the activities can return a mixed snapshot where the
+	// activities are already visible but the TurnStarted projection has not yet
+	// been observed by this read. Wait for the complete durable pair; the
+	// assertions below still require the adopted turn and its correlation.
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		return len(s.Activities) == 2
+		return len(s.Turns) == 1 && len(s.Activities) == 2
 	})
 
 	if len(snapshot.Turns) != 1 {

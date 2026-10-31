@@ -15,6 +15,11 @@ import (
 
 func seedRestartedQueue(t *testing.T, st *sqlite.Store) (domain.ConversationRecord, string, string) {
 	t.Helper()
+	return seedRestartedQueueWithHold(t, st, true)
+}
+
+func seedRestartedQueueWithHold(t *testing.T, st *sqlite.Store, recoveryRequired bool) (domain.ConversationRecord, string, string) {
+	t.Helper()
 	ctx := context.Background()
 	rec, found, err := st.GetSession(ctx, testSession)
 	if err != nil || !found {
@@ -52,7 +57,7 @@ func seedRestartedQueue(t *testing.T, st *sqlite.Store) (domain.ConversationReco
 		ExpectedGeneration: "gen-old",
 		Generation:         "gen-live",
 		AdoptQueued:        true,
-		RecoveryRequired:   true,
+		RecoveryRequired:   recoveryRequired,
 		Now:                time.Now().UTC(),
 	}); err != nil {
 		t.Fatalf("claim/adopt: %v", err)
@@ -139,6 +144,75 @@ func TestLiveReconnectRestoresQueueRecoveryHold(t *testing.T) {
 	}
 	if got := provider.sentTexts(); len(got) != 1 || got[0] != "live next" {
 		t.Fatalf("provider received %v, want only the next head", got)
+	}
+}
+
+// A live reconnect that did not adopt queued work has no durable hold. It must
+// still restore ownership of the provider turn that stayed alive, and once that
+// turn completes the ordinary FIFO queue must advance without a manual resume.
+func TestLiveReconnectWithoutPreexistingHoldDrainsQueueFIFO(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	conversation, _, nextID := seedRestartedQueueWithHold(t, st, false)
+	provider := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{
+		fakeConversation: newFakeConversation(),
+		err:              ports.ErrChatHistoryUnsettled,
+	}}
+	provider.providerConversationID = "thread-live"
+	svc := newLiveReconnectService(t, st, provider)
+	ctrl, err := svc.Start(ctx, chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), ProviderConversationID: "thread-live",
+	})
+	if err != nil {
+		t.Fatalf("live reconnect Start: %v", err)
+	}
+	if ctrl.Generation() != "gen-live" {
+		t.Fatalf("live reconnect generation = %q, want reused gen-live", ctrl.Generation())
+	}
+	before, err := svc.Snapshot(ctx, testSession)
+	if err != nil {
+		t.Fatalf("snapshot before completion: %v", err)
+	}
+	if before.Queue == nil || before.Queue.State != chatsvc.QueueStateWaitingForActiveTurn ||
+		before.Queue.HeadTurnID != nextID || before.Queue.PendingCount != 1 {
+		t.Fatalf("queue before live completion = %+v, want one FIFO head behind running", before.Queue)
+	}
+	if got := provider.sentTexts(); len(got) != 0 {
+		t.Fatalf("live reconnect dispatched queued work before the restored turn completed: %v", got)
+	}
+
+	provider.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-live-head",
+		TurnState: domain.TurnStateCompleted,
+	})
+	after := awaitServiceQueue(t, svc, func(q *chatsvc.QueueState) bool {
+		return q != nil && q.State == chatsvc.QueueStateRunning && q.PendingCount == 0
+	})
+	if after.ActiveTurnID == "" {
+		t.Fatalf("queue after restored completion = %+v, want the next FIFO turn running", after)
+	}
+	if got := provider.sentTexts(); len(got) != 1 || got[0] != "live next" {
+		t.Fatalf("provider received %v, want exactly the next FIFO turn", got)
+	}
+
+	provider.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1",
+		TurnState: domain.TurnStateCompleted,
+	})
+	final := awaitServiceQueue(t, svc, func(q *chatsvc.QueueState) bool {
+		return q != nil && q.State == chatsvc.QueueStateIdle
+	})
+	if final.PendingCount != 0 {
+		t.Fatalf("queue after FIFO completion = %+v, want empty", final)
+	}
+	snapshot, err := st.LoadConversationSnapshot(ctx, conversation.ID)
+	if err != nil {
+		t.Fatalf("final snapshot: %v", err)
+	}
+	states := turnStateByText(t, snapshot)
+	if states["live head"] != domain.TurnStateCompleted || states["live next"] != domain.TurnStateCompleted {
+		t.Fatalf("turn states = %+v, want both FIFO turns completed", states)
 	}
 }
 
