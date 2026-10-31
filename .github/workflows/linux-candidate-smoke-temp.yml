@@ -1,0 +1,187 @@
+name: Linux candidate smoke (temporary)
+
+# Temporary validation only. The branch-scoped push trigger is required because
+# workflow_dispatch only runs workflows that already exist on the default branch.
+on:
+  push:
+    branches:
+      - test/linux-candidate-smoke-1faea84
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CANDIDATE_RUN: "41171078391"
+  CANDIDATE_VERSION: "0.13.0-privacy.3"
+  SOURCE_SHA: "1faea84df45ff798cce7f3f81a7e212dea066ce6"
+  BUILD_RUN: "41170116263"
+  CANDIDATE_ARTIFACT: "fork-linux-0.13.0-privacy.3"
+
+jobs:
+  ubuntu-2204:
+    name: Ubuntu 22.04 — AppImage and deb
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download canonical candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.CANDIDATE_ARTIFACT }}
+          path: candidate
+          run-id: ${{ env.CANDIDATE_RUN }}
+          repository: EIVRAJAM/agent-orchestrator
+          github-token: ${{ github.token }}
+
+      - name: Validate candidate metadata and checksums
+        run: |
+          set -euo pipefail
+          cd candidate
+          sha256sum --check SHA256SUMS
+          python3 - <<'PY'
+          import json, os, re
+          meta = json.load(open("release-metadata.json"))
+          expected = {
+              "version": "0.13.0-privacy.3",
+              "source_sha": "1faea84df45ff798cce7f3f81a7e212dea066ce6",
+              "build_run_id": 41170116263,
+              "source_repository": "EIVRAJAM/agent-orchestrator",
+          }
+          for key, value in expected.items():
+              got = meta.get(key)
+              print(f"{key}={got}")
+              if got != value:
+                  raise SystemExit(f"{key}: got {got!r}, want {value!r}")
+          text = open("latest-linux.yml", encoding="utf-8").read()
+          path = re.search(r"(?m)^\s*path:\s*(\S+)\s*$", text).group(1)
+          url = re.search(r"(?m)^\s*-\s*url:\s*(\S+)\s*$", text).group(1)
+          sha = re.search(r"(?m)^\s*sha512:\s*(\S+)\s*$", text).group(1)
+          size = int(re.search(r"(?m)^\s*size:\s*(\d+)\s*$", text).group(1))
+          app = "Agent.Orchestrator-0.13.0-privacy.3.AppImage"
+          assert path == url == app, (path, url, app)
+          assert size == os.path.getsize(app), (size, os.path.getsize(app))
+          assert sha == __import__("base64").b64encode(__import__("hashlib").sha512(open(app, "rb").read()).digest()).decode()
+          print("LATEST_OK", path, size)
+          PY
+
+      - name: Install Ubuntu runtime dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xvfb xauth libgtk-3-0 libnss3 libgbm1 libasound2 libatspi2.0-0 \
+            libxcb-dri3-0 libxss1 libxtst6 libsecret-1-0 libnotify4 xdg-utils
+
+      - name: Start Xvfb
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          for _ in $(seq 1 20); do
+            [ -S /tmp/.X11-unix/X99 ] && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/xvfb.log"
+          exit 1
+
+      - name: Smoke AppImage
+        run: |
+          set -euo pipefail
+          chmod 700 candidate/Agent.Orchestrator-0.13.0-privacy.3.AppImage
+          mkdir -p "$RUNNER_TEMP/appimage"
+          (cd "$RUNNER_TEMP/appimage" && "$GITHUB_WORKSPACE/candidate/Agent.Orchestrator-0.13.0-privacy.3.AppImage" --appimage-extract)
+          APP="$RUNNER_TEMP/appimage/squashfs-root/agent-orchestrator"
+          CLI="$RUNNER_TEMP/appimage/squashfs-root/resources/daemon/ao"
+          test -x "$APP"
+          test -x "$CLI"
+          bash test/linux-candidate-smoke.sh appimage "$APP" "$CLI" "$CANDIDATE_VERSION"
+
+      - name: Install deb and smoke installed package
+        run: |
+          set -euo pipefail
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./candidate/agent-orchestrator_0.13.0-privacy.3_amd64.deb
+          test "$(dpkg-query -W -f='${Version}' agent-orchestrator)" = "0.13.0-privacy.3"
+          APP="$(command -v agent-orchestrator)"
+          CLI="$(find /usr/lib/agent-orchestrator -path '*/resources/daemon/ao' -type f -print -quit)"
+          test -x "$APP"
+          test -x "$CLI"
+          bash test/linux-candidate-smoke.sh deb "$APP" "$CLI" "$CANDIDATE_VERSION"
+
+  fedora-rpm:
+    name: Fedora 40 — rpm
+    runs-on: ubuntu-22.04
+    container: fedora:40
+    timeout-minutes: 45
+    steps:
+      - name: Install checkout prerequisites in the disposable container
+        run: |
+          set -euo pipefail
+          dnf -y install git tar gzip unzip findutils python3
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download canonical candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.CANDIDATE_ARTIFACT }}
+          path: candidate
+          run-id: ${{ env.CANDIDATE_RUN }}
+          repository: EIVRAJAM/agent-orchestrator
+          github-token: ${{ github.token }}
+
+      - name: Validate candidate metadata and checksums
+        run: |
+          set -euo pipefail
+          cd candidate
+          sha256sum --check SHA256SUMS
+          python3 - <<'PY'
+          import json
+          meta = json.load(open("release-metadata.json"))
+          expected = {
+              "version": "0.13.0-privacy.3",
+              "source_sha": "1faea84df45ff798cce7f3f81a7e212dea066ce6",
+              "build_run_id": 41170116263,
+              "source_repository": "EIVRAJAM/agent-orchestrator",
+          }
+          for key, value in expected.items():
+              got = meta.get(key)
+              print(f"{key}={got}")
+              if got != value:
+                  raise SystemExit(f"{key}: got {got!r}, want {value!r}")
+          print("METADATA_OK")
+          PY
+
+      - name: Install rpm, dependencies, and display
+        run: |
+          set -euo pipefail
+          dnf -y install --nogpgcheck ./candidate/agent-orchestrator-0.13.0-privacy.3-1.x86_64.rpm
+          dnf -y install xorg-x11-server-Xvfb xorg-x11-xauth python3 curl findutils util-linux
+          rpm -q agent-orchestrator
+          test "$(rpm -q --qf '%{VERSION}' agent-orchestrator)" = "0.13.0-privacy.3"
+
+      - name: Start Xvfb
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 > /tmp/xvfb.log 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          for _ in $(seq 1 20); do
+            [ -S /tmp/.X11-unix/X99 ] && exit 0
+            sleep 1
+          done
+          cat /tmp/xvfb.log
+          exit 1
+
+      - name: Smoke rpm
+        run: |
+          set -euo pipefail
+          APP="$(command -v agent-orchestrator)"
+          CLI="$(find /usr/lib /usr/lib64 -path '*/resources/daemon/ao' -type f -print -quit)"
+          test -x "$APP"
+          test -x "$CLI"
+          bash test/linux-candidate-smoke.sh rpm "$APP" "$CLI" "$CANDIDATE_VERSION"
