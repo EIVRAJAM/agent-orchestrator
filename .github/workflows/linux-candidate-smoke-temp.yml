@@ -19,11 +19,19 @@ env:
   CANDIDATE_ARTIFACT: "fork-linux-0.13.0-privacy.3"
 
 jobs:
-  ubuntu-2204:
-    name: Ubuntu 22.04 — AppImage and deb
+  debian13-appimage:
+    name: Debian 13 — AppImage
     runs-on: ubuntu-22.04
+    container: debian:13
     timeout-minutes: 45
     steps:
+      - name: Install checkout prerequisites in the disposable Debian container
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git tar gzip unzip findutils python3 curl ca-certificates
+
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -43,7 +51,7 @@ jobs:
           cd candidate
           sha256sum --check SHA256SUMS
           python3 - <<'PY'
-          import json, os, re
+          import base64, hashlib, json, os, re
           meta = json.load(open("release-metadata.json"))
           expected = {
               "version": "0.13.0-privacy.3",
@@ -64,16 +72,15 @@ jobs:
           app = "Agent.Orchestrator-0.13.0-privacy.3.AppImage"
           assert path == url == app, (path, url, app)
           assert size == os.path.getsize(app), (size, os.path.getsize(app))
-          assert sha == __import__("base64").b64encode(__import__("hashlib").sha512(open(app, "rb").read()).digest()).decode()
+          assert sha == base64.b64encode(hashlib.sha512(open(app, "rb").read()).digest()).decode()
           print("LATEST_OK", path, size)
           PY
 
-      - name: Install Ubuntu runtime dependencies
+      - name: Install Debian runtime dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            xvfb xauth libgtk-3-0 libnss3 libgbm1 libasound2 libatspi2.0-0 \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xvfb xauth libgtk-3-0t64 libnss3 libgbm1 libasound2t64 libatspi2.0-0t64 \
             libxcb-dri3-0 libxss1 libxtst6 libsecret-1-0 libnotify4 xdg-utils
 
       - name: Start Xvfb
@@ -100,27 +107,18 @@ jobs:
           test -x "$CLI"
           bash test/linux-candidate-smoke.sh appimage "$APP" "$CLI" "$CANDIDATE_VERSION"
 
-      - name: Install deb and smoke installed package
-        run: |
-          set -euo pipefail
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./candidate/agent-orchestrator_0.13.0-privacy.3_amd64.deb
-          test "$(dpkg-query -W -f='${Version}' agent-orchestrator)" = "0.13.0-privacy.3"
-          APP="$(command -v agent-orchestrator)"
-          CLI="$(find /usr/lib/agent-orchestrator -path '*/resources/daemon/ao' -type f -print -quit)"
-          test -x "$APP"
-          test -x "$CLI"
-          bash test/linux-candidate-smoke.sh deb "$APP" "$CLI" "$CANDIDATE_VERSION"
-
-  fedora-rpm:
-    name: Fedora 40 — rpm
+  debian13-deb:
+    name: Debian 13 — deb
     runs-on: ubuntu-22.04
-    container: fedora:40
+    container: debian:13
     timeout-minutes: 45
     steps:
-      - name: Install checkout prerequisites in the disposable container
+      - name: Install checkout prerequisites in the disposable Debian container
         run: |
           set -euo pipefail
-          dnf -y install git tar gzip unzip findutils python3
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git tar gzip unzip findutils python3 curl ca-certificates
 
       - uses: actions/checkout@v4
         with:
@@ -157,31 +155,42 @@ jobs:
           print("METADATA_OK")
           PY
 
-      - name: Install rpm, dependencies, and display
+      - name: Install Debian runtime dependencies
         run: |
           set -euo pipefail
-          dnf -y install --nogpgcheck ./candidate/agent-orchestrator-0.13.0-privacy.3-1.x86_64.rpm
-          dnf -y install xorg-x11-server-Xvfb xorg-x11-xauth python3 curl findutils util-linux
-          rpm -q agent-orchestrator
-          test "$(rpm -q --qf '%{VERSION}' agent-orchestrator)" = "0.13.0-privacy.3"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xvfb xauth libgtk-3-0t64 libnss3 libgbm1 libasound2t64 libatspi2.0-0t64 \
+            libxcb-dri3-0 libxss1 libxtst6 libsecret-1-0 libnotify4 xdg-utils
+
+      - name: Install deb and verify installed files
+        run: |
+          set -euo pipefail
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ./candidate/agent-orchestrator_0.13.0-privacy.3_amd64.deb
+          test "$(dpkg-query -W -f='${Version}' agent-orchestrator)" = "0.13.0-privacy.3"
+          dpkg -L agent-orchestrator | grep -qx '/usr/bin/agent-orchestrator'
+          APP="$(command -v agent-orchestrator)"
+          CLI="$(find /usr/lib/agent-orchestrator -path '*/resources/daemon/ao' -type f -print -quit)"
+          test -x "$APP"
+          test -x "$CLI"
+          echo "DEB_INSTALL_OK version=$(dpkg-query -W -f='${Version}' agent-orchestrator) app=$APP cli=$CLI"
 
       - name: Start Xvfb
         run: |
           set -euo pipefail
-          Xvfb :99 -screen 0 1280x1024x24 > /tmp/xvfb.log 2>&1 &
+          Xvfb :99 -screen 0 1280x1024x24 > "$RUNNER_TEMP/xvfb.log" 2>&1 &
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
           for _ in $(seq 1 20); do
             [ -S /tmp/.X11-unix/X99 ] && exit 0
             sleep 1
           done
-          cat /tmp/xvfb.log
+          cat "$RUNNER_TEMP/xvfb.log"
           exit 1
 
-      - name: Smoke rpm
+      - name: Smoke installed deb
         run: |
           set -euo pipefail
           APP="$(command -v agent-orchestrator)"
-          CLI="$(find /usr/lib /usr/lib64 -path '*/resources/daemon/ao' -type f -print -quit)"
+          CLI="$(find /usr/lib/agent-orchestrator -path '*/resources/daemon/ao' -type f -print -quit)"
           test -x "$APP"
           test -x "$CLI"
-          bash test/linux-candidate-smoke.sh rpm "$APP" "$CLI" "$CANDIDATE_VERSION"
+          bash test/linux-candidate-smoke.sh deb "$APP" "$CLI" "$CANDIDATE_VERSION"

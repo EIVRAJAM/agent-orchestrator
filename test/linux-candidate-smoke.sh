@@ -222,13 +222,26 @@ print(json.dumps(last, indent=2))
 raise SystemExit(1)
 PY
 
-prompt_count="$(grep -c '"kind": "prompt.start"' "$base/fake-acp.log" || true)"
-if [ "$prompt_count" -ne 1 ]; then
-  echo "FAKE_PROMPT_COUNT=$prompt_count want 1"
-  cat "$base/fake-acp.log"
-  exit 1
-fi
-echo "CHAT_OK label=$label session=$session fake_prompts=$prompt_count"
+python3 - "$base/fake-acp.log" <<'PY'
+import json
+import sys
+
+calls = 0
+completed = 0
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if record.get("kind") == "method" and record.get("method") == "session/prompt":
+        calls += 1
+    if record.get("kind") == "prompt.completed":
+        completed += 1
+print(f"FAKE_SESSION_PROMPTS={calls} FAKE_PROMPT_COMPLETIONS={completed}")
+if calls != 1 or completed != 1:
+    raise SystemExit("fake ACP must see exactly one session/prompt and one prompt.completed")
+PY
+echo "CHAT_OK label=$label session=$session fake_prompts=1"
 
 curl -fsS -X POST "http://127.0.0.1:$port/shutdown" >/dev/null 2>&1 || true
 kill -TERM "-$app_pid" 2>/dev/null || true
