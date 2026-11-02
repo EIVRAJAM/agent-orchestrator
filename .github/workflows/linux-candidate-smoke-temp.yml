@@ -194,3 +194,83 @@ jobs:
           test -x "$APP"
           test -x "$CLI"
           bash test/linux-candidate-smoke.sh deb "$APP" "$CLI" "$CANDIDATE_VERSION"
+
+  rocky9-rpm:
+    name: Rocky Linux 9.6 — rpm
+    runs-on: ubuntu-22.04
+    container: rockylinux:9.6
+    timeout-minutes: 45
+    steps:
+      - name: Install checkout prerequisites in the disposable Rocky container
+        run: |
+          set -euo pipefail
+          dnf -y install git tar gzip unzip findutils python3 curl ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download canonical candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.CANDIDATE_ARTIFACT }}
+          path: candidate
+          run-id: ${{ env.CANDIDATE_RUN }}
+          repository: EIVRAJAM/agent-orchestrator
+          github-token: ${{ github.token }}
+
+      - name: Validate candidate metadata and checksums
+        run: |
+          set -euo pipefail
+          cd candidate
+          sha256sum --check SHA256SUMS
+          python3 - <<'PY'
+          import json
+          meta = json.load(open("release-metadata.json"))
+          expected = {
+              "version": "0.13.0-privacy.3",
+              "source_sha": "1faea84df45ff798cce7f3f81a7e212dea066ce6",
+              "build_run_id": 41170116263,
+              "source_repository": "EIVRAJAM/agent-orchestrator",
+          }
+          for key, value in expected.items():
+              got = meta.get(key)
+              print(f"{key}={got}")
+              if got != value:
+                  raise SystemExit(f"{key}: got {got!r}, want {value!r}")
+          print("METADATA_OK")
+          PY
+
+      - name: Install rpm and verify package metadata
+        run: |
+          set -euo pipefail
+          dnf -y install --nogpgcheck ./candidate/agent-orchestrator-0.13.0-privacy.3-1.x86_64.rpm
+          dnf -y install xorg-x11-server-Xvfb xorg-x11-xauth python3 curl findutils util-linux
+          rpm -q agent-orchestrator
+          installed="$(rpm -q --qf '%{VERSION}' agent-orchestrator)"
+          echo "RPM_VERSION=$installed"
+          case "$installed" in
+            0.13.0-privacy.3|0.13.0.privacy.3) ;;
+            *) echo "unexpected RPM version: $installed" >&2; exit 1 ;;
+          esac
+
+      - name: Start Xvfb
+        run: |
+          set -euo pipefail
+          Xvfb :99 -screen 0 1280x1024x24 > /tmp/xvfb.log 2>&1 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          for _ in $(seq 1 20); do
+            [ -S /tmp/.X11-unix/X99 ] && exit 0
+            sleep 1
+          done
+          cat /tmp/xvfb.log
+          exit 1
+
+      - name: Smoke rpm
+        run: |
+          set -euo pipefail
+          APP="$(command -v agent-orchestrator)"
+          CLI="$(find /usr/lib /usr/lib64 -path '*/resources/daemon/ao' -type f -print -quit)"
+          test -x "$APP"
+          test -x "$CLI"
+          bash test/linux-candidate-smoke.sh rpm "$APP" "$CLI" "$CANDIDATE_VERSION"
