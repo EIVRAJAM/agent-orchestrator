@@ -1,12 +1,58 @@
 package persistenthost
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestStartupEvidenceReadRejectsOversizedFile(t *testing.T) {
+	dataDir := t.TempDir()
+	const sessionID = "startup-evidence-oversized"
+	const attemptID = "oversized-attempt-0123456789abcdef"
+
+	payload, err := json.Marshal(startupEvidence{
+		Version:   startupEvidenceVersion,
+		AttemptID: attemptID,
+		Stage:     StartupStageProviderExit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload = append(payload, bytes.Repeat([]byte(" "), int(maxStartupEvidenceBytes))...)
+	path, err := startupEvidencePath(dataDir, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	evidence, err := readStartupEvidence(dataDir, sessionID, attemptID)
+	if err == nil {
+		t.Fatal("oversized startup evidence was accepted")
+	}
+	if evidence != nil {
+		t.Fatalf("oversized startup evidence returned data: %+v", evidence)
+	}
+	if startupErrorFromEvidence(evidence) != nil {
+		t.Fatalf("oversized evidence produced StartupError: %v", startupErrorFromEvidence(evidence))
+	}
+	for _, leaked := range []string{dataDir, "host.startup.json", `"attemptId"`} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("oversized evidence error leaked %q: %v", leaked, err)
+		}
+	}
+}
 
 func TestStartupEvidenceOnlyMatchesAttempt(t *testing.T) {
 	dataDir := t.TempDir()

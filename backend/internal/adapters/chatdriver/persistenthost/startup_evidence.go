@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,8 +14,9 @@ import (
 const startupEvidenceVersion = 1
 
 const (
-	startupEvidenceFileName = "host.startup.json"
-	startupAttemptEnv       = "AO_CHAT_HOST_STARTUP_ATTEMPT"
+	startupEvidenceFileName       = "host.startup.json"
+	startupAttemptEnv             = "AO_CHAT_HOST_STARTUP_ATTEMPT"
+	maxStartupEvidenceBytes int64 = 4 << 10
 )
 
 // StartupStage is a closed, bounded classification of a detached host startup
@@ -120,12 +122,20 @@ func readStartupEvidence(dataDir, sessionID, attemptID string) (*startupEvidence
 	if err != nil {
 		return nil, err
 	}
-	payload, err := os.ReadFile(path) //nolint:gosec // AO-owned path derived from a validated session id.
+	file, err := os.Open(path) //nolint:gosec // AO-owned path derived from a validated session id.
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, errors.New("chat host startup evidence unavailable")
+	}
+	defer func() { _ = file.Close() }()
+	payload, err := io.ReadAll(io.LimitReader(file, maxStartupEvidenceBytes+1))
+	if err != nil {
+		return nil, errors.New("chat host startup evidence unavailable")
+	}
+	if int64(len(payload)) > maxStartupEvidenceBytes {
+		return nil, errors.New("invalid chat host startup evidence")
 	}
 	var evidence startupEvidence
 	if err := json.Unmarshal(payload, &evidence); err != nil {

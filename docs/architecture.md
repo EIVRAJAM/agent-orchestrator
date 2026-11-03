@@ -20,8 +20,8 @@ boundaries.
 
 The ACP host is launched as a detached process. `ConnectOrStart` waits for the
 host to publish `host.json` before it can attach. If the host fails during
-startup, it writes an atomic, bounded startup record while it still owns the
-exclusive host lock. The record contains only a random attempt ID, a fixed
+startup, it writes an atomic startup record bounded to 4 KiB while it still
+owns the exclusive host lock. The record contains only a random attempt ID, a fixed
 stage and, when applicable, the provider exit code; `ConnectOrStart` reads it
 after its existing wait expires, accepts only the attempt it launched, and
 returns typed `StartupError` evidence. The record never contains provider
