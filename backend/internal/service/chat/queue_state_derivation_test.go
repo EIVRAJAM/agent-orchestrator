@@ -177,6 +177,28 @@ func TestSnapshotReportsControllerAbsent(t *testing.T) {
 	}
 }
 
+func TestSnapshotReportsIdleWhenControllerAbsentAndQueueEmpty(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if err := h.svc.Stop(ctx, testSession); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	queue := snapshotQueue(t, h)
+	if queue.ControllerAvailable {
+		t.Fatal("controller available = true after Stop")
+	}
+	if queue.PendingCount != 0 || queue.HeadTurnID != "" {
+		t.Fatalf("queue = %+v, want empty", queue)
+	}
+	if queue.State != chatsvc.QueueStateIdle {
+		t.Fatalf("state = %q, want idle", queue.State)
+	}
+	if queue.ResumeSafety != chatsvc.QueueResumeNoPendingWork {
+		t.Fatalf("resume safety = %q, want no_pending_work", queue.ResumeSafety)
+	}
+}
+
 // TestSnapshotHandoffBeatsRunningTurn proves the priority order: a handoff armed
 // while a turn is in flight is reported as handoff, not as a busy queue.
 func TestSnapshotHandoffBeatsRunningTurn(t *testing.T) {

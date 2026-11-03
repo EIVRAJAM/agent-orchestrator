@@ -582,10 +582,10 @@ func deriveQueueState(
 	case compactionPending:
 		state.State = QueueStateCompacting
 		state.ResumeSafety = QueueResumeCompactionInProgress
-	case !state.ControllerAvailable:
+	case !state.ControllerAvailable && facts.PendingCount > 0:
 		state.State = QueueStateControllerRecoveryRequired
 		state.ResumeSafety = QueueResumeControllerRecoveryRequired
-	case recoveryRequired:
+	case recoveryRequired && facts.PendingCount > 0:
 		// The controller is live but the adopted queue is deliberately held
 		// until a manual resume names its head.
 		state.State = QueueStateControllerRecoveryRequired
