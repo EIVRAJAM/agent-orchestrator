@@ -10,6 +10,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+type mergePRRequest struct {
+	PRURL           string `json:"prUrl"`
+	ExpectedHeadSHA string `json:"expectedHeadSha"`
+}
+
 type mergePRResponse struct {
 	OK       bool   `json:"ok"`
 	PRNumber int    `json:"prNumber"`
@@ -36,7 +41,9 @@ func newPRCommand(ctx *commandContext) *cobra.Command {
 }
 
 func newPRMergeCommand(ctx *commandContext) *cobra.Command {
-	return &cobra.Command{
+	var prURL string
+	var expectedHeadSHA string
+	cmd := &cobra.Command{
 		Use:   "merge <pr-number>",
 		Short: "Merge a pull request",
 		Args:  usageArgs(cobra.ExactArgs(1)),
@@ -45,8 +52,22 @@ func newPRMergeCommand(ctx *commandContext) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			prURL = strings.TrimSpace(prURL)
+			expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
+			if prURL == "" || expectedHeadSHA == "" {
+				return usageError{errors.New("--pr-url and --head-sha are required")}
+			}
+			_, _, _, urlNumber, err := cliParsePRURL(prURL)
+			if err != nil || strconv.Itoa(urlNumber) != prNumber {
+				return usageError{errors.New("--pr-url must be a valid PR/MR URL matching the PR number")}
+			}
 			var res mergePRResponse
-			if err := ctx.postJSON(cmd.Context(), "prs/"+url.PathEscape(prNumber)+"/merge", struct{}{}, &res); err != nil {
+			if err := ctx.postJSON(
+				cmd.Context(),
+				"prs/"+url.PathEscape(prNumber)+"/merge",
+				mergePRRequest{PRURL: prURL, ExpectedHeadSHA: expectedHeadSHA},
+				&res,
+			); err != nil {
 				return err
 			}
 			if method := strings.TrimSpace(res.Method); method != "" {
@@ -57,6 +78,9 @@ func newPRMergeCommand(ctx *commandContext) *cobra.Command {
 			return err
 		},
 	}
+	cmd.Flags().StringVar(&prURL, "pr-url", "", "Exact PR/MR URL to merge")
+	cmd.Flags().StringVar(&expectedHeadSHA, "head-sha", "", "Exact provider head SHA the user reviewed")
+	return cmd
 }
 
 func newPRResolveCommentsCommand(ctx *commandContext) *cobra.Command {

@@ -238,7 +238,7 @@ query values are redacted.
 
 `go run .` in `backend/` remains a compatibility wrapper around the daemon.
 
-PR actions are available through `ao pr merge` and
+PR actions are available through `ao pr merge --pr-url <url> --head-sha <sha>` and
 `ao pr resolve-comments`. Review actions are available through `ao review ls`,
 `ao review trigger` (also `execute` and `restart`), `ao review cancel` (also
 `stop`), and `ao review submit`.
