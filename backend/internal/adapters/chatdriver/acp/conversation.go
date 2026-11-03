@@ -583,17 +583,20 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 			}
 		}
 	}
+	// The provider mode is already authoritative at this point. Record it before
+	// applying later options so a partial turn-settings failure cannot leave AO
+	// enforcing a stale, potentially more permissive policy.
+	if settings.Approval != "" {
+		c.mu.Lock()
+		c.permissionMode = ports.NormalizePermissionMode(effectiveApproval)
+		c.mu.Unlock()
+	}
 	for _, option := range options {
 		if option.ID != "model" {
 			if err := applyOption(option); err != nil {
 				return err
 			}
 		}
-	}
-	if settings.Approval != "" {
-		c.mu.Lock()
-		c.permissionMode = ports.NormalizePermissionMode(effectiveApproval)
-		c.mu.Unlock()
 	}
 	return nil
 }
