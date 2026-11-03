@@ -204,7 +204,9 @@ jobs:
       - name: Install checkout prerequisites in the disposable Rocky container
         run: |
           set -euo pipefail
-          dnf -y install git tar gzip unzip findutils python3 curl ca-certificates
+          dnf -y install git tar gzip unzip findutils python3 ca-certificates
+          command -v curl
+          curl --version | head -1
 
       - uses: actions/checkout@v4
         with:
@@ -245,7 +247,7 @@ jobs:
         run: |
           set -euo pipefail
           dnf -y install --nogpgcheck ./candidate/agent-orchestrator-0.13.0-privacy.3-1.x86_64.rpm
-          dnf -y install xorg-x11-server-Xvfb xorg-x11-xauth python3 curl findutils util-linux
+          dnf -y install xorg-x11-server-Xvfb xorg-x11-xauth python3 findutils util-linux
           rpm -q agent-orchestrator
           installed="$(rpm -q --qf '%{VERSION}' agent-orchestrator)"
           echo "RPM_VERSION=$installed"
