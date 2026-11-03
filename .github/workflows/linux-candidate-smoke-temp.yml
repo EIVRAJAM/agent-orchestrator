@@ -198,7 +198,7 @@ jobs:
   rocky9-rpm:
     name: Rocky Linux 9.6 — rpm
     runs-on: ubuntu-22.04
-    container: rockylinux:9.6
+    container: rockylinux/rockylinux:9.6
     timeout-minutes: 45
     steps:
       - name: Install checkout prerequisites in the disposable Rocky container
