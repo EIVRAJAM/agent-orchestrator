@@ -7,6 +7,7 @@ app="${2:?app binary required}"
 cli="${3:?ao cli required}"
 version="${4:?expected version required}"
 base="${RUNNER_TEMP:?RUNNER_TEMP required}/ao-smoke-$label"
+instance="ao-smoke-$label-$$"
 
 rm -rf "$base"
 mkdir -p "$base/home" "$base/data" "$base/fake/bin"
@@ -127,15 +128,21 @@ git -C "$base/repo" remote add origin "$base/origin.git"
 git -C "$base/repo" fetch -q origin
 git -C "$base/repo" remote set-head origin --auto
 
+app_pid=""
+app_exited=0
 setsid env \
   HOME="$HOME" XDG_DATA_HOME="$XDG_DATA_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
   SHELL="$SHELL" PATH="$PATH" AO_DATA_DIR="$AO_DATA_DIR" AO_RUN_FILE="$AO_RUN_FILE" AO_PORT="$AO_PORT" \
-  AO_SMOKE_FAKE_LOG="$AO_SMOKE_FAKE_LOG" AO_DISABLE_GPU=1 ELECTRON_DISABLE_SANDBOX=1 \
-  ELECTRON_ENABLE_LOGGING=1 DISPLAY="${DISPLAY:?DISPLAY required}" \
-  "$app" --no-sandbox --disable-gpu --remote-debugging-port="$debug_port" > "$base/app.log" 2>&1 &
+  AO_SMOKE_INSTANCE_ID="$instance" AO_SMOKE_FAKE_LOG="$AO_SMOKE_FAKE_LOG" \
+  AO_DISABLE_GPU=1 ELECTRON_DISABLE_SANDBOX=1 ELECTRON_ENABLE_LOGGING=1 \
+  DISPLAY="${DISPLAY:?DISPLAY required}" \
+  "$app" --no-sandbox --disable-gpu --remote-debugging-port="$debug_port" --remote-allow-origins='*' > "$base/app.log" 2>&1 &
 app_pid=$!
 
 cleanup() {
+  if [ "$app_exited" -eq 1 ] || [ -z "$app_pid" ]; then
+    return
+  fi
   kill -TERM "-$app_pid" 2>/dev/null || true
   sleep 1
   kill -KILL "-$app_pid" 2>/dev/null || true
@@ -345,40 +352,49 @@ header.extend(mask)
 header.extend(bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload)))
 sock.sendall(header)
 
+def recv_exact(size):
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data
+
+
 def read_frame():
-    first = sock.recv(2)
-    if len(first) != 2:
-        raise SystemExit("WS_FRAME_EOF")
+    first = recv_exact(2)
     opcode = first[0] & 0x0F
     length = first[1] & 0x7F
     if length == 126:
-        length = struct.unpack("!H", sock.recv(2))[0]
+        length = struct.unpack("!H", recv_exact(2))[0]
     elif length == 127:
-        length = struct.unpack("!Q", sock.recv(8))[0]
-    data = b""
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
-        if not chunk:
-            raise SystemExit("WS_FRAME_PAYLOAD_EOF")
-        data += chunk
-    return opcode, data
+        length = struct.unpack("!Q", recv_exact(8))[0]
+    return opcode, recv_exact(length)
 
-while True:
-    opcode, data = read_frame()
-    if opcode == 8:
-        raise SystemExit("WS_CLOSED_BEFORE_QUIT_RESPONSE")
-    if opcode != 1:
-        continue
-    message = json.loads(data.decode())
-    if message.get("id") != 1:
-        continue
-    if message.get("error"):
-        raise SystemExit(f"APP_QUIT_RPC_ERROR {message['error']}")
-    result = message.get("result") or {}
-    if result.get("exceptionDetails"):
-        raise SystemExit(f"APP_QUIT_EXCEPTION {json.dumps(result['exceptionDetails'])}")
-    print("APP_QUIT_RPC_OK")
-    break
+
+try:
+    while True:
+        opcode, data = read_frame()
+        if opcode == 8:
+            print("APP_QUIT_CDP_EOF")
+            break
+        if opcode != 1:
+            continue
+        message = json.loads(data.decode())
+        if message.get("id") != 1:
+            continue
+        if message.get("error"):
+            raise SystemExit(f"APP_QUIT_RPC_ERROR {message['error']}")
+        result = message.get("result") or {}
+        if result.get("exceptionDetails"):
+            raise SystemExit(f"APP_QUIT_EXCEPTION {json.dumps(result['exceptionDetails'])}")
+        print("APP_QUIT_RPC_OK")
+        break
+except EOFError:
+    # The app may close the browser websocket while quitting after the full
+    # request frame was sent. The process exit status is still authoritative.
+    print("APP_QUIT_CDP_EOF")
 sock.close()
 PY
 
@@ -412,28 +428,42 @@ if [ "$app_status" -ne 0 ]; then
   exit 1
 fi
 
-# Verify no process from this smoke remains, including the daemon/host/provider.
-remaining=""
-for _ in $(seq 1 15); do
-  remaining=""
-  self="$$"
+smoke_residuals() {
+  local entry pid details
   for entry in /proc/[0-9]*; do
     pid="${entry##*/}"
-    [ "$pid" = "$self" ] && continue
     [ -r "$entry/environ" ] || continue
-    if tr '\0' '\n' < "$entry/environ" 2>/dev/null | grep -Fxq "AO_SMOKE_FAKE_LOG=$base/fake-acp.log"; then
-      remaining="$remaining $pid"
+    if tr '\0' '\n' < "$entry/environ" 2>/dev/null | grep -Fxq "AO_SMOKE_INSTANCE_ID=$instance"; then
+      details="$(ps -o pid=,ppid=,pgid=,sid=,stat=,args= -p "$pid" 2>/dev/null || true)"
+      [ -n "$details" ] && printf '%s\n' "$details"
     fi
   done
-  [ -z "$remaining" ] && break
+}
+
+remaining=""
+for _ in $(seq 1 15); do
+  remaining="$(smoke_residuals)"
+  if [ -z "$remaining" ] && ! kill -0 "-$app_pid" 2>/dev/null; then
+    break
+  fi
   sleep 1
 done
 if [ -n "$remaining" ]; then
-  echo "SMOKE_PROCESSES_REMAIN:$remaining"
+  echo "SMOKE_PROCESSES_REMAIN:"
+  printf '%s\n' "$remaining"
   # Emergency cleanup only after marking the smoke failed.
-  for pid in $remaining; do kill -TERM "$pid" 2>/dev/null || true; done
+  while read -r pid _; do
+    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+  done <<< "$remaining"
   sleep 2
-  for pid in $remaining; do kill -KILL "$pid" 2>/dev/null || true; done
+  while read -r pid _; do
+    [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+  done <<< "$remaining"
+  exit 1
+fi
+if kill -0 "-$app_pid" 2>/dev/null; then
+  echo "APP_PROCESS_GROUP_REMAINS: $app_pid"
+  ps -eo pid=,ppid=,pgid=,sid=,stat=,args= | awk -v p="$app_pid" '$3 == p'
   exit 1
 fi
 echo "CLEAN_STOP_OK label=$label"
