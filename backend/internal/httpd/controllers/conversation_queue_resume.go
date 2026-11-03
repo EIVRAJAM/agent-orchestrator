@@ -45,8 +45,9 @@ type queueResumeService interface {
 // resumeHeldQueue releases exactly one never-sent queued turn.
 //
 // This first delivery resumes only while a live, authoritative controller owns a
-// durable queued row; it does not recover after a cold start, where the queue has
-// already been closed. See docs/chat-queue-resume.md.
+// durable queued row. Cold starts preserve queued rows behind the recovery hold;
+// start or restore the session's controller before resuming. See
+// docs/chat-queue-resume.md.
 func (c *ConversationsController) resumeHeldQueue(w http.ResponseWriter, r *http.Request) {
 	svc, ok := c.Svc.(queueResumeService)
 	if !ok {

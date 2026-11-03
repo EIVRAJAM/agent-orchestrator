@@ -394,8 +394,9 @@ func newSessionResumeQueueCommand(ctx *commandContext) *cobra.Command {
 			"state's head turn id and controller generation as the compare-and-set\n" +
 			"preconditions. --turn and --generation override the observed values. Both\n" +
 			"preconditions are always sent; a missing generation is a usage error.\n\n" +
-			"This works only while the session's controller is live: after a daemon restart the\n" +
-			"queued messages are already closed and cannot be resumed.",
+			"This works only while the session's controller is live. After a daemon restart,\n" +
+			"queued messages are preserved but the session must be started or restored before\n" +
+			"the held queue can be resumed.",
 		Args: oneSessionIDArg,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := normalizeSessionID(args[0])

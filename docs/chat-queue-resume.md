@@ -5,16 +5,13 @@ queued work behind it so the outage cannot cascade through the rest of the queue
 (issue #4861). This document describes the user-initiated counterpart added in
 this change: releasing **exactly one** never-sent queued turn.
 
-## Scope and the cold-start limitation
+## Scope and cold-start behavior
 
-This first delivery resumes a durable `queued` turn **only while a live,
-authoritative controller owns the session**. It deliberately does **not** recover
-after a cold start: on a cold start `SettleOrphanedConversationTurns` has already
-converted the queued rows to `failed` (`queries/conversations.sql`), so there is
-nothing left to release. Preserving queued rows across a cold start changes the
-recovery policy (agent switches, provider-thread changes) and is a separate
-change with its own forensic and generation tests. The API, the CLI help, and the
-derived `queueState` all state this limitation.
+This delivery preserves durable `queued` turns across a cold start, but it does
+not drain them automatically. A replacement controller adopts the queued rows
+into its generation and installs the recovery hold; a live, authoritative
+controller must exist before `resume-queue` can release the named head. Start or
+restore the session first when it is stopped.
 
 The recovery that would help *after* a closure — re-queueing a `failed` turn that
 was never sent (`state='failed' AND started_at IS NULL`) — is **not** part of
@@ -134,7 +131,7 @@ another explicit resume. It is not `queued_waiting_for_active_turn`: there is no
 active turn. The retention lives only in the controller, is tied to its
 generation, records the turn that produced it, is cleared by the next explicit
 resume, and is cleared on handoff, close, terminate or replacement. It is never
-persisted and does not change the cold-start policy.
+persisted; cold-start adoption still requires an explicit resume.
 
 `session_terminated` is the strongest state; a terminated session is never
 reported as a recoverable queue.
@@ -487,8 +484,8 @@ calls back into the service. So there is no cycle and no inversion.
 ## Provider failure taxonomy and local evidence
 
 This delivery adds diagnostics, not a recovery policy. It does not add a scheduler,
-automatic canary, cold-start adoption, process lock, or controller lease. A
-failed or recovered turn still holds the queue exactly as described above, and
+automatic canary, automatic cold-start drain, process lock, or controller lease.
+A failed or recovered turn still holds the queue exactly as described above, and
 `ao session resume-queue` is still the only way to release one held turn.
 
 ### Demonstrated classes
@@ -638,7 +635,7 @@ resumed, or how Start/Stop/handoff/live reconnect work. Existing regression test
 
 ## Out of scope
 
-- Preserving `queued` rows across a cold start (Option B).
+- Automatic draining of a cold-start-adopted queue.
 - Re-queueing `failed` turns whose `started_at IS NULL`.
 - Automatic retries. Delivery classification for a possibly-accepted turn is not
   sufficient for a safe second delivery (no `Retry-After` is preserved for chat
