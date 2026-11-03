@@ -13,6 +13,18 @@ import (
 
 const issueContextBodyLimit = 12000
 
+func (s *Service) canonicalizeIssueID(cfg ports.SpawnConfig, project domain.ProjectRecord) ports.SpawnConfig {
+	if s.tracker == nil || strings.TrimSpace(string(cfg.IssueID)) == "" {
+		return cfg
+	}
+	id, ok := s.trackerIDForIssue(cfg, project)
+	if !ok {
+		return cfg
+	}
+	cfg.IssueID = domain.CanonicalIssueID(id)
+	return cfg
+}
+
 func (s *Service) withIssueContext(ctx context.Context, cfg ports.SpawnConfig, project domain.ProjectRecord) ports.SpawnConfig {
 	if cfg.IssueContext != "" || cfg.IssueID == "" || s.tracker == nil {
 		return cfg
@@ -36,6 +48,13 @@ func (s *Service) withIssueContext(ctx context.Context, cfg ports.SpawnConfig, p
 
 func (s *Service) trackerIDForIssue(cfg ports.SpawnConfig, project domain.ProjectRecord) (domain.TrackerID, bool) {
 	issue := strings.TrimPrefix(strings.TrimSpace(string(cfg.IssueID)), "#")
+	if strings.HasPrefix(issue, string(domain.TrackerProviderGitLab)+":") {
+		if native, host, ok := canonicalGitLabIssueNative(issue); ok {
+			return domain.TrackerID{Provider: domain.TrackerProviderGitLab, Native: native, Host: host}, true
+		}
+		return domain.TrackerID{}, false
+	}
+	issue = strings.TrimPrefix(issue, string(domain.TrackerProviderGitHub)+":")
 	if issue == "" {
 		return domain.TrackerID{}, false
 	}
@@ -120,6 +139,34 @@ func canonicalGitHubIssueNative(raw string) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("%s/%s#%d", owner, name, n), true
+}
+
+func canonicalGitLabIssueNative(raw string) (string, string, bool) {
+	raw = strings.TrimPrefix(strings.TrimSpace(raw), string(domain.TrackerProviderGitLab)+":")
+	host := ""
+	if at := strings.LastIndexByte(raw, '@'); at > 0 {
+		host = strings.TrimSpace(raw[at+1:])
+		raw = raw[:at]
+	}
+	hash := strings.LastIndexByte(raw, '#')
+	if hash <= 0 || hash == len(raw)-1 {
+		return "", "", false
+	}
+	repo := strings.Trim(raw[:hash], "/")
+	parts := strings.Split(repo, "/")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return "", "", false
+		}
+	}
+	n, err := strconv.Atoi(raw[hash+1:])
+	if err != nil || n <= 0 {
+		return "", "", false
+	}
+	return fmt.Sprintf("%s#%d", repo, n), normalizeTrackerHost(string(domain.TrackerProviderGitLab), host), true
 }
 
 func splitIssueOwnerRepo(repo string) (string, string, bool) {
