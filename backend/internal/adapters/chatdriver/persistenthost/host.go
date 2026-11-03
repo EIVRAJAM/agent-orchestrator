@@ -104,10 +104,16 @@ type Config struct {
 	Argv                 []string
 	Protocol             Protocol
 	OwnershipFingerprint string
-	Prepare              func(context.Context) (PreparedProvider, error)
+	// StartupAttemptID correlates startup evidence with the parent attempt that
+	// launched this host. It is random and bounded; it carries no user data.
+	StartupAttemptID string
+	Prepare          func(context.Context) (PreparedProvider, error)
 	// Diagnostics is an explicit, test-owned opt-in. The files are already open;
 	// the detached child receives descriptors, never a writable path.
 	Diagnostics *HostDiagnostics
+	// startupEvidencePublished is a test-only synchronization hook. It runs
+	// after the evidence write and before the host lock is released.
+	startupEvidencePublished func()
 }
 
 // PreparedProvider is resolved only when no compatible live host can be
@@ -300,7 +306,6 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		}
 		transport, attachErr := attach(ctx, d, true)
 		if attachErr == nil {
-			_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID)
 			return transport, nil
 		}
 		if errors.Is(attachErr, ErrAttached) {
@@ -318,7 +323,6 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 				}
 				transport, attachErr = attach(ctx, d, true)
 				if attachErr == nil {
-					_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID)
 					return transport, nil
 				}
 				if !errors.Is(attachErr, ErrAttached) {
@@ -358,9 +362,11 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if len(cfg.Argv) == 0 {
 		return nil, errors.New("chat host start requires provider argv")
 	}
-	if err := clearStartupEvidence(cfg.DataDir, cfg.SessionID); err != nil {
-		return nil, fmt.Errorf("clear chat host startup evidence: %w", err)
+	attemptID, err := randomToken()
+	if err != nil {
+		return nil, fmt.Errorf("create chat host startup attempt: %w", err)
 	}
+	cfg.StartupAttemptID = attemptID
 	if err := spawnDetached(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -377,7 +383,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 			}
 			transport, attachErr := attach(ctx, d, false)
 			if attachErr == nil {
-				_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID)
+				_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID, attemptID)
 				return transport, nil
 			}
 			lastErr = attachErr
@@ -389,7 +395,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if d, readErr := readDescriptor(cfg.DataDir, cfg.SessionID); readErr == nil && processalive.Alive(d.PID) {
 		return nil, fmt.Errorf("%w: %w", ErrOwnershipInconclusive, lastErr)
 	}
-	evidence, evidenceErr := readStartupEvidence(cfg.DataDir, cfg.SessionID)
+	evidence, evidenceErr := readStartupEvidence(cfg.DataDir, cfg.SessionID, attemptID)
 	if evidenceErr != nil {
 		return nil, fmt.Errorf("start chat host: %w: startup evidence invalid", lastErr)
 	}
@@ -594,7 +600,7 @@ func providerEnvironment(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, entry := range env {
 		name, _, ok := strings.Cut(entry, "=")
-		if ok && name == hostEventsFDEnv {
+		if ok && (name == hostEventsFDEnv || name == startupAttemptEnv) {
 			continue
 		}
 		out = append(out, entry)
@@ -604,13 +610,13 @@ func providerEnvironment(env []string) []string {
 
 // Run owns the provider until it exits or an authenticated shutdown arrives.
 func Run(ctx context.Context, cfg Config) (err error) {
-	startupFailure := startupEvidence{Version: startupEvidenceVersion}
-	defer func() {
-		if err != nil && startupFailure.Stage != "" &&
-			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			_ = writeStartupEvidence(cfg.DataDir, cfg.SessionID, startupFailure)
-		}
-	}()
+	startupFailure := startupEvidence{
+		Version:   startupEvidenceVersion,
+		AttemptID: strings.TrimSpace(cfg.StartupAttemptID),
+	}
+	if startupFailure.AttemptID == "" {
+		startupFailure.AttemptID = strings.TrimSpace(os.Getenv(startupAttemptEnv))
+	}
 	if len(cfg.Argv) == 0 || !filepath.IsAbs(cfg.Workdir) {
 		startupFailure.Stage = StartupStageConfig
 		return errors.New("chat host requires provider argv and absolute workdir")
@@ -629,9 +635,18 @@ func Run(ctx context.Context, cfg Config) (err error) {
 	}
 	diagnostics.Event("host lock acquired")
 	defer releaseLock()
-	if clearErr := clearStartupEvidence(cfg.DataDir, cfg.SessionID); clearErr != nil {
-		return clearErr
-	}
+	// Register the evidence writer only after acquiring the exclusive host lock
+	// and before the lock release defer. On return, evidence is written first,
+	// while this host still owns ownership; a losing contender never writes.
+	defer func() {
+		if err != nil && startupFailure.Stage != "" && startupFailure.AttemptID != "" &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			_ = writeStartupEvidence(cfg.DataDir, cfg.SessionID, startupFailure)
+			if cfg.startupEvidencePublished != nil {
+				cfg.startupEvidencePublished()
+			}
+		}
+	}()
 	startupFailure.Stage = StartupStageToken
 	token, err := randomToken()
 	if err != nil {

@@ -406,8 +406,12 @@ func TestConnectOrStartLaunchesDetachedHost(t *testing.T) {
 	if transport.Reconnected {
 		t.Fatal("new detached host reported reconnect")
 	}
-	if evidence, evidenceErr := readStartupEvidence(dataDir, cfg.SessionID); evidenceErr != nil || evidence != nil {
-		t.Fatalf("successful host left startup evidence: %+v, %v", evidence, evidenceErr)
+	evidencePath, pathErr := startupEvidencePath(dataDir, cfg.SessionID)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if _, statErr := os.Stat(evidencePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("successful host left startup evidence: %v", statErr)
 	}
 	d, err := readDescriptor(dataDir, cfg.SessionID)
 	if err != nil {
@@ -436,8 +440,10 @@ func TestConnectOrStartLaunchesDetachedHost(t *testing.T) {
 
 func TestRunRecordsProviderExitStartupEvidence(t *testing.T) {
 	dataDir := t.TempDir()
+	const attemptID = "provider-exit-attempt-0123456789abcdef"
 	err := Run(context.Background(), Config{
 		SessionID: "provider-exit-evidence", DataDir: dataDir, Workdir: t.TempDir(),
+		StartupAttemptID: attemptID,
 		Env: append(os.Environ(),
 			"AO_CHAT_HOST_PROVIDER_HELPER=1",
 			"AO_CHAT_HOST_EXIT_IMMEDIATELY=1",
@@ -447,12 +453,15 @@ func TestRunRecordsProviderExitStartupEvidence(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run succeeded after the provider exited during startup")
 	}
-	evidence, readErr := readStartupEvidence(dataDir, "provider-exit-evidence")
+	evidence, readErr := readStartupEvidence(dataDir, "provider-exit-evidence", attemptID)
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
 	if evidence == nil {
 		t.Fatal("provider exit produced no startup evidence")
+	}
+	if evidence.AttemptID != attemptID {
+		t.Fatalf("attempt id = %q, want %q", evidence.AttemptID, attemptID)
 	}
 	if evidence.Stage != StartupStageProviderExit {
 		t.Fatalf("stage = %q, want %q", evidence.Stage, StartupStageProviderExit)

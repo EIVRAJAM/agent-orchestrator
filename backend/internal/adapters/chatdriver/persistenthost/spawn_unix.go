@@ -44,7 +44,7 @@ func spawnDetached(ctx context.Context, cfg Config) error {
 	}
 	cmd := exec.Command(exe, hostArgs(cfg)...) //nolint:forbidigo // detached chat host has specialized lifetime and session ownership
 	cmd.Dir = cfg.Workdir
-	cmd.Env = env
+	cmd.Env = withStartupAttemptEnv(env, cfg.StartupAttemptID)
 	cmd.Stdin = nil
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
