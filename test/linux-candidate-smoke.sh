@@ -28,6 +28,14 @@ print(s.getsockname()[1])
 s.close()
 PY
 )"
+debug_port="$(python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
 export AO_PORT="$port"
 export PATH="$base/fake/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export SHELL="$base/fake/fake-shell"
@@ -124,7 +132,7 @@ setsid env \
   SHELL="$SHELL" PATH="$PATH" AO_DATA_DIR="$AO_DATA_DIR" AO_RUN_FILE="$AO_RUN_FILE" AO_PORT="$AO_PORT" \
   AO_SMOKE_FAKE_LOG="$AO_SMOKE_FAKE_LOG" AO_DISABLE_GPU=1 ELECTRON_DISABLE_SANDBOX=1 \
   ELECTRON_ENABLE_LOGGING=1 DISPLAY="${DISPLAY:?DISPLAY required}" \
-  "$app" --no-sandbox --disable-gpu > "$base/app.log" 2>&1 &
+  "$app" --no-sandbox --disable-gpu --remote-debugging-port="$debug_port" > "$base/app.log" 2>&1 &
 app_pid=$!
 
 cleanup() {
@@ -243,15 +251,189 @@ if calls != 1 or completed != 1:
 PY
 echo "CHAT_OK label=$label session=$session fake_prompts=1"
 
-curl -fsS -X POST "http://127.0.0.1:$port/shutdown" >/dev/null 2>&1 || true
-kill -TERM "-$app_pid" 2>/dev/null || true
-for _ in $(seq 1 20); do
-  if ! kill -0 "$app_pid" 2>/dev/null; then break; fi
+shutdown_ok=0
+for _ in $(seq 1 10); do
+  if curl -fsS --max-time 3 -X POST "http://127.0.0.1:$port/shutdown" \
+    -o "$base/shutdown.body" -D "$base/shutdown.headers"; then
+    shutdown_ok=1
+    break
+  fi
   sleep 1
 done
-if kill -0 "$app_pid" 2>/dev/null; then
-  echo "APP_DID_NOT_STOP label=$label"
-  tail -50 "$base/app.log" || true
+if [ "$shutdown_ok" -ne 1 ]; then
+  echo "SHUTDOWN_HTTP_FAILED label=$label"
+  cat "$base/shutdown.body" 2>/dev/null || true
+  tail -100 "$base/app.log" || true
   exit 1
 fi
-echo "STOP_OK label=$label"
+echo "SHUTDOWN_HTTP_OK label=$label"
+
+# Stop the packaged application through its supported renderer bridge:
+# window.ao.menu.action("app.quit") invokes the main-process app.quit handler.
+python3 - "$debug_port" <<'PY'
+import base64
+import json
+import os
+import socket
+import struct
+import sys
+import time
+import urllib.request
+from urllib.parse import urlparse
+
+port = sys.argv[1]
+target = None
+for _ in range(30):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as response:
+            targets = json.load(response)
+        pages = [item for item in targets if item.get("type") == "page"]
+        if pages:
+            target = pages[0]
+            break
+    except Exception:
+        pass
+    time.sleep(0.5)
+if target is None:
+    raise SystemExit("NO_DEBUG_PAGE_TARGET")
+ws_url = target.get("webSocketDebuggerUrl")
+if not ws_url:
+    raise SystemExit("NO_WEBSOCKET_DEBUGGER_URL")
+
+u = urlparse(ws_url)
+sock = socket.create_connection((u.hostname, u.port), timeout=5)
+key = base64.b64encode(os.urandom(16)).decode()
+path = u.path + (("?" + u.query) if u.query else "")
+request = (
+    f"GET {path} HTTP/1.1\r\n"
+    f"Host: {u.hostname}:{u.port}\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\n"
+    "Sec-WebSocket-Version: 13\r\n\r\n"
+)
+sock.sendall(request.encode())
+handshake = b""
+while b"\r\n\r\n" not in handshake:
+    chunk = sock.recv(4096)
+    if not chunk:
+        raise SystemExit("WS_HANDSHAKE_EOF")
+    handshake += chunk
+if b" 101 " not in handshake.split(b"\r\n", 1)[0]:
+    raise SystemExit("WS_HANDSHAKE_FAILED")
+
+payload = json.dumps({
+    "id": 1,
+    "method": "Runtime.evaluate",
+    "params": {
+        "expression": "window.ao.menu.action('app.quit')",
+        "awaitPromise": True,
+        "returnByValue": True,
+    },
+}).encode()
+mask = os.urandom(4)
+header = bytearray([0x81])
+if len(payload) < 126:
+    header.append(0x80 | len(payload))
+elif len(payload) < 65536:
+    header.append(0x80 | 126)
+    header.extend(struct.pack("!H", len(payload)))
+else:
+    header.append(0x80 | 127)
+    header.extend(struct.pack("!Q", len(payload)))
+header.extend(mask)
+header.extend(bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload)))
+sock.sendall(header)
+
+def read_frame():
+    first = sock.recv(2)
+    if len(first) != 2:
+        raise SystemExit("WS_FRAME_EOF")
+    opcode = first[0] & 0x0F
+    length = first[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", sock.recv(2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", sock.recv(8))[0]
+    data = b""
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
+        if not chunk:
+            raise SystemExit("WS_FRAME_PAYLOAD_EOF")
+        data += chunk
+    return opcode, data
+
+while True:
+    opcode, data = read_frame()
+    if opcode == 8:
+        raise SystemExit("WS_CLOSED_BEFORE_QUIT_RESPONSE")
+    if opcode != 1:
+        continue
+    message = json.loads(data.decode())
+    if message.get("id") != 1:
+        continue
+    if message.get("error"):
+        raise SystemExit(f"APP_QUIT_RPC_ERROR {message['error']}")
+    result = message.get("result") or {}
+    if result.get("exceptionDetails"):
+        raise SystemExit(f"APP_QUIT_EXCEPTION {json.dumps(result['exceptionDetails'])}")
+    print("APP_QUIT_RPC_OK")
+    break
+sock.close()
+PY
+
+app_exited=0
+for _ in $(seq 1 30); do
+  if ! kill -0 "$app_pid" 2>/dev/null; then
+    app_exited=1
+    break
+  fi
+  sleep 1
+done
+if [ "$app_exited" -ne 1 ]; then
+  echo "APP_DID_NOT_EXIT label=$label"
+  # Emergency cleanup only after marking the smoke failed.
+  kill -TERM "-$app_pid" 2>/dev/null || true
+  sleep 2
+  kill -KILL "-$app_pid" 2>/dev/null || true
+  wait "$app_pid" 2>/dev/null
+  tail -100 "$base/app.log" || true
+  exit 1
+fi
+
+set +e
+wait "$app_pid"
+app_status=$?
+set -e
+echo "APP_EXIT_STATUS=$app_status"
+if [ "$app_status" -ne 0 ]; then
+  echo "APP_EXIT_FAILED label=$label status=$app_status"
+  tail -100 "$base/app.log" || true
+  exit 1
+fi
+
+# Verify no process from this smoke remains, including the daemon/host/provider.
+remaining=""
+for _ in $(seq 1 15); do
+  remaining=""
+  self="$$"
+  for entry in /proc/[0-9]*; do
+    pid="${entry##*/}"
+    [ "$pid" = "$self" ] && continue
+    [ -r "$entry/environ" ] || continue
+    if tr '\0' '\n' < "$entry/environ" 2>/dev/null | grep -Fxq "AO_SMOKE_FAKE_LOG=$base/fake-acp.log"; then
+      remaining="$remaining $pid"
+    fi
+  done
+  [ -z "$remaining" ] && break
+  sleep 1
+done
+if [ -n "$remaining" ]; then
+  echo "SMOKE_PROCESSES_REMAIN:$remaining"
+  # Emergency cleanup only after marking the smoke failed.
+  for pid in $remaining; do kill -TERM "$pid" 2>/dev/null || true; done
+  sleep 2
+  for pid in $remaining; do kill -KILL "$pid" 2>/dev/null || true; done
+  exit 1
+fi
+echo "CLEAN_STOP_OK label=$label"
