@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,6 +47,9 @@ func TestMain(m *testing.M) {
 func TestProviderHelper(t *testing.T) {
 	if os.Getenv("AO_CHAT_HOST_PROVIDER_HELPER") != "1" {
 		return
+	}
+	if os.Getenv("AO_CHAT_HOST_EXIT_IMMEDIATELY") == "1" {
+		os.Exit(7)
 	}
 	if sentinel := os.Getenv("AO_CHAT_HOST_DIAGNOSTIC_STDERR_SENTINEL"); sentinel != "" {
 		_, _ = fmt.Fprintln(os.Stderr, sentinel)
@@ -402,6 +406,9 @@ func TestConnectOrStartLaunchesDetachedHost(t *testing.T) {
 	if transport.Reconnected {
 		t.Fatal("new detached host reported reconnect")
 	}
+	if evidence, evidenceErr := readStartupEvidence(dataDir, cfg.SessionID); evidenceErr != nil || evidence != nil {
+		t.Fatalf("successful host left startup evidence: %+v, %v", evidence, evidenceErr)
+	}
 	d, err := readDescriptor(dataDir, cfg.SessionID)
 	if err != nil {
 		t.Fatal(err)
@@ -425,6 +432,50 @@ func TestConnectOrStartLaunchesDetachedHost(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("detached host did not remove its descriptor after shutdown")
+}
+
+func TestRunRecordsProviderExitStartupEvidence(t *testing.T) {
+	dataDir := t.TempDir()
+	err := Run(context.Background(), Config{
+		SessionID: "provider-exit-evidence", DataDir: dataDir, Workdir: t.TempDir(),
+		Env: append(os.Environ(),
+			"AO_CHAT_HOST_PROVIDER_HELPER=1",
+			"AO_CHAT_HOST_EXIT_IMMEDIATELY=1",
+		),
+		Argv: []string{os.Args[0], "-test.run=TestProviderHelper"},
+	})
+	if err == nil {
+		t.Fatal("Run succeeded after the provider exited during startup")
+	}
+	evidence, readErr := readStartupEvidence(dataDir, "provider-exit-evidence")
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if evidence == nil {
+		t.Fatal("provider exit produced no startup evidence")
+	}
+	if evidence.Stage != StartupStageProviderExit {
+		t.Fatalf("stage = %q, want %q", evidence.Stage, StartupStageProviderExit)
+	}
+	if !evidence.ProviderExited || evidence.ProviderExitCode != 7 {
+		t.Fatalf("provider exit evidence = %+v, want exited with code 7", evidence)
+	}
+	if strings.Contains(string(mustReadStartupEvidence(t, dataDir, "provider-exit-evidence")), "-test.run") {
+		t.Fatal("startup evidence leaked provider argv")
+	}
+}
+
+func mustReadStartupEvidence(t *testing.T, dataDir, sessionID string) []byte {
+	t.Helper()
+	path, err := startupEvidencePath(dataDir, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
 }
 
 func TestHostReplaysUnansweredServerRequestAfterDetach(t *testing.T) {

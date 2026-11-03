@@ -300,6 +300,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 		}
 		transport, attachErr := attach(ctx, d, true)
 		if attachErr == nil {
+			_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID)
 			return transport, nil
 		}
 		if errors.Is(attachErr, ErrAttached) {
@@ -317,6 +318,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 				}
 				transport, attachErr = attach(ctx, d, true)
 				if attachErr == nil {
+					_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID)
 					return transport, nil
 				}
 				if !errors.Is(attachErr, ErrAttached) {
@@ -356,6 +358,9 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	if len(cfg.Argv) == 0 {
 		return nil, errors.New("chat host start requires provider argv")
 	}
+	if err := clearStartupEvidence(cfg.DataDir, cfg.SessionID); err != nil {
+		return nil, fmt.Errorf("clear chat host startup evidence: %w", err)
+	}
 	if err := spawnDetached(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -372,6 +377,7 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 			}
 			transport, attachErr := attach(ctx, d, false)
 			if attachErr == nil {
+				_ = clearStartupEvidence(cfg.DataDir, cfg.SessionID)
 				return transport, nil
 			}
 			lastErr = attachErr
@@ -382,6 +388,13 @@ func ConnectOrStart(ctx context.Context, cfg Config) (*Transport, error) {
 	}
 	if d, readErr := readDescriptor(cfg.DataDir, cfg.SessionID); readErr == nil && processalive.Alive(d.PID) {
 		return nil, fmt.Errorf("%w: %w", ErrOwnershipInconclusive, lastErr)
+	}
+	evidence, evidenceErr := readStartupEvidence(cfg.DataDir, cfg.SessionID)
+	if evidenceErr != nil {
+		return nil, fmt.Errorf("start chat host: %w: startup evidence invalid", lastErr)
+	}
+	if startupErr := startupErrorFromEvidence(evidence); startupErr != nil {
+		return nil, startupErr
 	}
 	return nil, fmt.Errorf("start chat host: %w", lastErr)
 }
@@ -590,8 +603,16 @@ func providerEnvironment(env []string) []string {
 }
 
 // Run owns the provider until it exits or an authenticated shutdown arrives.
-func Run(ctx context.Context, cfg Config) error {
+func Run(ctx context.Context, cfg Config) (err error) {
+	startupFailure := startupEvidence{Version: startupEvidenceVersion}
+	defer func() {
+		if err != nil && startupFailure.Stage != "" &&
+			!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			_ = writeStartupEvidence(cfg.DataDir, cfg.SessionID, startupFailure)
+		}
+	}()
 	if len(cfg.Argv) == 0 || !filepath.IsAbs(cfg.Workdir) {
+		startupFailure.Stage = StartupStageConfig
 		return errors.New("chat host requires provider argv and absolute workdir")
 	}
 	diagnostics, diagnosticsErr := openHostDiagnosticsFromFD()
@@ -600,6 +621,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer func() { _ = diagnostics.Close() }()
 	diagnostics.Event("startup")
+	startupFailure.Stage = StartupStageLock
 	releaseLock, err := acquireHostLock(cfg.DataDir, cfg.SessionID)
 	if err != nil {
 		diagnostics.Event("host lock failed")
@@ -607,10 +629,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	diagnostics.Event("host lock acquired")
 	defer releaseLock()
+	if clearErr := clearStartupEvidence(cfg.DataDir, cfg.SessionID); clearErr != nil {
+		return clearErr
+	}
+	startupFailure.Stage = StartupStageToken
 	token, err := randomToken()
 	if err != nil {
 		return err
 	}
+	startupFailure.Stage = StartupStageListener
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -627,6 +654,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	child.Env = providerEnvironment(childEnv)
 	configureProviderProcess(child)
+	startupFailure.Stage = StartupStageProviderPipe
 	stdin, err := child.StdinPipe()
 	if err != nil {
 		return err
@@ -636,6 +664,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 	child.Stderr = io.Discard
+	startupFailure.Stage = StartupStageProviderStart
 	closeProviderTree, err := startProviderProcess(child)
 	if err != nil {
 		diagnostics.Event("provider start failed")
@@ -651,6 +680,7 @@ func Run(ctx context.Context, cfg Config) error {
 		OwnershipFingerprint: cfg.OwnershipFingerprint,
 		Address:              listener.Addr().String(), Token: token, PID: os.Getpid(), StartedAt: time.Now().UTC(),
 	}
+	startupFailure.Stage = StartupStageDescriptor
 	if err := writeDescriptor(cfg.DataDir, d); err != nil {
 		diagnostics.Event("descriptor write failed")
 		_ = killProviderProcess(context.WithoutCancel(ctx), child)
@@ -666,6 +696,7 @@ func Run(ctx context.Context, cfg Config) error {
 		shutdown: make(chan struct{}),
 	}
 	if cfg.Protocol == ProtocolACP {
+		startupFailure.Stage = StartupStageACPRelay
 		h.acp, err = newACPRelay(ctx, filepath.Join(filepath.Dir(path), "acp-prompt.journal"))
 		if err != nil {
 			diagnostics.Event("ACP relay failed")
@@ -702,6 +733,7 @@ func Run(ctx context.Context, cfg Config) error {
 	var runErr error
 	select {
 	case runErr = <-providerDone:
+		startupFailure.Stage = StartupStageProviderExit
 		_ = killProviderProcess(context.WithoutCancel(ctx), child)
 	case <-h.shutdown:
 		stopProvider()
@@ -710,12 +742,17 @@ func Run(ctx context.Context, cfg Config) error {
 		stopProvider()
 	case err := <-acceptDone:
 		if err != nil && !errors.Is(err, net.ErrClosed) {
+			startupFailure.Stage = StartupStageAccept
 			_ = killProviderProcess(context.WithoutCancel(ctx), child)
 			return err
 		}
 	}
 	_ = listener.Close()
 	_ = child.Wait()
+	if child.ProcessState != nil {
+		startupFailure.ProviderExited = true
+		startupFailure.ProviderExitCode = child.ProcessState.ExitCode()
+	}
 	return runErr
 }
 

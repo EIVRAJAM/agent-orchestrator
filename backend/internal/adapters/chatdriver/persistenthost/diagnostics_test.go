@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -262,7 +263,7 @@ func TestProviderDoesNotInheritDiagnosticFD(t *testing.T) {
 	}
 }
 
-func TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsHostError(t *testing.T) {
+func TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsStartupEvidence(t *testing.T) {
 	dir := t.TempDir()
 	closed, err := os.Create(filepath.Join(dir, "closed.events.log"))
 	if err != nil {
@@ -285,7 +286,14 @@ func TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsHostError(t *test
 	if strings.Contains(message, "chat host diagnostics") {
 		t.Fatalf("diagnostic failure replaced the host result: %v", err)
 	}
-	if !strings.Contains(message, "start chat host") || !strings.Contains(message, "host.json") {
-		t.Fatalf("ConnectOrStart error = %v, want the current host-descriptor error", err)
+	var startupErr *StartupError
+	if !errors.As(err, &startupErr) {
+		t.Fatalf("ConnectOrStart error = %T %v, want StartupError", err, err)
+	}
+	if startupErr.Stage != StartupStageProviderStart {
+		t.Fatalf("startup stage = %q, want %q", startupErr.Stage, StartupStageProviderStart)
+	}
+	if strings.Contains(message, "/definitely/missing-provider-binary") {
+		t.Fatalf("startup error leaked provider argv: %v", err)
 	}
 }

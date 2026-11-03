@@ -19,14 +19,17 @@ modes through the same session, lifecycle, workspace, storage, and observation
 boundaries.
 
 The ACP host is launched as a detached process. `ConnectOrStart` waits for the
-host to publish `host.json` before it can attach. If the provider fails before
-that descriptor is published, the parent does not receive the provider's
-original error; it observes the descriptor/connection failure after its current
-wait expires. `TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsHostError`
-pins that observable contract. The test-only host diagnostics capture bounded,
-sanitized lifecycle evidence and host streams under the test's temporary
-directory (provider stderr remains discarded), but they neither prove nor fix
-the intermittent `host.json` failure.
+host to publish `host.json` before it can attach. If the host fails during
+startup, it writes an atomic, bounded startup record containing only a fixed
+stage and, when applicable, the provider exit code; `ConnectOrStart` reads that
+record after its existing wait expires and returns typed `StartupError`
+evidence. The record never contains provider stderr, prompt or issue text,
+argv, environment, paths, or arbitrary provider messages.
+`TestConnectOrStartInvalidDiagnosticsProviderFailureReturnsStartupEvidence` and
+`TestRunRecordsProviderExitStartupEvidence` pin the parent and child sides of
+that contract. The test-only host diagnostics remain separate, bounded
+lifecycle evidence under the test's temporary directory (provider stderr
+remains discarded).
 
 ## Table of contents
 
