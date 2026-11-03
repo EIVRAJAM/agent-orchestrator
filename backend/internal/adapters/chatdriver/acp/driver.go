@@ -209,6 +209,17 @@ func (d *Driver) discoverConfigOptions(ctx context.Context, workingDir string) (
 // Harness identifies the AO harness this ACP transport adapts.
 func (d *Driver) Harness() domain.AgentHarness { return d.cfg.Harness }
 
+// SupportsBackgroundRestrictions is false: ACP exposes provider-native
+// approval/read-only modes, not an OS or network sandbox that AO can prove for
+// background work.
+func (*Driver) SupportsBackgroundRestrictions() bool { return false }
+
+// BackgroundRestrictionReason explains the fail-closed boundary without
+// claiming that an ACP approval mode is a sandbox.
+func (*Driver) BackgroundRestrictionReason() string {
+	return "ACP provider-native approval modes are not an OS or network sandbox"
+}
+
 // Probe checks the provider binding without creating an ACP session or worktree.
 func (d *Driver) Probe(ctx context.Context) (ports.ChatCapabilities, error) {
 	if d.cfg.Probe == nil || d.cfg.Launch == nil {

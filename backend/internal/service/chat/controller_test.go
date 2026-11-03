@@ -400,6 +400,8 @@ type fakeDriver struct {
 	resume    func(ports.ChatResumeConfig) (ports.ChatConversation, error)
 }
 
+func (fakeDriver) SupportsBackgroundRestrictions() bool { return true }
+
 type sequenceDriver struct {
 	mu            sync.Mutex
 	conversations []ports.ChatConversation

@@ -81,6 +81,10 @@ var (
 	// ErrChatCapabilityUnavailable means an explicit tuning value was requested
 	// but the provider did not advertise the matching live capability.
 	ErrChatCapabilityUnavailable = errors.New("chat model capability unavailable")
+	// ErrChatBackgroundRestrictions means a background task requires both
+	// read-only workspace access and network isolation that the selected driver
+	// cannot guarantee. The task must be rejected before a provider starts.
+	ErrChatBackgroundRestrictions = errors.New("chat background restrictions unavailable")
 	// ErrChatHistoryLoadFailed means one provider transcript load did not
 	// produce a replay: the ACP session/load answered with a provider-side
 	// failure (JSON-RPC -32603 "Internal error"), or a single load attempt ran
@@ -1156,6 +1160,39 @@ type ChatEvent struct {
 	// Err carries display text and optional typed causes. Its presence does not
 	// imply the conversation is over; check Kind and ControllerState.
 	Err error
+}
+
+// ChatBackgroundRestrictionSupport is implemented by drivers that can enforce
+// both read-only workspace access and network isolation for background tasks.
+// A driver that does not implement it, or returns false, is rejected before any
+// provider process starts.
+type ChatBackgroundRestrictionSupport interface {
+	SupportsBackgroundRestrictions() bool
+}
+
+// ChatBackgroundRestrictionReason lets a driver explain why it cannot enforce
+// the background restrictions without exposing provider error text.
+type ChatBackgroundRestrictionReason interface {
+	BackgroundRestrictionReason() string
+}
+
+// ChatBackgroundRestrictionsError reports a fail-closed background rejection.
+type ChatBackgroundRestrictionsError struct {
+	Harness domain.AgentHarness
+	Reason  string
+}
+
+func (e *ChatBackgroundRestrictionsError) Error() string {
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "the selected driver has no enforceable read-only and network-isolation policy"
+	}
+	return fmt.Sprintf("%s: %s cannot guarantee read-only workspace and network isolation for background tasks: %s; task was not started",
+		ErrChatBackgroundRestrictions, e.Harness, reason)
+}
+
+func (e *ChatBackgroundRestrictionsError) Unwrap() error {
+	return ErrChatBackgroundRestrictions
 }
 
 // ChatDriver opens conversations for one harness.

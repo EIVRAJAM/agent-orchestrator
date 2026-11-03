@@ -445,6 +445,13 @@ cancellation stop the child host before provider deletion; unsupported deletion
 can leave provider-side history, and genuine deletion failures retain ownership
 for retry through an active parent of the same harness.
 
+Background title and suggestion tasks require a driver-enforced read-only
+workspace **and** network isolation. Codex can enforce both through its native
+sandbox. ACP exposes provider-native approval modes, but those are not an OS or
+network sandbox, so ACP background tasks are rejected with a typed error before
+AO creates an ID, starts a provider, or sends a prompt. Unreal Agent likewise
+has no read-only sandbox. This is a fail-closed boundary, not an automatic
+retry or queue state.
 
 ```mermaid
 sequenceDiagram

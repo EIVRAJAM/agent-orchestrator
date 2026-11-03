@@ -29,6 +29,88 @@ func (c *backgroundTestConversation) StartDeferredTurn(providerTurnID string) er
 }
 func (*backgroundTestConversation) DiscardDeferredTurn(string) {}
 
+type unsupportedBackgroundDriver struct {
+	startCalls int
+}
+
+func (*unsupportedBackgroundDriver) Harness() domain.AgentHarness {
+	return domain.HarnessClaudeCode
+}
+func (*unsupportedBackgroundDriver) Probe(context.Context) (ports.ChatCapabilities, error) {
+	return nil, nil
+}
+func (*unsupportedBackgroundDriver) BackgroundRestrictionReason() string {
+	return "ACP provider-native approval modes are not an OS or network sandbox"
+}
+func (d *unsupportedBackgroundDriver) Start(context.Context, ports.ChatStartConfig) (ports.ChatConversation, error) {
+	d.startCalls++
+	return nil, errors.New("background start must not be called")
+}
+func (*unsupportedBackgroundDriver) Resume(context.Context, ports.ChatResumeConfig) (ports.ChatConversation, error) {
+	return nil, errors.New("background resume must not be called")
+}
+
+func TestRunBackgroundTaskRejectsUnsupportedRestrictionsBeforeStart(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	before, err := st.ListSessions(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &unsupportedBackgroundDriver{}
+	idCalls := 0
+	service := chatsvc.New(chatsvc.Options{
+		Store:   st,
+		Drivers: fakeRegistry{driver: driver},
+		NewID: func() string {
+			idCalls++
+			return "must-not-be-used"
+		},
+	})
+
+	_, err = service.RunBackgroundTask(ctx, domain.HarnessClaudeCode, ports.ChatStartConfig{}, "Write a short title")
+	if !errors.Is(err, ports.ErrChatBackgroundRestrictions) {
+		t.Fatalf("error = %v, want ErrChatBackgroundRestrictions", err)
+	}
+	var rejection *ports.ChatBackgroundRestrictionsError
+	if !errors.As(err, &rejection) {
+		t.Fatalf("error = %T, want ChatBackgroundRestrictionsError", err)
+	}
+	if rejection.Harness != domain.HarnessClaudeCode {
+		t.Fatalf("rejected harness = %q, want %q", rejection.Harness, domain.HarnessClaudeCode)
+	}
+	if driver.startCalls != 0 {
+		t.Fatalf("provider Start calls = %d, want 0", driver.startCalls)
+	}
+	if idCalls != 0 {
+		t.Fatalf("background session ID calls = %d, want 0", idCalls)
+	}
+	after, listErr := st.ListSessions(ctx, "")
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("durable sessions changed after rejected background task: before=%d after=%d", len(before), len(after))
+	}
+	for _, want := range []string{"ACP", "read-only", "network isolation", "task was not started"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+}
+
+func TestPromptSuggestionTaskRejectsUnsupportedRestrictionsBeforeFork(t *testing.T) {
+	driver := &unsupportedBackgroundDriver{}
+	service := chatsvc.New(chatsvc.Options{Drivers: fakeRegistry{driver: driver}})
+	_, err := service.RunPromptSuggestionTask(context.Background(), "session-1", "turn-1", domain.HarnessClaudeCode, ports.ChatStartConfig{}, "Suggest a prompt")
+	if !errors.Is(err, ports.ErrChatBackgroundRestrictions) {
+		t.Fatalf("error = %v, want ErrChatBackgroundRestrictions", err)
+	}
+	if driver.startCalls != 0 {
+		t.Fatalf("provider Start calls = %d, want 0", driver.startCalls)
+	}
+}
+
 func TestRunBackgroundTaskUsesNativeDriverAndTerminatesIt(t *testing.T) {
 	conversation := &backgroundTestConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}
 	var started ports.ChatStartConfig

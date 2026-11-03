@@ -97,6 +97,9 @@ surface (`npm run sqlc`, `npm run api`).
   selection must be explicit; native modes and prompts are not OS or network
   isolation. See the [public catalog](../frontend/src/docs/content/plugins/agents/index.mdx)
   and `internal/adapters/reviewer/registry.go` for the current set.
+- Background title/suggestion tasks require a driver-enforced read-only
+  workspace and network isolation. Codex supports both; ACP and Unreal Agent do
+  not, so AO rejects those background tasks before starting a provider.
 - The provider-neutral interactive-reviewer capability gateway and neutral
   AO-owned working-directory contract are available. The experimental
   host-trusted adapters remain candidates for future contained execution once

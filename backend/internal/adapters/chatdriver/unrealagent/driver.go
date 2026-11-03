@@ -57,6 +57,15 @@ var _ ports.ChatDriver = (*Driver)(nil)
 // Harness returns the domain harness owned by this driver.
 func (*Driver) Harness() domain.AgentHarness { return domain.HarnessUnreal }
 
+// SupportsBackgroundRestrictions is false: Unreal Agent has no read-only
+// sandbox and background work would otherwise start without that guarantee.
+func (*Driver) SupportsBackgroundRestrictions() bool { return false }
+
+// BackgroundRestrictionReason explains why Unreal Agent cannot run background tasks.
+func (*Driver) BackgroundRestrictionReason() string {
+	return "Unreal Agent has no read-only sandbox"
+}
+
 func capabilities() ports.ChatCapabilities {
 	return ports.ChatCapabilities{
 		ports.ChatCapabilityStreaming: true,

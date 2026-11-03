@@ -1410,6 +1410,13 @@ func TestACPDriverRunsAfterInitializeBeforeOpeningSession(t *testing.T) {
 	}
 }
 
+func TestACPDriverDoesNotSupportBackgroundRestrictions(t *testing.T) {
+	driver := New(Config{Harness: domain.HarnessClaudeCode}, nil)
+	if driver.SupportsBackgroundRestrictions() {
+		t.Fatal("ACP claimed read-only and network-isolated background support")
+	}
+}
+
 func TestACPDriverAfterInitializeFailureStopsStart(t *testing.T) {
 	agent := &fakeAgent{}
 	driver := New(Config{
