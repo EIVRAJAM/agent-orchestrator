@@ -220,8 +220,10 @@ func TestProviderEnvironmentRemovesHostDiagnosticFD(t *testing.T) {
 	got := providerEnvironment([]string{
 		"PATH=/bin",
 		hostEventsFDEnv + "=3",
+		startupAttemptEnv + "=attempt-a",
 		"AO_CHAT_HOST_PROVIDER_HELPER=1",
 		hostEventsFDEnv + "=4",
+		startupAttemptEnv + "=attempt-b",
 	})
 	want := []string{"PATH=/bin", "AO_CHAT_HOST_PROVIDER_HELPER=1"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {

@@ -7,11 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 const startupEvidenceVersion = 1
 
-const startupEvidenceFileName = "host.startup.json"
+const (
+	startupEvidenceFileName = "host.startup.json"
+	startupAttemptEnv       = "AO_CHAT_HOST_STARTUP_ATTEMPT"
+)
 
 // StartupStage is a closed, bounded classification of a detached host startup
 // failure. It deliberately carries no provider message, argv, environment, or
@@ -46,6 +50,7 @@ func (s StartupStage) valid() bool {
 
 type startupEvidence struct {
 	Version          int          `json:"version"`
+	AttemptID        string       `json:"attemptId"`
 	Stage            StartupStage `json:"stage"`
 	ProviderExited   bool         `json:"providerExited,omitempty"`
 	ProviderExitCode int          `json:"providerExitCode,omitempty"`
@@ -80,6 +85,9 @@ func writeStartupEvidence(dataDir, sessionID string, evidence startupEvidence) e
 	if !evidence.Stage.valid() {
 		return errors.New("invalid chat host startup stage")
 	}
+	if len(evidence.AttemptID) < 16 || len(evidence.AttemptID) > 128 {
+		return errors.New("invalid chat host startup attempt id")
+	}
 	path, err := startupEvidencePath(dataDir, sessionID)
 	if err != nil {
 		return err
@@ -104,7 +112,10 @@ func writeStartupEvidence(dataDir, sessionID string, evidence startupEvidence) e
 	return os.Chmod(path, 0o600)
 }
 
-func readStartupEvidence(dataDir, sessionID string) (*startupEvidence, error) {
+func readStartupEvidence(dataDir, sessionID, attemptID string) (*startupEvidence, error) {
+	if attemptID == "" {
+		return nil, nil
+	}
 	path, err := startupEvidencePath(dataDir, sessionID)
 	if err != nil {
 		return nil, err
@@ -120,13 +131,23 @@ func readStartupEvidence(dataDir, sessionID string) (*startupEvidence, error) {
 	if err := json.Unmarshal(payload, &evidence); err != nil {
 		return nil, errors.New("invalid chat host startup evidence")
 	}
+	if evidence.AttemptID != attemptID {
+		return nil, nil
+	}
 	if evidence.Version != startupEvidenceVersion || !evidence.Stage.valid() {
 		return nil, errors.New("invalid chat host startup evidence")
 	}
 	return &evidence, nil
 }
 
-func clearStartupEvidence(dataDir, sessionID string) error {
+func clearStartupEvidence(dataDir, sessionID, attemptID string) error {
+	if attemptID == "" {
+		return nil
+	}
+	evidence, err := readStartupEvidence(dataDir, sessionID, attemptID)
+	if err != nil || evidence == nil {
+		return err
+	}
 	path, err := startupEvidencePath(dataDir, sessionID)
 	if err != nil {
 		return err
@@ -135,6 +156,24 @@ func clearStartupEvidence(dataDir, sessionID string) error {
 		return err
 	}
 	return nil
+}
+
+func withStartupAttemptEnv(env []string, attemptID string) []string {
+	if attemptID == "" {
+		return env
+	}
+	if env == nil {
+		env = os.Environ()
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && name == startupAttemptEnv {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, startupAttemptEnv+"="+attemptID)
 }
 
 func startupErrorFromEvidence(evidence *startupEvidence) error {
