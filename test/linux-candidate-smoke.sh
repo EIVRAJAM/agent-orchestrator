@@ -116,6 +116,262 @@ EOF
 
 chmod 700 "$base/fake/bin/opencode" "$base/fake/fake_acp.py" "$base/fake/fake-shell"
 
+cat > "$base/inspect_procs.py" <<'PY'
+#!/usr/bin/env python3
+"""Inspect /proc without ps and account for process inspection races."""
+
+import argparse
+import errno
+import glob
+import json
+import os
+import sys
+
+
+class Gone(Exception):
+    pass
+
+
+class InspectError(Exception):
+    pass
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except FileNotFoundError as exc:
+        raise Gone(str(exc)) from exc
+    except PermissionError as exc:
+        raise InspectError(f"permission denied: {path}: {exc}") from exc
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            raise Gone(str(exc)) from exc
+        raise InspectError(f"read failed: {path}: {exc}") from exc
+
+
+def read_process(pid, marker):
+    try:
+        stat = read_bytes(f"/proc/{pid}/stat").decode("utf-8", "replace")
+    except Gone:
+        return None
+    close = stat.rfind(")")
+    if close < 0:
+        raise InspectError(f"malformed stat for pid {pid}")
+    fields = stat[close + 2 :].split()
+    if len(fields) < 4:
+        raise InspectError(f"short stat for pid {pid}: {stat!r}")
+    try:
+        ppid = int(fields[1])
+        pgid = int(fields[2])
+        sid = int(fields[3])
+    except ValueError as exc:
+        raise InspectError(f"non-numeric stat for pid {pid}: {stat!r}") from exc
+    name = stat[stat.find("(") + 1 : close]
+    state = fields[0]
+
+    environ = b""
+    if state != "Z":
+        try:
+            environ = read_bytes(f"/proc/{pid}/environ")
+        except Gone:
+            return None
+        except InspectError:
+            # A process can become a zombie between stat and environ. Re-read
+            # stat before deciding whether this is a real inspection failure.
+            try:
+                retry = read_bytes(f"/proc/{pid}/stat").decode("utf-8", "replace")
+            except Gone:
+                return None
+            retry_close = retry.rfind(")")
+            retry_fields = retry[retry_close + 2 :].split() if retry_close >= 0 else []
+            if retry_fields and retry_fields[0] == "Z":
+                environ = b""
+                state = "Z"
+            else:
+                raise
+
+    raw_cmd = b""
+    if state != "Z":
+        try:
+            raw_cmd = read_bytes(f"/proc/{pid}/cmdline")
+        except Gone:
+            return None
+    cmd = " ".join(
+        part.decode("utf-8", "replace")
+        for part in raw_cmd.split(b"\0")
+        if part
+    )
+    if not cmd:
+        cmd = f"[{name}]"
+    marker_value = f"AO_SMOKE_INSTANCE_ID={marker}".encode()
+    marker_present = marker_value in environ.split(b"\0")
+    if "chat-host" in cmd:
+        role = "chat-host"
+    elif "fake_acp.py" in cmd:
+        role = "fake-provider"
+    elif "/resources/daemon/ao" in cmd:
+        role = "daemon"
+    elif "agent-orchestrator" in cmd:
+        role = "app"
+    else:
+        role = "other"
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "pgid": pgid,
+        "sid": sid,
+        "state": state,
+        "name": name,
+        "role": role,
+        "marker": marker_present,
+        "cmd": cmd,
+    }
+
+
+def load_groups(path, app_pid, required):
+    groups = {int(app_pid)}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        if required:
+            raise InspectError(f"missing known-groups file: {path}")
+        return groups
+    except (OSError, ValueError) as exc:
+        raise InspectError(f"invalid known-groups file {path}: {exc}") from exc
+    try:
+        groups.update(int(value) for value in data["groups"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InspectError(f"invalid known-groups payload {path}: {data!r}") from exc
+    return groups
+
+
+def scan(marker, app_pid, groups_file, required_groups):
+    groups = load_groups(groups_file, app_pid, required_groups)
+    records = []
+    errors = []
+    for entry in glob.glob("/proc/[0-9]*"):
+        try:
+            pid = int(os.path.basename(entry))
+            record = read_process(pid, marker)
+        except (ValueError, InspectError) as exc:
+            errors.append(str(exc))
+            continue
+        if record is None:
+            continue
+        if record["marker"]:
+            records.append(record)
+        elif record["state"] == "Z" and (
+            record["pgid"] in groups or record["sid"] in groups
+        ):
+            record["role"] = "orphan-zombie"
+            records.append(record)
+    return records, errors, groups
+
+
+def render(record):
+    kind = "ZOMBIE" if record["state"] == "Z" else "ACTIVE"
+    return (
+        f"{kind} pid={record['pid']} ppid={record['ppid']} "
+        f"pgid={record['pgid']} sid={record['sid']} "
+        f"state={record['state']} role={record['role']} "
+        f"marker={'1' if record['marker'] else '0'} "
+        f"cmd={record['cmd']!r}"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("snapshot", "check"))
+    parser.add_argument("marker")
+    parser.add_argument("app_pid", type=int)
+    parser.add_argument("groups_file")
+    parser.add_argument("--phase", choices=("host", "final"))
+    args = parser.parse_args()
+
+    try:
+        records, errors, groups = scan(
+            args.marker,
+            args.app_pid,
+            args.groups_file,
+            required_groups=args.mode == "check",
+        )
+    except InspectError as exc:
+        print(f"INSPECT_ERROR {exc}")
+        return 12
+
+    records.sort(key=lambda item: item["pid"])
+    if args.mode == "snapshot":
+        if errors:
+            print("INSPECT_ERRORS")
+            for error in errors:
+                print(f"INSPECT_ERROR {error}")
+            return 12
+        for record in records:
+            print(render(record))
+        try:
+            with open(args.groups_file, "w", encoding="utf-8") as fh:
+                json.dump({"groups": sorted(groups)}, fh, sort_keys=True)
+        except OSError as exc:
+            print(f"INSPECT_ERROR writing {args.groups_file}: {exc}")
+            return 12
+        active = sum(record["state"] != "Z" for record in records)
+        zombies = sum(record["state"] == "Z" for record in records)
+        print(
+            f"SNAPSHOT_OK active={active} zombies={zombies} groups={len(groups)}"
+        )
+        return 0
+
+    if args.phase is None:
+        print("INSPECT_ERROR missing --phase for check")
+        return 12
+    if errors:
+        print("INSPECT_ERRORS")
+        for error in errors:
+            print(f"INSPECT_ERROR {error}")
+        return 12
+
+    active = [record for record in records if record["state"] != "Z"]
+    zombies = [record for record in records if record["state"] == "Z"]
+    if args.phase == "host":
+        bad_active = [
+            record
+            for record in active
+            if record["role"] in ("chat-host", "fake-provider")
+        ]
+        if bad_active:
+            for record in bad_active:
+                print(render(record))
+            print(f"HOST_ACTIVE={len(bad_active)}")
+            return 10
+        if zombies:
+            for record in zombies:
+                print(render(record))
+            print(f"INSTANCE_ZOMBIES={len(zombies)}")
+            return 11
+        print(f"PROCESS_CHECK_OK phase=host active={len(active)} zombies=0")
+        return 0
+
+    if active:
+        for record in active:
+            print(render(record))
+        print(f"INSTANCE_ACTIVE={len(active)}")
+        return 10
+    if zombies:
+        for record in zombies:
+            print(render(record))
+        print(f"INSTANCE_ZOMBIES={len(zombies)}")
+        return 11
+    print("PROCESS_CHECK_OK phase=final active=0 zombies=0")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+chmod 700 "$base/inspect_procs.py"
+
 mkdir -p "$base/repo"
 git -C "$base/repo" init -q
 git -C "$base/repo" config user.email smoke@example.invalid
@@ -193,29 +449,6 @@ ao() {
     "$cli" "$@"
 }
 
-smoke_residuals() {
-  local entry pid details
-  for entry in /proc/[0-9]*; do
-    pid="${entry##*/}"
-    [ -r "$entry/environ" ] || continue
-    if tr '\0' '\n' < "$entry/environ" 2>/dev/null | grep -Fxq "AO_SMOKE_INSTANCE_ID=$instance"; then
-      details="$(ps -o pid=,ppid=,pgid=,sid=,stat=,args= -p "$pid" 2>/dev/null || true)"
-      [ -n "$details" ] && printf '%s\n' "$details"
-    fi
-  done
-  return 0
-}
-
-smoke_host_provider_residuals() {
-  local line
-  smoke_residuals | while IFS= read -r line; do
-    case "$line" in
-      *chat-host*|*fake_acp.py*) printf '%s\n' "$line" ;;
-    esac
-  done
-  return 0
-}
-
 ao project add --path "$base/repo" --worker-agent opencode --orchestrator-agent opencode > "$base/project-add.log" 2>&1
 spawn_out="$(ao spawn --project repo --agent opencode --kind worker --mode chat --name "smoke-$label" --skip-agent-check 2>&1)"
 printf '%s\n' "$spawn_out" > "$base/spawn.log"
@@ -281,6 +514,15 @@ if calls != 1 or completed != 1:
 PY
 echo "CHAT_OK label=$label session=$session fake_prompts=1"
 
+# Record the process groups/sessions belonging to this smoke before the host
+# exits, so orphaned zombies can still be attributed to this instance.
+if ! python3 "$base/inspect_procs.py" snapshot "$instance" "$app_pid" "$base/known-groups.json" > "$base/processes-before-kill.txt"; then
+  echo "PROCESS_SNAPSHOT_FAILED label=$label"
+  cat "$base/processes-before-kill.txt" || true
+  exit 1
+fi
+cat "$base/processes-before-kill.txt"
+
 # Terminate the disposable session through its supported CLI. This explicitly
 # gives the detached ACP host permission to close instead of preserving it.
 if ! ao session kill "$session" > "$base/session-kill.log" 2>&1; then
@@ -290,17 +532,23 @@ if ! ao session kill "$session" > "$base/session-kill.log" 2>&1; then
 fi
 echo "SESSION_KILL_OK label=$label"
 
-host_remaining=""
+host_status=1
 for _ in $(seq 1 20); do
-  host_remaining="$(smoke_host_provider_residuals)"
-  [ -z "$host_remaining" ] && break
+  set +e
+  python3 "$base/inspect_procs.py" check "$instance" "$app_pid" "$base/known-groups.json" --phase host > "$base/host-check.txt" 2>&1
+  host_status=$?
+  set -e
+  if [ "$host_status" -eq 0 ] || [ "$host_status" -eq 12 ]; then
+    break
+  fi
   sleep 1
 done
-if [ -n "$host_remaining" ]; then
-  echo "SESSION_HOST_REMAINS label=$label"
-  printf '%s\n' "$host_remaining"
+if [ "$host_status" -ne 0 ]; then
+  echo "SESSION_HOST_NOT_STOPPED label=$label status=$host_status"
+  cat "$base/host-check.txt" || true
   exit 1
 fi
+cat "$base/host-check.txt"
 echo "SESSION_HOST_STOPPED label=$label"
 
 if ! curl -fsS --max-time 3 "http://127.0.0.1:$port/healthz" > /dev/null; then
@@ -479,30 +727,21 @@ if [ "$app_status" -ne 0 ]; then
   exit 1
 fi
 
-remaining=""
+final_status=1
 for _ in $(seq 1 15); do
-  remaining="$(smoke_residuals)"
-  if [ -z "$remaining" ] && ! kill -0 "-$app_pid" 2>/dev/null; then
+  set +e
+  python3 "$base/inspect_procs.py" check "$instance" "$app_pid" "$base/known-groups.json" --phase final > "$base/final-check.txt" 2>&1
+  final_status=$?
+  set -e
+  if [ "$final_status" -eq 0 ] || [ "$final_status" -eq 12 ]; then
     break
   fi
   sleep 1
 done
-if [ -n "$remaining" ]; then
-  echo "SMOKE_PROCESSES_REMAIN:"
-  printf '%s\n' "$remaining"
-  # Emergency cleanup only after marking the smoke failed.
-  while read -r pid _; do
-    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
-  done <<< "$remaining"
-  sleep 2
-  while read -r pid _; do
-    [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
-  done <<< "$remaining"
+if [ "$final_status" -ne 0 ]; then
+  echo "SMOKE_PROCESSES_REMAIN label=$label status=$final_status"
+  cat "$base/final-check.txt" || true
   exit 1
 fi
-if kill -0 "-$app_pid" 2>/dev/null; then
-  echo "APP_PROCESS_GROUP_REMAINS: $app_pid"
-  ps -eo pid=,ppid=,pgid=,sid=,stat=,args= | awk -v p="$app_pid" '$3 == p'
-  exit 1
-fi
+cat "$base/final-check.txt"
 echo "CLEAN_STOP_OK label=$label"

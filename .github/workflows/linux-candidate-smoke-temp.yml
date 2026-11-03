@@ -22,7 +22,9 @@ jobs:
   debian13-appimage:
     name: Debian 13 — AppImage
     runs-on: ubuntu-22.04
-    container: debian:13
+    container:
+      image: debian:13
+      options: --init
     timeout-minutes: 45
     steps:
       - name: Install checkout prerequisites in the disposable Debian container
@@ -110,7 +112,9 @@ jobs:
   debian13-deb:
     name: Debian 13 — deb
     runs-on: ubuntu-22.04
-    container: debian:13
+    container:
+      image: debian:13
+      options: --init
     timeout-minutes: 45
     steps:
       - name: Install checkout prerequisites in the disposable Debian container
@@ -198,7 +202,9 @@ jobs:
   rocky9-rpm:
     name: Rocky Linux 9.6 — rpm
     runs-on: ubuntu-22.04
-    container: rockylinux/rockylinux:9.6
+    container:
+      image: rockylinux/rockylinux:9.6
+      options: --init
     timeout-minutes: 45
     steps:
       - name: Install checkout prerequisites in the disposable Rocky container
