@@ -193,6 +193,29 @@ ao() {
     "$cli" "$@"
 }
 
+smoke_residuals() {
+  local entry pid details
+  for entry in /proc/[0-9]*; do
+    pid="${entry##*/}"
+    [ -r "$entry/environ" ] || continue
+    if tr '\0' '\n' < "$entry/environ" 2>/dev/null | grep -Fxq "AO_SMOKE_INSTANCE_ID=$instance"; then
+      details="$(ps -o pid=,ppid=,pgid=,sid=,stat=,args= -p "$pid" 2>/dev/null || true)"
+      [ -n "$details" ] && printf '%s\n' "$details"
+    fi
+  done
+  return 0
+}
+
+smoke_host_provider_residuals() {
+  local line
+  smoke_residuals | while IFS= read -r line; do
+    case "$line" in
+      *chat-host*|*fake_acp.py*) printf '%s\n' "$line" ;;
+    esac
+  done
+  return 0
+}
+
 ao project add --path "$base/repo" --worker-agent opencode --orchestrator-agent opencode > "$base/project-add.log" 2>&1
 spawn_out="$(ao spawn --project repo --agent opencode --kind worker --mode chat --name "smoke-$label" --skip-agent-check 2>&1)"
 printf '%s\n' "$spawn_out" > "$base/spawn.log"
@@ -257,6 +280,34 @@ if calls != 1 or completed != 1:
     raise SystemExit("fake ACP must see exactly one session/prompt and one prompt.completed")
 PY
 echo "CHAT_OK label=$label session=$session fake_prompts=1"
+
+# Terminate the disposable session through its supported CLI. This explicitly
+# gives the detached ACP host permission to close instead of preserving it.
+if ! ao session kill "$session" > "$base/session-kill.log" 2>&1; then
+  echo "SESSION_KILL_FAILED label=$label"
+  cat "$base/session-kill.log" || true
+  exit 1
+fi
+echo "SESSION_KILL_OK label=$label"
+
+host_remaining=""
+for _ in $(seq 1 20); do
+  host_remaining="$(smoke_host_provider_residuals)"
+  [ -z "$host_remaining" ] && break
+  sleep 1
+done
+if [ -n "$host_remaining" ]; then
+  echo "SESSION_HOST_REMAINS label=$label"
+  printf '%s\n' "$host_remaining"
+  exit 1
+fi
+echo "SESSION_HOST_STOPPED label=$label"
+
+if ! curl -fsS --max-time 3 "http://127.0.0.1:$port/healthz" > /dev/null; then
+  echo "DAEMON_UNEXPECTEDLY_STOPPED label=$label"
+  exit 1
+fi
+echo "DAEMON_ALIVE_BEFORE_SHUTDOWN label=$label"
 
 shutdown_ok=0
 for _ in $(seq 1 10); do
@@ -427,18 +478,6 @@ if [ "$app_status" -ne 0 ]; then
   tail -100 "$base/app.log" || true
   exit 1
 fi
-
-smoke_residuals() {
-  local entry pid details
-  for entry in /proc/[0-9]*; do
-    pid="${entry##*/}"
-    [ -r "$entry/environ" ] || continue
-    if tr '\0' '\n' < "$entry/environ" 2>/dev/null | grep -Fxq "AO_SMOKE_INSTANCE_ID=$instance"; then
-      details="$(ps -o pid=,ppid=,pgid=,sid=,stat=,args= -p "$pid" 2>/dev/null || true)"
-      [ -n "$details" ] && printf '%s\n' "$details"
-    fi
-  done
-}
 
 remaining=""
 for _ in $(seq 1 15); do
