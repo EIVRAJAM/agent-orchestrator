@@ -2501,6 +2501,57 @@ func TestACPDriverKeepsPermissionPolicyWhenLaterTurnSettingFails(t *testing.T) {
 	}
 }
 
+func TestACPDriverKeepsAppliedPermissionModeWhenLaterOptionFails(t *testing.T) {
+	agent := &fakeAgent{}
+	driver := New(Config{
+		Harness: domain.HarnessCursor,
+		Probe:   func(context.Context) error { return nil },
+		Launch:  func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil },
+		SessionMode: func(permission ports.PermissionMode) string {
+			if ports.NormalizePermissionMode(permission) == ports.PermissionModeAcceptEdits {
+				return "accept-edits"
+			}
+			return ""
+		},
+		SessionOptions: func(settings ports.ChatTurnSettings) []SessionOption {
+			if settings.Effort == "" {
+				return nil
+			}
+			return []SessionOption{{ID: "effort", Value: settings.Effort}}
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	driver.useTestProcess(fakeSpawn(agent))
+
+	opened, err := driver.Start(context.Background(), ports.ChatStartConfig{
+		WorkspacePath: t.TempDir(),
+		Permissions:   ports.PermissionModeBypassPermissions,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer opened.Close()
+	_ = nextEvent(t, opened.Events())
+
+	agent.mu.Lock()
+	agent.configErr = errors.New("set effort failed")
+	agent.mu.Unlock()
+	conv := opened.(*conversation)
+	err = conv.applyTurnSettings(context.Background(), ports.ChatTurnSettings{
+		Approval: ports.PermissionModeAcceptEdits,
+		Effort:   "high",
+	})
+	if err == nil {
+		t.Fatal("applyTurnSettings succeeded, want effort config error")
+	}
+	conv.mu.Lock()
+	mode := conv.permissionMode
+	conv.mu.Unlock()
+	if mode != ports.PermissionModeAcceptEdits {
+		t.Fatalf("permission mode after applied mode + failed option = %q, want %q",
+			mode, ports.PermissionModeAcceptEdits)
+	}
+}
+
 func TestACPDriverAppliesModelBeforeModelDependentMode(t *testing.T) {
 	agent := &fakeAgent{modeRequiresOption: SessionOption{
 		ID: "model", Value: "claude-opus-4-6",
