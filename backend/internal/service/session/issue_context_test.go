@@ -169,6 +169,25 @@ func TestTrackerIDForIssue_PlainNumberGitLabDotCom(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeIssueIDRoundTripsIntakeAndManualSpawn(t *testing.T) {
+	svc := NewWithDeps(Deps{SCM: staticSCM{repo: ports.SCMRepo{
+		Provider: "github", Owner: "acme", Name: "repo", Repo: "acme/repo",
+	}}, Tracker: &fakeTracker{}})
+	project := domain.ProjectRecord{RepoOriginURL: "https://github.com/acme/repo.git"}
+
+	canonical := svc.canonicalizeIssueID(ports.SpawnConfig{IssueID: "42"}, project)
+	if canonical.IssueID != "github:acme/repo#42" {
+		t.Fatalf("manual issue ID = %q, want github:acme/repo#42", canonical.IssueID)
+	}
+	id, ok := svc.trackerIDForIssue(ports.SpawnConfig{IssueID: canonical.IssueID}, project)
+	if !ok || id.Provider != domain.TrackerProviderGitHub || id.Native != "acme/repo#42" {
+		t.Fatalf("canonical round trip = %+v, %v", id, ok)
+	}
+	if got := domain.CanonicalIssueID(id); got != canonical.IssueID {
+		t.Fatalf("round trip = %q, want %q", got, canonical.IssueID)
+	}
+}
+
 func TestTrackerIDForIssue_PlainNumberGitHub(t *testing.T) {
 	svc := NewWithDeps(Deps{SCM: staticSCM{repo: ports.SCMRepo{
 		Provider: "github",

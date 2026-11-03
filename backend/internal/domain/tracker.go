@@ -30,6 +30,24 @@ type TrackerID struct {
 	Host string `json:"host,omitempty"`
 }
 
+// CanonicalIssueID stores tracker issue ids with the provider included, so
+// intake and manual spawn deduplication share one identity format.
+func CanonicalIssueID(id TrackerID) IssueID {
+	provider := id.Provider
+	if provider == "" {
+		provider = TrackerProviderGitHub
+	}
+	native := strings.TrimSpace(id.Native)
+	if native == "" {
+		return ""
+	}
+	host := strings.TrimSpace(id.Host)
+	if host != "" {
+		return IssueID(string(provider) + ":" + native + "@" + host)
+	}
+	return IssueID(string(provider) + ":" + native)
+}
+
 // NormalizedIssueState is the cross-provider issue-state vocabulary every
 // adapter must implement. The closed list is intentional — adding a value
 // here is a port-level decision because every adapter must map it.
