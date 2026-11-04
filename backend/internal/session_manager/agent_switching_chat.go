@@ -222,7 +222,12 @@ func (m *Manager) executeChatAgentSwitch(
 		return result, fmt.Errorf("switch Chat agent %s: close optional source handoff: %w", id, err)
 	}
 	recorder.boundary(domain.AgentSwitchFailureChatSourceQuiesce)
-	if err := handoff.PrepareChatHandoff(
+	if withReason, ok := handoff.(chatHandoffReasonLauncher); ok {
+		if err := withReason.PrepareChatHandoffForReason(
+			ctx, id, domain.SessionInterfaceTransitionInterrupt, domain.ChatStopReasonAgentSwitch); err != nil {
+			return result, fmt.Errorf("switch Chat agent %s: quiesce source: %w", id, err)
+		}
+	} else if err := handoff.PrepareChatHandoff(
 		ctx, id, domain.SessionInterfaceTransitionInterrupt); err != nil {
 		return result, fmt.Errorf("switch Chat agent %s: quiesce source: %w", id, err)
 	}
@@ -241,7 +246,7 @@ func (m *Manager) executeChatAgentSwitch(
 	recorder.durable(result)
 
 	recorder.boundary(domain.AgentSwitchFailureSourceControllerStop)
-	if err := m.stopSourceControllerConclusive(rec); err != nil {
+	if err := m.stopSourceControllerConclusive(rec, true); err != nil {
 		recorder.failurePoint = domain.AgentSwitchFailureSourceControllerDrain
 		recorder.callOutcome = domain.AgentSwitchCallEffectUnknown
 		recorder.retain(false)
@@ -638,7 +643,7 @@ func (m *Manager) rollbackStoppedChatAgentSwitchSource(
 	// A target that failed to start can leave its provider host behind. The
 	// session has one host, so the source cannot reopen while the target's
 	// host still owns it under another protocol. Stop it first.
-	if err := m.stopSourceControllerConclusive(current); err != nil {
+	if err := m.stopSourceControllerConclusive(current, false); err != nil {
 		return fmt.Errorf("stop failed target controller: %w", err)
 	}
 	_, err = m.resumeChatController(

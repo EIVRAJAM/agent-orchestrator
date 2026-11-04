@@ -3074,6 +3074,30 @@ func (c *Controller) BeginHandoff(
 	ctx context.Context,
 	policy domain.SessionInterfaceTransitionPolicy,
 ) error {
+	return c.beginHandoff(ctx, policy, domain.ChatStopReasonHandoffInterrupt)
+}
+
+// BeginHandoffWithReason records the operation that initiated an interrupting
+// handoff. It accepts only the two handoff-owned reasons so cleanup cannot turn
+// an explicit termination into one of them.
+func (c *Controller) BeginHandoffWithReason(
+	ctx context.Context,
+	policy domain.SessionInterfaceTransitionPolicy,
+	reason domain.ChatStopReason,
+) error {
+	if policy == domain.SessionInterfaceTransitionInterrupt &&
+		reason != domain.ChatStopReasonHandoffInterrupt &&
+		reason != domain.ChatStopReasonAgentSwitch {
+		return fmt.Errorf("invalid interrupting handoff reason %q", reason)
+	}
+	return c.beginHandoff(ctx, policy, reason)
+}
+
+func (c *Controller) beginHandoff(
+	ctx context.Context,
+	policy domain.SessionInterfaceTransitionPolicy,
+	reason domain.ChatStopReason,
+) error {
 	if err := c.ArmHandoff(ctx, policy); err != nil {
 		return err
 	}
@@ -3086,7 +3110,7 @@ func (c *Controller) BeginHandoff(
 		c.mu.Lock()
 		active := c.pendingTurnID != ""
 		c.mu.Unlock()
-		err := c.recordStopIntentLocked(ctx, domain.ChatStopReasonHandoffInterrupt, false)
+		err := c.recordStopIntentLocked(ctx, reason, false)
 		if err == nil {
 			c.mu.Lock()
 			// An interrupt handoff settles the whole source queue and never

@@ -1551,6 +1551,18 @@ func (s *Service) PrepareChatHandoff(
 	id domain.SessionID,
 	policy domain.SessionInterfaceTransitionPolicy,
 ) error {
+	return s.PrepareChatHandoffForReason(ctx, id, policy, domain.ChatStopReasonHandoffInterrupt)
+}
+
+// PrepareChatHandoffForReason records the operation that initiated an
+// interrupting handoff. Interface handoffs use handoff_interrupt; agent
+// switches use agent_switch.
+func (s *Service) PrepareChatHandoffForReason(
+	ctx context.Context,
+	id domain.SessionID,
+	policy domain.SessionInterfaceTransitionPolicy,
+	reason domain.ChatStopReason,
+) error {
 	controller, err := s.Controller(id)
 	if errors.Is(err, ErrNoController) {
 		// A dead/missing source controller is already quiescent. Session Manager
@@ -1564,7 +1576,7 @@ func (s *Service) PrepareChatHandoff(
 	if controller.State() == ports.ChatControllerStopped {
 		return nil
 	}
-	return controller.BeginHandoff(ctx, policy)
+	return controller.BeginHandoffWithReason(ctx, policy, reason)
 }
 
 // AbortChatHandoff reopens the existing controller when the user cancels before
@@ -1578,6 +1590,17 @@ func (s *Service) AbortChatHandoff(id domain.SessionID) {
 
 // Stop closes a session's controller. Safe to call for a session that has none.
 func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
+	return s.stop(ctx, id, domain.ChatStopReasonSessionTerminated, true)
+}
+
+// StopChatAfterStopIntent terminates a controller whose durability was already
+// recorded by a handoff or agent-switch preparation. It must not write a second
+// Stop episode or move the cutoff.
+func (s *Service) StopChatAfterStopIntent(ctx context.Context, id domain.SessionID) error {
+	return s.stop(ctx, id, "", false)
+}
+
+func (s *Service) stop(ctx context.Context, id domain.SessionID, reason domain.ChatStopReason, record bool) error {
 	owner := domain.SessionConversationOwner(id)
 	gate := s.controllerGate(owner)
 	if err := gate.lock(ctx); err != nil {
@@ -1605,7 +1628,7 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		var stopErr error
 		// A crash can leave durable queued work behind with no live controller.
 		// Explicit termination still owns that queue and must cancel it durably.
-		if s.store != nil {
+		if record && s.store != nil {
 			if conversation, convErr := s.store.ConversationForSession(ctx, id); convErr == nil {
 				generation := ""
 				if s.sessions != nil {
@@ -1616,7 +1639,7 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 					}
 				}
 				if _, recordErr := s.store.RecordStopIntentAndCancelQueued(
-					ctx, conversation.ID, id, "", generation, domain.ChatStopReasonSessionTerminated, s.newID(), s.now(),
+					ctx, conversation.ID, id, "", generation, reason, s.newID(), s.now(),
 				); recordErr != nil {
 					stopErr = errors.Join(stopErr, fmt.Errorf("record terminated chat queue: %w", recordErr))
 				}
@@ -1639,10 +1662,15 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		// Explicit Kill can still retry authenticated shutdown of this owner.
 		hostErr = s.stopProviderHost(ctx, id)
 	}
-	// Explicit Kill is a user-visible termination even when it retires a failed
-	// hibernation. It must consume any queue that accumulated while shutdown was
-	// retrying; a successful hibernate already refuses to admit queued work.
-	terminateErr := controller.TerminateForStop(ctx, domain.ChatStopReasonSessionTerminated)
+	// Explicit termination writes its own reason. A handoff/agent-switch source
+	// cleanup already recorded the operation's reason and cutoff, so it only
+	// terminates the controller.
+	var terminateErr error
+	if record {
+		terminateErr = controller.TerminateForStop(ctx, reason)
+	} else {
+		terminateErr = controller.Terminate(ctx)
+	}
 	err := errors.Join(hostErr, terminateErr)
 	if preserved && !hibernating && s.stopProviderHost != nil {
 		// Close may already have retired this handle (for example after a failed

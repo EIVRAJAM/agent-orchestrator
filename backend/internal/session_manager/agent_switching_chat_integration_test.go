@@ -76,12 +76,25 @@ func (l integrationChatLauncher) PrepareChatHandoff(
 	return l.service.PrepareChatHandoff(ctx, id, policy)
 }
 
+func (l integrationChatLauncher) PrepareChatHandoffForReason(
+	ctx context.Context,
+	id domain.SessionID,
+	policy domain.SessionInterfaceTransitionPolicy,
+	reason domain.ChatStopReason,
+) error {
+	return l.service.PrepareChatHandoffForReason(ctx, id, policy, reason)
+}
+
 func (l integrationChatLauncher) AbortChatHandoff(id domain.SessionID) {
 	l.service.AbortChatHandoff(id)
 }
 
 func (l integrationChatLauncher) StopChat(ctx context.Context, id domain.SessionID) error {
 	return l.service.StopChat(ctx, id)
+}
+
+func (l integrationChatLauncher) StopChatAfterStopIntent(ctx context.Context, id domain.SessionID) error {
+	return l.service.StopChatAfterStopIntent(ctx, id)
 }
 
 type integrationChatConversation struct {

@@ -595,7 +595,9 @@ var _ interface {
 	RunPromptSuggestionTask(context.Context, domain.SessionID, string, domain.AgentHarness, ports.ChatStartConfig, string) (string, error)
 	ArmChatHandoff(context.Context, domain.SessionID, domain.SessionInterfaceTransitionPolicy) error
 	PrepareChatHandoff(context.Context, domain.SessionID, domain.SessionInterfaceTransitionPolicy) error
+	PrepareChatHandoffForReason(context.Context, domain.SessionID, domain.SessionInterfaceTransitionPolicy, domain.ChatStopReason) error
 	AbortChatHandoff(domain.SessionID)
+	StopChatAfterStopIntent(context.Context, domain.SessionID) error
 } = chatLauncher{}
 
 func (c chatLauncher) SupportsChat(harness domain.AgentHarness) bool {
@@ -734,12 +736,25 @@ func (c chatLauncher) PrepareChatHandoff(
 	return c.svc.PrepareChatHandoff(ctx, id, policy)
 }
 
+func (c chatLauncher) PrepareChatHandoffForReason(
+	ctx context.Context,
+	id domain.SessionID,
+	policy domain.SessionInterfaceTransitionPolicy,
+	reason domain.ChatStopReason,
+) error {
+	return c.svc.PrepareChatHandoffForReason(ctx, id, policy, reason)
+}
+
 func (c chatLauncher) AbortChatHandoff(id domain.SessionID) {
 	c.svc.AbortChatHandoff(id)
 }
 
 func (c chatLauncher) StopChat(ctx context.Context, id domain.SessionID) error {
 	return c.svc.StopChat(ctx, id)
+}
+
+func (c chatLauncher) StopChatAfterStopIntent(ctx context.Context, id domain.SessionID) error {
+	return c.svc.StopChatAfterStopIntent(ctx, id)
 }
 
 // reviewPRRefresher lets a review trigger fetch a worker's PR fresh from the
