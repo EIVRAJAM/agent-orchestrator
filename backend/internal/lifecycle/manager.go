@@ -132,6 +132,12 @@ type notificationSink interface {
 	Resolve(ctx context.Context, res ports.NotificationResolution) error
 }
 
+// trackerWritebackSink is the optional lifecycle-to-tracker write-back boundary.
+// Enqueue must stay local/durable; it must never post to a provider inline.
+type trackerWritebackSink interface {
+	Enqueue(ctx context.Context, sessionID domain.SessionID, prURL string) error
+}
+
 // projectConfigLoader resolves a project's config so MarkTerminated can check
 // the ContainerReap opt-out before reaping. A load failure must not fall
 // through to reaping - see ports.ContainerReaper below.
@@ -241,8 +247,9 @@ type Manager struct {
 	// guard is the shared pane-write primitive every reaction nudge goes
 	// through (see sessionguard). Nil when no messenger was wired: reaction
 	// nudges become no-ops but the reducer still runs.
-	guard         *sessionguard.Guard
-	notifications notificationSink
+	guard            *sessionguard.Guard
+	notifications    notificationSink
+	trackerWriteback trackerWritebackSink
 	// completionTerminator is late-bound because Session Manager itself depends
 	// on this lifecycle reducer. It is required before the SCM observer starts.
 	completionTerminator sessionTerminator
@@ -288,6 +295,21 @@ type Manager struct {
 	// adapter via WithUrgentNudgeGate; the default answers false, so an unknown
 	// harness never takes an urgent write while waiting_input.
 	urgentNudgeWaitingInputSafe func(domain.AgentHarness) bool
+}
+
+// SetTrackerWritebackSink late-binds the durable tracker comment outbox. It
+// runs before the SCM observer is started; the lock also keeps a future caller
+// from racing an in-flight observation.
+func (m *Manager) SetTrackerWritebackSink(sink trackerWritebackSink) {
+	m.mu.Lock()
+	m.trackerWriteback = sink
+	m.mu.Unlock()
+}
+
+func (m *Manager) trackerWritebackSink() trackerWritebackSink {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.trackerWriteback
 }
 
 // New builds a Lifecycle Manager over the session store it writes and the messenger it uses for agent nudges.

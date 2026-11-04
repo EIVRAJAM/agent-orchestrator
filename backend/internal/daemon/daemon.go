@@ -69,6 +69,7 @@ import (
 	settingssvc "github.com/aoagents/agent-orchestrator/backend/internal/service/settings"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/systemcheck"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/systeminstall"
+	trackerwriteback "github.com/aoagents/agent-orchestrator/backend/internal/service/trackerwriteback"
 	usagesvc "github.com/aoagents/agent-orchestrator/backend/internal/service/usage"
 	sessionmanager "github.com/aoagents/agent-orchestrator/backend/internal/session_manager"
 	"github.com/aoagents/agent-orchestrator/backend/internal/skillassets"
@@ -572,6 +573,7 @@ func Run() error {
 	// nil-guard and the intake resolver's backoff both tolerate that
 	// (issue #2685).
 	tracker := newMultiTracker(cfg.GitLab, log)
+	trackerWriteback := trackerwriteback.New(store, trackerCommenter(tracker), log, 30*time.Second)
 	codexPlugin := codexagent.New()
 	codexHome, err := codexPlugin.NativeSessionConfigDir(ctx, nil)
 	if err != nil {
@@ -696,6 +698,8 @@ func Run() error {
 		stop()
 		<-reportDeliveryDone
 	}()
+	lcStack.LCM.SetTrackerWritebackSink(trackerWriteback)
+	lcStack.trackerWritebackDone = trackerWriteback.Start(ctx)
 	lcStack.trackerDone = startTrackerIntake(ctx, cfg, store, sessionSvc, tracker, log)
 
 	hostCommands := systemexec.New(cfg.DataDir)

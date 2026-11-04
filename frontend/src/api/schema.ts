@@ -4766,6 +4766,9 @@ export interface components {
             selection: string;
             sourceRole: string;
         };
+        DomainTrackerWritebackConfig: {
+            enabled?: boolean;
+        };
         EditConversationMessageRequest: {
             clientMessageId?: string;
             text: string;
@@ -5303,6 +5306,7 @@ export interface components {
             sessionPrefix?: string;
             symlinks?: string[];
             trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
+            trackerWriteback?: components["schemas"]["DomainTrackerWritebackConfig"];
             worker?: components["schemas"]["RoleOverride"];
             workersRequestReview?: boolean;
         };

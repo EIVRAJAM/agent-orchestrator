@@ -94,6 +94,11 @@ type trackerIntakeConfig struct {
 	Assignee string `json:"assignee,omitempty"`
 }
 
+// trackerWritebackConfig mirrors domain.TrackerWritebackConfig.
+type trackerWritebackConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
 // reviewerConfig mirrors domain.ReviewerConfig.
 type reviewerConfig struct {
 	Harness     string       `json:"harness"`
@@ -108,21 +113,22 @@ type containerReapConfig struct {
 // client. The CLI sets common fields via flags and the whole object via
 // --config-json.
 type projectConfig struct {
-	ContainerReap     *containerReapConfig `json:"containerReap,omitempty"`
-	CanonicalRepoURL  string               `json:"canonicalRepoURL,omitempty"`
-	DefaultBranch     string               `json:"defaultBranch,omitempty"`
-	SessionPrefix     string               `json:"sessionPrefix,omitempty"`
-	Env               map[string]string    `json:"env,omitempty"`
-	Symlinks          []string             `json:"symlinks,omitempty"`
-	PostCreate        []string             `json:"postCreate,omitempty"`
-	AgentRules        string               `json:"agentRules,omitempty"`
-	AgentRulesFile    string               `json:"agentRulesFile,omitempty"`
-	OrchestratorRules string               `json:"orchestratorRules,omitempty"`
-	AgentConfig       agentConfig          `json:"agentConfig,omitempty"`
-	Worker            roleOverride         `json:"worker,omitempty"`
-	Orchestrator      roleOverride         `json:"orchestrator,omitempty"`
-	TrackerIntake     trackerIntakeConfig  `json:"trackerIntake,omitempty"`
-	AutoReview        bool                 `json:"autoReview,omitempty"`
+	ContainerReap     *containerReapConfig   `json:"containerReap,omitempty"`
+	CanonicalRepoURL  string                 `json:"canonicalRepoURL,omitempty"`
+	DefaultBranch     string                 `json:"defaultBranch,omitempty"`
+	SessionPrefix     string                 `json:"sessionPrefix,omitempty"`
+	Env               map[string]string      `json:"env,omitempty"`
+	Symlinks          []string               `json:"symlinks,omitempty"`
+	PostCreate        []string               `json:"postCreate,omitempty"`
+	AgentRules        string                 `json:"agentRules,omitempty"`
+	AgentRulesFile    string                 `json:"agentRulesFile,omitempty"`
+	OrchestratorRules string                 `json:"orchestratorRules,omitempty"`
+	AgentConfig       agentConfig            `json:"agentConfig,omitempty"`
+	Worker            roleOverride           `json:"worker,omitempty"`
+	Orchestrator      roleOverride           `json:"orchestrator,omitempty"`
+	TrackerIntake     trackerIntakeConfig    `json:"trackerIntake,omitempty"`
+	TrackerWriteback  trackerWritebackConfig `json:"trackerWriteback,omitempty"`
+	AutoReview        bool                   `json:"autoReview,omitempty"`
 	// WorkersRequestReview must round-trip through set-config so a CLI edit
 	// of another field never silently turns it off.
 	WorkersRequestReview bool             `json:"workersRequestReview,omitempty"`
@@ -152,6 +158,7 @@ type projectSetConfigOptions struct {
 	trackerIntake     bool
 	trackerRepo       string
 	trackerAssignee   string
+	trackerWriteback  bool
 	reviewers         []string
 	configJSON        string
 	clear             bool
@@ -345,6 +352,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	f.BoolVar(&opts.trackerIntake, "tracker-intake", false, "Opt this project into issue intake (GitHub or GitLab; provider inferred from git origin). Inert unless the daemon also has AO_TRACKER_INTAKE=on")
 	f.StringVar(&opts.trackerRepo, "tracker-repo", "", "Provider-native repo for issue intake (owner/repo or group/subgroup/repo; default: derive from git origin)")
 	f.StringVar(&opts.trackerAssignee, "tracker-assignee", "", "Issue assignee required for intake eligibility")
+	f.BoolVar(&opts.trackerWriteback, "tracker-writeback", false, "Opt this project into the single tracker write-back: a PR-ready comment when CI is green (default off)")
 	f.StringArrayVar(&opts.reviewers, "reviewer", nil, "Reviewer harness that reviews worker PRs (repeatable; e.g. claude-code)")
 	f.StringVar(&opts.configJSON, "config-json", "", "Full config as a JSON object (overrides field flags)")
 	f.BoolVar(&opts.clear, "clear", false, "Clear all config")
@@ -390,7 +398,8 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 			Repo:     opts.trackerRepo,
 			Assignee: opts.trackerAssignee,
 		},
-		Reviewers: reviewersForFlags(opts.reviewers),
+		TrackerWriteback: trackerWritebackConfig{Enabled: opts.trackerWriteback},
+		Reviewers:        reviewersForFlags(opts.reviewers),
 	}
 	if reflect.DeepEqual(cfg, projectConfig{}) {
 		return projectConfig{}, usageError{errors.New("usage: provide at least one config flag, --config-json, or --clear")}

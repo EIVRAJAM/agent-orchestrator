@@ -156,6 +156,18 @@ func (t *lazyTracker) List(ctx context.Context, repo domain.TrackerRepo, filter 
 	return tracker.List(ctx, repo, filter)
 }
 
+func (t *lazyTracker) CreateIssueComment(ctx context.Context, id domain.TrackerID, body string) (ports.TrackerComment, error) {
+	tracker, err := t.resolve()
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	commenter, ok := tracker.(ports.TrackerCommenter)
+	if !ok {
+		return ports.TrackerComment{}, ports.ErrTrackerCommentUnsupported
+	}
+	return commenter.CreateIssueComment(ctx, id, body)
+}
+
 func (t *lazyTracker) Preflight(ctx context.Context) error {
 	tracker, err := t.resolve()
 	if err != nil {
@@ -182,6 +194,7 @@ func (t *lazyTracker) resolve() (ports.Tracker, error) {
 }
 
 var _ ports.Tracker = (*lazyTracker)(nil)
+var _ ports.TrackerCommenter = (*lazyTracker)(nil)
 
 func logTrackerDisabled(logger *slog.Logger, provider string, err error) {
 	if errors.Is(err, trackergithub.ErrNoToken) || errors.Is(err, trackergitlab.ErrNoToken) {
@@ -189,4 +202,11 @@ func logTrackerDisabled(logger *slog.Logger, provider string, err error) {
 	} else {
 		logger.Warn("tracker disabled: setup failed", "provider", provider, "err", err)
 	}
+}
+
+func trackerCommenter(tracker ports.Tracker) ports.TrackerCommenter {
+	if commenter, ok := tracker.(ports.TrackerCommenter); ok {
+		return commenter
+	}
+	return nil
 }

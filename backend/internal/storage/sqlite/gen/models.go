@@ -785,6 +785,21 @@ type TelemetryEvent struct {
 	PayloadJson string
 }
 
+type TrackerWriteback struct {
+	ID          string
+	ProjectID   string
+	SessionID   string
+	IssueID     string
+	PRURL       string
+	Status      string
+	Attempts    int64
+	CommentURL  string
+	FailureCode string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	ClaimedAt   sql.NullTime
+}
+
 type UsageBinding struct {
 	ID             int64
 	SessionID      domain.SessionID

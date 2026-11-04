@@ -14048,6 +14048,11 @@ components:
       - selection
       - sourceRole
       type: object
+    DomainTrackerWritebackConfig:
+      properties:
+        enabled:
+          type: boolean
+      type: object
     EditConversationMessageRequest:
       properties:
         clientMessageId:
@@ -15471,6 +15476,8 @@ components:
           type: array
         trackerIntake:
           $ref: '#/components/schemas/TrackerIntakeConfig'
+        trackerWriteback:
+          $ref: '#/components/schemas/DomainTrackerWritebackConfig'
         worker:
           $ref: '#/components/schemas/RoleOverride'
         workersRequestReview:

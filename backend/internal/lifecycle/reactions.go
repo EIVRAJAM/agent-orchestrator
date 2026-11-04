@@ -448,6 +448,16 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	if err != nil {
 		return err
 	}
+	if ready {
+		if sink := m.trackerWritebackSink(); sink != nil {
+			prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
+			if prURL != "" {
+				if err := sink.Enqueue(ctx, id, prURL); err != nil {
+					slog.Default().Warn("lifecycle: tracker writeback enqueue failed", "session", id)
+				}
+			}
+		}
+	}
 	intent, err := m.notificationIntentForCurrentSCM(ctx, id, o, ready)
 	if err != nil {
 		return err

@@ -947,3 +947,29 @@ func TestGet_HostCaseInsensitive(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 }
+
+func TestCreateIssueCommentPostsGitLabNote(t *testing.T) {
+	f := newFakeGL(t)
+	tr := newTrackerForTest(t, f)
+	f.on(http.MethodPost, "/projects/acme/demo/issues/12/notes", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":77,"web_url":"https://gitlab.com/acme/demo/-/issues/12#note_77"}`))
+	})
+	comment, err := tr.CreateIssueComment(context.Background(), domain.TrackerID{
+		Provider: domain.TrackerProviderGitLab,
+		Native:   "acme/demo#12",
+	}, "AO: PR ready for review: https://gitlab.com/acme/demo/-/merge_requests/3")
+	if err != nil {
+		t.Fatalf("CreateIssueComment: %v", err)
+	}
+	if comment.ID != "77" || comment.URL != "https://gitlab.com/acme/demo/-/issues/12#note_77" {
+		t.Fatalf("comment = %+v", comment)
+	}
+	calls := f.calls()
+	if len(calls) != 1 || calls[0].Method != http.MethodPost || calls[0].Path != "/projects/acme/demo/issues/12/notes" {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if !strings.Contains(calls[0].Body, `"body":"AO: PR ready for review: https://gitlab.com/acme/demo/-/merge_requests/3"`) {
+		t.Fatalf("comment body = %s", calls[0].Body)
+	}
+}
