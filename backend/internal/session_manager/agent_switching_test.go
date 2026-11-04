@@ -626,8 +626,25 @@ type switchReleaseLCM struct {
 
 type switchAgentChatLauncher struct {
 	*recordingLauncher
-	store *switchTestStore
-	live  bool
+	store           *switchTestStore
+	live            bool
+	preparedReason  domain.ChatStopReason
+	stopAfterIntent bool
+}
+
+func (l *switchAgentChatLauncher) PrepareChatHandoffForReason(
+	ctx context.Context,
+	id domain.SessionID,
+	policy domain.SessionInterfaceTransitionPolicy,
+	reason domain.ChatStopReason,
+) error {
+	l.preparedReason = reason
+	return l.PrepareChatHandoff(ctx, id, policy)
+}
+
+func (l *switchAgentChatLauncher) StopChatAfterStopIntent(ctx context.Context, id domain.SessionID) error {
+	l.stopAfterIntent = true
+	return l.StopChat(ctx, id)
 }
 
 func (l *switchAgentChatLauncher) StartChat(ctx context.Context, cfg ChatStart) (ChatStarted, error) {
@@ -1217,6 +1234,12 @@ func TestAgentSwitchChatControllerReadyUsesSourceGenerationCAS(t *testing.T) {
 	if len(launcher.armed) != 1 || len(launcher.prepared) != 1 || len(launcher.stopped) != 1 {
 		t.Fatalf("Chat ownership boundaries: armed=%v prepared=%v stopped=%v",
 			launcher.armed, launcher.prepared, launcher.stopped)
+	}
+	if launcher.preparedReason != domain.ChatStopReasonAgentSwitch {
+		t.Fatalf("prepared stop reason = %q, want agent_switch", launcher.preparedReason)
+	}
+	if !launcher.stopAfterIntent {
+		t.Fatal("source cleanup did not use StopChatAfterStopIntent")
 	}
 	if len(launcher.turns) != 0 || len(launcher.relayed) != 1 || launcher.relayed[0] != aoTargetActivationPrompt {
 		t.Fatalf("target activation human=%v automation=%v, want one automation turn", launcher.turns, launcher.relayed)

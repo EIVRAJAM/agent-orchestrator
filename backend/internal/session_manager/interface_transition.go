@@ -58,6 +58,19 @@ type chatHandoffLauncher interface {
 	AbortChatHandoff(domain.SessionID)
 }
 
+// chatHandoffReasonLauncher is implemented by the production Chat service so an
+// agent switch can record its own initiating reason instead of handoff_interrupt.
+type chatHandoffReasonLauncher interface {
+	PrepareChatHandoffForReason(context.Context, domain.SessionID, domain.SessionInterfaceTransitionPolicy, domain.ChatStopReason) error
+}
+
+// chatStopAfterIntent is implemented by the production Chat service for a
+// source stop whose reason and cutoff were already recorded by handoff/switch
+// preparation.
+type chatStopAfterIntent interface {
+	StopChatAfterStopIntent(context.Context, domain.SessionID) error
+}
+
 type chatHandoffHistoryStore interface {
 	ConversationForSession(context.Context, domain.SessionID) (domain.ConversationRecord, error)
 	ConversationBranch(context.Context, string, string) (domain.ConversationBranch, error)
@@ -516,7 +529,7 @@ func (m *Manager) runInterfaceTransition(
 	// Retry the idempotent stop under fresh bounded contexts. If it still cannot
 	// be proven stopped, do not launch either controller: recovery is safer than
 	// two writers racing on one native conversation.
-	if err := m.stopSourceControllerConclusive(rec); err != nil {
+	if err := m.stopSourceControllerConclusive(rec, true); err != nil {
 		detail := "AO could not prove that the old controller stopped. Restart AO to reconcile this session before sending more work: " + err.Error()
 		_ = m.finishInterfaceTransition(transition.ID, domain.SessionInterfaceTransitionRecovery,
 			"SOURCE_STOP_UNCERTAIN", detail)
@@ -1126,10 +1139,15 @@ func (m *Manager) abortSourceHandoff(transition domain.SessionInterfaceTransitio
 	}
 }
 
-func (m *Manager) stopSourceController(ctx context.Context, rec domain.SessionRecord) error {
+func (m *Manager) stopSourceController(ctx context.Context, rec domain.SessionRecord, afterStopIntent bool) error {
 	if domain.NormalizeSessionMode(rec.Mode) == domain.SessionModeChat {
 		if m.chat == nil {
 			return nil
+		}
+		if afterStopIntent {
+			if stopper, ok := m.chat.(chatStopAfterIntent); ok {
+				return stopper.StopChatAfterStopIntent(ctx, rec.ID)
+			}
 		}
 		return m.chat.StopChat(ctx, rec.ID)
 	}
@@ -1145,11 +1163,11 @@ func (m *Manager) stopSourceController(ctx context.Context, rec domain.SessionRe
 // tmux command into a conclusive success when the process did in fact exit. Chat
 // Service retains a controller whose event stream has not stopped, so its retry
 // waits for the same process rather than losing the only handle to it.
-func (m *Manager) stopSourceControllerConclusive(rec domain.SessionRecord) error {
+func (m *Manager) stopSourceControllerConclusive(rec domain.SessionRecord, afterStopIntent bool) error {
 	var failures []error
 	for attempt := 0; attempt < 2; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), interfaceTransitionStopLimit)
-		err := m.stopSourceController(ctx, rec)
+		err := m.stopSourceController(ctx, rec, afterStopIntent)
 		cancel()
 		if err == nil {
 			return nil
@@ -1291,7 +1309,7 @@ func (m *Manager) stopTransitionTargetConclusive(ctx context.Context, transition
 	if transition.TargetMode == domain.SessionModeChat && m.chat == nil {
 		return errors.New("cannot confirm target shutdown without Chat service")
 	}
-	return m.stopSourceControllerConclusive(current)
+	return m.stopSourceControllerConclusive(current, false)
 }
 
 func (m *Manager) retainUnconfirmedTransitionTarget(transition domain.SessionInterfaceTransition, cause error) error {
