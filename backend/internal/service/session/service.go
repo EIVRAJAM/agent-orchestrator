@@ -60,6 +60,13 @@ type Store interface {
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 }
 
+// activeIssueSessionStore is the durable lookup used to coalesce intake and
+// manual issue spawns. It stays optional so focused service fakes keep their
+// existing surface; the SQLite store implements it in production.
+type activeIssueSessionStore interface {
+	GetActiveSessionByIssue(ctx context.Context, project domain.ProjectID, issue domain.IssueID) (domain.SessionRecord, bool, error)
+}
+
 // ListFilter captures API-facing session list query filters.
 type ListFilter struct {
 	ProjectID        domain.ProjectID
@@ -202,6 +209,8 @@ type Service struct {
 	runBackground       func(func())
 	orchestratorLocksMu sync.Mutex
 	orchestratorLocks   map[domain.ProjectID]*sync.Mutex
+	issueLocksMu        sync.Mutex
+	issueLocks          map[string]*sync.Mutex
 	workspaceCache      *workspaceCache
 	workspaceManifests  *workspaceManifestIndex
 	workspaceEditsMu    sync.Mutex
@@ -367,6 +376,22 @@ func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			return domain.Session{}, 0, 0, apierr.Invalid("HARNESS_REQUIRED", "harness is required for a standalone session", nil)
 		}
 	}
+	cfg = s.canonicalizeIssueID(cfg, project)
+	if cfg.IssueID != "" && (cfg.Kind == "" || cfg.Kind == domain.KindWorker) {
+		if active, ok := s.store.(activeIssueSessionStore); ok {
+			unlock := s.lockIssue(domain.ProjectID(project.ID), cfg.IssueID)
+			defer unlock()
+			existing, found, err := active.GetActiveSessionByIssue(ctx, domain.ProjectID(project.ID), cfg.IssueID)
+			if err != nil {
+				return domain.Session{}, 0, 0, fmt.Errorf("find active issue session: %w", err)
+			}
+			if found {
+				sess, err := s.toSession(ctx, existing)
+				return sess, 0, 0, err
+			}
+		}
+	}
+
 	if s.agentReadiness != nil && cfg.Harness != "" {
 		readiness, err := s.agentReadiness.EnsureAgentReadiness(ctx, string(cfg.Harness), domain.AgentReadinessPurposeLaunch)
 		if err != nil {
@@ -386,7 +411,6 @@ func (s *Service) spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	if err != nil {
 		return domain.Session{}, 0, 0, fmt.Errorf("count sessions: %w", err)
 	}
-	cfg = s.canonicalizeIssueID(cfg, project)
 	cfg = s.withIssueContext(ctx, cfg, project)
 	rec, promptBytes, systemPromptBytes, err := s.manager.Spawn(ctx, cfg)
 	if err != nil {
@@ -698,6 +722,26 @@ func (s *Service) lockOrchestratorProject(projectID domain.ProjectID) func() {
 		s.orchestratorLocks[projectID] = mu
 	}
 	s.orchestratorLocksMu.Unlock()
+
+	mu.Lock()
+	return mu.Unlock
+}
+
+// lockIssue serializes issue-scoped spawns in this daemon. The durable lookup
+// below handles restarts; this lock closes the check-then-create race between
+// concurrent intake and manual HTTP/CLI requests.
+func (s *Service) lockIssue(project domain.ProjectID, issue domain.IssueID) func() {
+	s.issueLocksMu.Lock()
+	if s.issueLocks == nil {
+		s.issueLocks = make(map[string]*sync.Mutex)
+	}
+	key := string(project) + "\x00" + string(issue)
+	mu := s.issueLocks[key]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.issueLocks[key] = mu
+	}
+	s.issueLocksMu.Unlock()
 
 	mu.Lock()
 	return mu.Unlock

@@ -757,6 +757,24 @@ func (s *Store) GetSession(ctx context.Context, id domain.SessionID) (domain.Ses
 	return getSessionRowToRecord(row), true, nil
 }
 
+// GetActiveSessionByIssue returns the live visible worker for one canonical
+// issue id. Intake and manual spawn both call this through the session service
+// before creating a runtime; terminated sessions deliberately do not block a
+// fresh respawn.
+func (s *Store) GetActiveSessionByIssue(ctx context.Context, project domain.ProjectID, issue domain.IssueID) (domain.SessionRecord, bool, error) {
+	row, err := s.qr.GetActiveSessionIDByIssue(ctx, gen.GetActiveSessionIDByIssueParams{
+		ProjectID: optionalProjectID(project),
+		IssueID:   issue,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.SessionRecord{}, false, nil
+	}
+	if err != nil {
+		return domain.SessionRecord{}, false, fmt.Errorf("find active session for issue %s: %w", issue, err)
+	}
+	return s.GetSession(ctx, row)
+}
+
 // GetSessionByAutomationRunID returns the unique session spawned for a durable
 // automation occurrence, if one exists.
 func (s *Store) GetSessionByAutomationRunID(ctx context.Context, id domain.AutomationRunID) (domain.SessionRecord, bool, error) {
