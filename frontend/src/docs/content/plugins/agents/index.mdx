@@ -102,6 +102,8 @@ Qwen Chat needs version 0.16 or newer; OMP Chat needs version 15 or newer. MiMo 
 
 Chat registration does not imply interface handoff support. Use the switch action and its disabled reason in the session UI. Experimental reviewer modes and prompts do not sandbox tools or network access.
 
+Background title and suggestion tasks require both a read-only workspace and network isolation. Codex provides both; ACP provider modes do not provide an OS or network sandbox, so ACP background tasks are rejected before the provider starts. Native ACP modes are not presented as operating-system or network isolation.
+
 ## Choosing and configuring a harness
 
 ```bash

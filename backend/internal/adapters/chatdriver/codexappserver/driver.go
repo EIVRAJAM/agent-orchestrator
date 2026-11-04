@@ -115,6 +115,10 @@ var _ ports.ChatDriver = (*Driver)(nil)
 // Harness reports which agent this driver serves.
 func (d *Driver) Harness() domain.AgentHarness { return domain.HarnessCodex }
 
+// SupportsBackgroundRestrictions reports that Codex's native sandbox enforces
+// both read-only workspace access and network isolation for background turns.
+func (*Driver) SupportsBackgroundRestrictions() bool { return true }
+
 // capabilities is what a Codex app-server of a supported version provides. Each
 // entry here was exercised against a live app-server rather than read off a doc.
 func capabilities() ports.ChatCapabilities {

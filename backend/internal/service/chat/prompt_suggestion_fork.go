@@ -18,6 +18,9 @@ func (s *Service) RunPromptSuggestionTask(ctx context.Context, id domain.Session
 	if err != nil {
 		return "", err
 	}
+	if err := backgroundRestrictionError(driver, harness); err != nil {
+		return "", err
+	}
 	forker, canFork := driver.(ports.ChatIsolatedForker)
 	// Native children use the desktop launch's existing crash-cleanup journal.
 	// A standalone daemon retains the scratch-conversation fallback.
