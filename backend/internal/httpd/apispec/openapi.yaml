@@ -10742,6 +10742,65 @@ paths:
       summary: Cancel an unclaimed speculative task worktree
       tags:
       - projects
+  /api/v1/tracker/writebacks:
+    get:
+      operationId: listTrackerWritebacks
+      parameters:
+      - description: Optional durable outbox status.
+        in: query
+        name: status
+        schema:
+          description: Optional durable outbox status.
+          enum:
+          - pending
+          - claimed
+          - sent
+          - uncertain
+          - failed
+          type: string
+      - description: Maximum rows to return. Defaults to 50.
+        in: query
+        name: limit
+        schema:
+          description: Maximum rows to return. Defaults to 50.
+          maximum: 100
+          minimum: 1
+          type: integer
+      - description: Rows to skip.
+        in: query
+        name: offset
+        schema:
+          description: Rows to skip.
+          minimum: 0
+          type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControllersListTrackerWritebacksResponse'
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Bad Request
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIError'
+          description: Not Implemented
+      summary: List durable tracker write-back states without changing them
+      tags:
+      - trackers
   /api/v1/usage/memory/pressure:
     get:
       operationId: getMemoryPressure
@@ -12525,6 +12584,24 @@ components:
         deleteArtifacts:
           type: boolean
       type: object
+    ControllersListTrackerWritebacksResponse:
+      properties:
+        hasMore:
+          type: boolean
+        items:
+          items:
+            $ref: '#/components/schemas/ControllersTrackerWritebackView'
+          type: array
+        limit:
+          type: integer
+        offset:
+          type: integer
+      required:
+      - items
+      - limit
+      - offset
+      - hasMore
+      type: object
     ControllersRemoteHostAccountTokenResponse:
       properties:
         hostId:
@@ -12875,6 +12952,39 @@ components:
           type: boolean
       required:
       - enabled
+      type: object
+    ControllersTrackerWritebackView:
+      properties:
+        attempts:
+          type: integer
+        claimedAt:
+          format: date-time
+          type:
+          - "null"
+          - string
+        createdAt:
+          format: date-time
+          type: string
+        failureCode:
+          type: string
+        id:
+          type: string
+        projectId:
+          type: string
+        sessionId:
+          type: string
+        status:
+          type: string
+        updatedAt:
+          format: date-time
+          type: string
+      required:
+      - id
+      - sessionId
+      - status
+      - attempts
+      - createdAt
+      - updatedAt
       type: object
     ControllersUpdateCloudOfferingRequest:
       properties:
@@ -14047,6 +14157,11 @@ components:
       - revision
       - selection
       - sourceRole
+      type: object
+    DomainTrackerWritebackConfig:
+      properties:
+        enabled:
+          type: boolean
       type: object
     EditConversationMessageRequest:
       properties:
@@ -15471,6 +15586,8 @@ components:
           type: array
         trackerIntake:
           $ref: '#/components/schemas/TrackerIntakeConfig'
+        trackerWriteback:
+          $ref: '#/components/schemas/DomainTrackerWritebackConfig'
         worker:
           $ref: '#/components/schemas/RoleOverride'
         workersRequestReview:

@@ -71,6 +71,7 @@ type APIDeps struct {
 	AgentAuth controllers.AgentAuthService
 	// GitHub is the local GitHub PAT + repos surface.
 	GitHub            controllers.GitHubPATService
+	TrackerWritebacks controllers.TrackerWritebackService
 	AgentSwitchPolicy AgentSwitchPolicyControl
 	// LinkPreview unfurls external URLs for the renderer's hover cards; nil
 	// leaves the route answering 501.
@@ -115,36 +116,37 @@ func normalizeAPIDeps(deps APIDeps, log *slog.Logger) APIDeps {
 // API owns one controller per resource and is the single Register call the
 // router invokes to mount the /api/v1 surface.
 type API struct {
-	cfg           config.Config
-	deps          APIDeps
-	agents        *controllers.AgentsController
-	codexAccounts *controllers.CodexAccountsController
-	projects      *controllers.ProjectsController
-	sessions      *controllers.SessionsController
-	automations   *controllers.AutomationsController
-	desktop       *controllers.DesktopWorkspaceController
-	usage         *controllers.UsageController
-	prs           *controllers.PRsController
-	reviews       *controllers.ReviewsController
-	notifications *controllers.NotificationsController
-	reports       *controllers.ReportsController
-	push          *controllers.PushController
-	imports       *controllers.ImportController
-	fs            *controllers.FSController
-	shellTerms    *controllers.ShellTerminalsController
-	cues          *controllers.CuesController
-	conversations *controllers.ConversationsController
-	settings      *controllers.SettingsController
-	dev           *controllers.DevController
-	browser       *controllers.BrowserController
-	system        *controllers.SystemController
-	identity      *controllers.IdentityController
-	endpoints     *controllers.EndpointsController
-	systemInstall *controllers.SystemInstallController
-	agentAuth     *controllers.AgentAuthController
-	linkPreview   *controllers.LinkPreviewController
-	github        *controllers.GitHubController
-	events        *EventsController
+	cfg               config.Config
+	deps              APIDeps
+	agents            *controllers.AgentsController
+	codexAccounts     *controllers.CodexAccountsController
+	projects          *controllers.ProjectsController
+	sessions          *controllers.SessionsController
+	automations       *controllers.AutomationsController
+	desktop           *controllers.DesktopWorkspaceController
+	usage             *controllers.UsageController
+	prs               *controllers.PRsController
+	reviews           *controllers.ReviewsController
+	notifications     *controllers.NotificationsController
+	reports           *controllers.ReportsController
+	push              *controllers.PushController
+	imports           *controllers.ImportController
+	fs                *controllers.FSController
+	shellTerms        *controllers.ShellTerminalsController
+	cues              *controllers.CuesController
+	conversations     *controllers.ConversationsController
+	settings          *controllers.SettingsController
+	dev               *controllers.DevController
+	browser           *controllers.BrowserController
+	system            *controllers.SystemController
+	identity          *controllers.IdentityController
+	endpoints         *controllers.EndpointsController
+	systemInstall     *controllers.SystemInstallController
+	agentAuth         *controllers.AgentAuthController
+	linkPreview       *controllers.LinkPreviewController
+	github            *controllers.GitHubController
+	trackerWritebacks *controllers.TrackerWritebacksController
+	events            *EventsController
 }
 
 // NewAPI constructs the API surface from its dependencies. cfg carries the
@@ -179,30 +181,31 @@ func newAPIWithLogger(cfg config.Config, deps APIDeps, log *slog.Logger) *API {
 			Capabilities:             deps.SessionCapabilities,
 			ShellPreviewCapabilities: deps.ShellPreviewCapabilities,
 		},
-		automations:   &controllers.AutomationsController{Svc: deps.Automations},
-		desktop:       &controllers.DesktopWorkspaceController{Svc: deps.DesktopWorkspaces},
-		usage:         &controllers.UsageController{Svc: deps.UsageSummary, Log: loggerOrDefault(log), Memory: deps.SessionMemory, Steps: deps.SessionSteps, Pressure: memoryPressure(deps.SessionMemory)},
-		prs:           &controllers.PRsController{Svc: deps.PRs},
-		reviews:       &controllers.ReviewsController{Svc: deps.Reviews},
-		notifications: &controllers.NotificationsController{Svc: deps.Notifications, Stream: deps.NotificationStream},
-		reports:       &controllers.ReportsController{Svc: deps.Reports},
-		push:          &controllers.PushController{Registry: deps.Push},
-		imports:       &controllers.ImportController{Svc: deps.Import},
-		fs:            &controllers.FSController{Svc: deps.Directories},
-		shellTerms:    &controllers.ShellTerminalsController{Svc: deps.ShellTerminals},
-		cues:          &controllers.CuesController{Svc: deps.Cues},
-		conversations: &controllers.ConversationsController{Svc: deps.Conversations, Renders: attachmentstore.New(cfg.DataDir)},
-		settings:      &controllers.SettingsController{Svc: deps.Settings},
-		dev:           &controllers.DevController{Import: deps.DevImport},
-		browser:       &controllers.BrowserController{Svc: deps.Browser},
-		system:        &controllers.SystemController{Checks: deps.SystemChecks},
-		identity:      &controllers.IdentityController{HostID: deps.HostID},
-		endpoints:     &controllers.EndpointsController{Source: deps.Endpoints},
-		systemInstall: &controllers.SystemInstallController{Installer: deps.Installer},
-		agentAuth:     &controllers.AgentAuthController{Svc: deps.AgentAuth},
-		linkPreview:   &controllers.LinkPreviewController{Svc: deps.LinkPreview},
-		github:        &controllers.GitHubController{Svc: deps.GitHub},
-		events:        &EventsController{Source: deps.CDC, Live: deps.Events},
+		automations:       &controllers.AutomationsController{Svc: deps.Automations},
+		desktop:           &controllers.DesktopWorkspaceController{Svc: deps.DesktopWorkspaces},
+		usage:             &controllers.UsageController{Svc: deps.UsageSummary, Log: loggerOrDefault(log), Memory: deps.SessionMemory, Steps: deps.SessionSteps, Pressure: memoryPressure(deps.SessionMemory)},
+		prs:               &controllers.PRsController{Svc: deps.PRs},
+		reviews:           &controllers.ReviewsController{Svc: deps.Reviews},
+		notifications:     &controllers.NotificationsController{Svc: deps.Notifications, Stream: deps.NotificationStream},
+		reports:           &controllers.ReportsController{Svc: deps.Reports},
+		push:              &controllers.PushController{Registry: deps.Push},
+		imports:           &controllers.ImportController{Svc: deps.Import},
+		fs:                &controllers.FSController{Svc: deps.Directories},
+		shellTerms:        &controllers.ShellTerminalsController{Svc: deps.ShellTerminals},
+		cues:              &controllers.CuesController{Svc: deps.Cues},
+		conversations:     &controllers.ConversationsController{Svc: deps.Conversations, Renders: attachmentstore.New(cfg.DataDir)},
+		settings:          &controllers.SettingsController{Svc: deps.Settings},
+		dev:               &controllers.DevController{Import: deps.DevImport},
+		browser:           &controllers.BrowserController{Svc: deps.Browser},
+		system:            &controllers.SystemController{Checks: deps.SystemChecks},
+		identity:          &controllers.IdentityController{HostID: deps.HostID},
+		endpoints:         &controllers.EndpointsController{Source: deps.Endpoints},
+		systemInstall:     &controllers.SystemInstallController{Installer: deps.Installer},
+		agentAuth:         &controllers.AgentAuthController{Svc: deps.AgentAuth},
+		linkPreview:       &controllers.LinkPreviewController{Svc: deps.LinkPreview},
+		github:            &controllers.GitHubController{Svc: deps.GitHub},
+		trackerWritebacks: &controllers.TrackerWritebacksController{Svc: deps.TrackerWritebacks},
+		events:            &EventsController{Source: deps.CDC, Live: deps.Events},
 	}
 }
 
@@ -262,6 +265,7 @@ func (a *API) Register(root chi.Router) {
 			a.agentAuth.Register(r)
 			a.linkPreview.Register(r)
 			a.github.Register(r)
+			a.trackerWritebacks.Register(r)
 			// Sibling REST controllers plug in here.
 		})
 		// Long-lived streams intentionally bypass the REST timeout middleware.

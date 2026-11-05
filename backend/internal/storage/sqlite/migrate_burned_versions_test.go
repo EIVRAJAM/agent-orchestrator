@@ -203,6 +203,7 @@ var shippedMigrations = map[int64]string{
 	198: "0198_harness_defaults.sql",
 	199: "0199_conversation_message_continuation.sql",
 	200: "0200_chat_queue_recovery.sql",
+	201: "0201_tracker_writebacks.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

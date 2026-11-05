@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 // recordedReq captures one inbound HTTP request so tests can assert against
@@ -831,6 +832,56 @@ func TestList_RejectsBadRepo(t *testing.T) {
 			_, err := tr.List(ctx(), domain.TrackerRepo{Provider: domain.TrackerProviderGitHub, Native: native}, domain.ListFilter{})
 			if !errors.Is(err, ErrBadID) {
 				t.Fatalf("native=%q: err = %v, want ErrBadID", native, err)
+			}
+		})
+	}
+}
+
+func TestCreateIssueCommentPostsOnlyTheProvidedBody(t *testing.T) {
+	f := newFakeGH(t)
+	tr := newTrackerForTest(t, f)
+	f.on(http.MethodPost, "/repos/acme/demo/issues/12/comments", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":77,"html_url":"https://github.com/acme/demo/issues/12#issuecomment-77"}`))
+	})
+	comment, err := tr.CreateIssueComment(context.Background(), domain.TrackerID{
+		Provider: domain.TrackerProviderGitHub,
+		Native:   "acme/demo#12",
+	}, "AO: PR ready for review: https://github.com/acme/demo/pull/3")
+	if err != nil {
+		t.Fatalf("CreateIssueComment: %v", err)
+	}
+	if comment.ID != "77" || comment.URL != "https://github.com/acme/demo/issues/12#issuecomment-77" {
+		t.Fatalf("comment = %+v", comment)
+	}
+	calls := f.calls()
+	if len(calls) != 1 || calls[0].Method != http.MethodPost || calls[0].Path != "/repos/acme/demo/issues/12/comments" {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if !strings.Contains(calls[0].Body, `"body":"AO: PR ready for review: https://github.com/acme/demo/pull/3"`) {
+		t.Fatalf("comment body = %s", calls[0].Body)
+	}
+}
+
+func TestCreateIssueCommentRejectsMissingOrInvalidReceiptURL(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing": `{"id":77}`,
+		"invalid": `{"id":77,"html_url":"/issuecomment-77"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeGH(t)
+			tr := newTrackerForTest(t, f)
+			f.on(http.MethodPost, "/repos/acme/demo/issues/12/comments", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			})
+			if _, err := tr.CreateIssueComment(context.Background(), domain.TrackerID{
+				Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12",
+			}, "AO: PR ready for review: https://github.com/acme/demo/pull/3"); !errors.Is(err, ports.ErrTrackerCommentReceipt) {
+				t.Fatalf("err = %v, want ErrTrackerCommentReceipt", err)
+			}
+			if len(f.calls()) != 1 {
+				t.Fatalf("calls = %+v, want one POST", f.calls())
 			}
 		})
 	}

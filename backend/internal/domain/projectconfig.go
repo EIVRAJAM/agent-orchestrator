@@ -56,10 +56,12 @@ type ProjectConfig struct {
 	// triggered. It is configured independently of the Worker override; an empty
 	// list falls back to claude-code (see ResolveReviewerHarness).
 	Reviewers []ReviewerConfig `json:"reviewers,omitempty"`
-	// TrackerIntake controls issue-driven worker spawning. It is opt-in and
-	// read-only toward the tracker in v1: matching issues spawn sessions, but the
-	// tracker is not commented on or transitioned.
+	// TrackerIntake controls issue-driven worker spawning.
 	TrackerIntake TrackerIntakeConfig `json:"trackerIntake,omitempty"`
+	// TrackerWriteback is an independent, default-off opt-in for the single
+	// outbound tracker mutation AO permits: a short deterministic PR-ready
+	// comment. It never closes issues or changes labels/assignees.
+	TrackerWriteback TrackerWritebackConfig `json:"trackerWriteback,omitempty"`
 
 	// ContainerReap controls whether AO reaps a worker session's ao.session-
 	// labeled Docker containers on terminal state / kill. Enabled by default;
@@ -83,6 +85,12 @@ type ProjectConfig struct {
 	// the feature but check with the user or orchestrator before using it.
 	// Read at spawn, when the worker prompt is built.
 	WorkersRequestReview bool `json:"workersRequestReview,omitempty"`
+}
+
+// TrackerWritebackConfig controls the optional tracker comment emitted when a
+// session's PR is ready for review and CI is green. Zero value is disabled.
+type TrackerWritebackConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
 }
 
 // ContainerReapConfig is the project-level opt-out for #2652's Docker

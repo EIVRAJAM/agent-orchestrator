@@ -181,6 +181,8 @@ func TestTelemetryMetaClassifiesRegisteredCommandPaths(t *testing.T) {
 		"ao mcp":                     {},
 		"ao pty-host":                {},
 		"ao start":                   {},
+		"ao tracker":                 {},
+		"ao tracker writebacks":      {},
 		"ao unreal-provider":         {},
 	}
 

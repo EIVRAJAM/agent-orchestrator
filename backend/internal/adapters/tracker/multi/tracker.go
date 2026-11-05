@@ -70,6 +70,20 @@ func (m *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter doma
 	return t.List(ctx, repo, filter)
 }
 
+// CreateIssueComment delegates to the sub-tracker matching id.Provider when
+// that adapter implements the optional write capability.
+func (m *Tracker) CreateIssueComment(ctx context.Context, id domain.TrackerID, body string) (ports.TrackerComment, error) {
+	t, err := m.resolve(string(id.Provider))
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	commenter, ok := t.(ports.TrackerCommenter)
+	if !ok {
+		return ports.TrackerComment{}, ports.ErrTrackerCommentUnsupported
+	}
+	return commenter.CreateIssueComment(ctx, id, body)
+}
+
 // Preflight probes every registered sub-tracker. The first error is
 // returned, but all trackers are probed so a transient failure from one
 // does not mask a successful verification from another. When no
@@ -88,3 +102,4 @@ func (m *Tracker) Preflight(ctx context.Context) error {
 
 // Statically assert Tracker satisfies the port.
 var _ ports.Tracker = (*Tracker)(nil)
+var _ ports.TrackerCommenter = (*Tracker)(nil)

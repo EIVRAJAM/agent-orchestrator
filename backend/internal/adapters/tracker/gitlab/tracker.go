@@ -182,6 +182,7 @@ func (t *Tracker) ConfigForHost(host string) error {
 // Statically assert Tracker satisfies the port. If this stops compiling, the
 // port shape changed and the adapter needs to follow.
 var _ ports.Tracker = (*Tracker)(nil)
+var _ ports.TrackerCommenter = (*Tracker)(nil)
 
 // ---------------------------------------------------------------------------
 // Get
@@ -336,6 +337,41 @@ func (t *Tracker) List(ctx context.Context, repo domain.TrackerRepo, filter doma
 		path = nextPath
 	}
 	return out, nil
+}
+
+// CreateIssueComment posts one issue note with the already-authenticated
+// tracker credential. The caller owns the body policy; the adapter only writes
+// the exact body it receives.
+func (t *Tracker) CreateIssueComment(ctx context.Context, id domain.TrackerID, body string) (ports.TrackerComment, error) {
+	projectPath, iid, err := t.parseID(id)
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	he, err := t.configForHost(id.Host)
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	body = strings.TrimSpace(body)
+	if body == "" || len(body) > 60000 {
+		return ports.TrackerComment{}, fmt.Errorf("gitlab tracker: invalid comment body length")
+	}
+	path := fmt.Sprintf("/projects/%s/issues/%d/notes", url.PathEscape(projectPath), iid)
+	resp, err := t.do(ctx, he, http.MethodPost, path, map[string]string{"body": body})
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	var raw struct {
+		ID     int64  `json:"id"`
+		WebURL string `json:"web_url"`
+	}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return ports.TrackerComment{}, fmt.Errorf("gitlab tracker: decode note: %w", err)
+	}
+	comment := ports.TrackerComment{ID: strconv.FormatInt(raw.ID, 10), URL: raw.WebURL}
+	if !ports.ValidTrackerCommentURL(comment.URL) {
+		return ports.TrackerComment{}, fmt.Errorf("%w: missing or invalid comment URL", ports.ErrTrackerCommentReceipt)
+	}
+	return comment, nil
 }
 
 // ---------------------------------------------------------------------------

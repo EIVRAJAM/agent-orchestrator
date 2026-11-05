@@ -48,6 +48,39 @@ func CanonicalIssueID(id TrackerID) IssueID {
 	return IssueID(string(provider) + ":" + native)
 }
 
+// ParseCanonicalIssueID decodes the provider-qualified identity AO stores in
+// sessions.issue_id. It rejects malformed or empty identities so write-back
+// never guesses a tracker target.
+func ParseCanonicalIssueID(raw string) (TrackerID, bool) {
+	raw = strings.TrimSpace(raw)
+	provider, native, ok := strings.Cut(raw, ":")
+	if !ok || (provider != string(TrackerProviderGitHub) && provider != string(TrackerProviderGitLab)) {
+		return TrackerID{}, false
+	}
+	host := ""
+	if provider == string(TrackerProviderGitLab) {
+		if at := strings.LastIndexByte(native, '@'); at > 0 {
+			host = strings.TrimSpace(native[at+1:])
+			native = native[:at]
+		}
+	}
+	native = strings.TrimSpace(native)
+	hash := strings.LastIndexByte(native, '#')
+	if hash <= 0 || hash == len(native)-1 {
+		return TrackerID{}, false
+	}
+	number := strings.TrimSpace(native[hash+1:])
+	if number == "" {
+		return TrackerID{}, false
+	}
+	for _, r := range number {
+		if r < '0' || r > '9' {
+			return TrackerID{}, false
+		}
+	}
+	return TrackerID{Provider: TrackerProvider(provider), Native: native, Host: host}, true
+}
+
 // NormalizedIssueState is the cross-provider issue-state vocabulary every
 // adapter must implement. The closed list is intentional — adding a value
 // here is a port-level decision because every adapter must map it.

@@ -127,6 +127,7 @@ func New(opts Options) (*Tracker, error) {
 // Statically assert Tracker satisfies the port. If this stops compiling, the
 // port shape changed and the adapter needs to follow.
 var _ ports.Tracker = (*Tracker)(nil)
+var _ ports.TrackerCommenter = (*Tracker)(nil)
 
 // ---------------------------------------------------------------------------
 // Get
@@ -237,6 +238,40 @@ func mapStateFromGitHub(state, reason string, labels []string) domain.Normalized
 	default:
 		return domain.IssueOpen
 	}
+}
+
+// CreateIssueComment posts one issue comment with the already-authenticated
+// tracker credential. Callers own the body policy: this adapter never accepts
+// or forwards untrusted issue text on its own.
+func (t *Tracker) CreateIssueComment(ctx context.Context, id domain.TrackerID, body string) (ports.TrackerComment, error) {
+	owner, repo, number, err := t.parseID(id)
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	body = strings.TrimSpace(body)
+	if body == "" || len(body) > 60000 {
+		return ports.TrackerComment{}, fmt.Errorf("github tracker: invalid comment body length")
+	}
+	payload := struct {
+		Body string `json:"body"`
+	}{Body: body}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, number)
+	resp, err := t.do(ctx, http.MethodPost, path, payload)
+	if err != nil {
+		return ports.TrackerComment{}, err
+	}
+	var raw struct {
+		ID      int64  `json:"id"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal(resp, &raw); err != nil {
+		return ports.TrackerComment{}, fmt.Errorf("github tracker: decode comment: %w", err)
+	}
+	comment := ports.TrackerComment{ID: strconv.FormatInt(raw.ID, 10), URL: raw.HTMLURL}
+	if !ports.ValidTrackerCommentURL(comment.URL) {
+		return ports.TrackerComment{}, fmt.Errorf("%w: missing or invalid comment URL", ports.ErrTrackerCommentReceipt)
+	}
+	return comment, nil
 }
 
 // ---------------------------------------------------------------------------

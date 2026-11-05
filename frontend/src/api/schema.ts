@@ -3525,6 +3525,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tracker/writebacks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List durable tracker write-back states without changing them */
+        get: operations["listTrackerWritebacks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/usage/memory/pressure": {
         parameters: {
             query?: never;
@@ -4221,6 +4238,12 @@ export interface components {
         ControllersKillSessionRequest: {
             deleteArtifacts?: boolean;
         };
+        ControllersListTrackerWritebacksResponse: {
+            hasMore: boolean;
+            items: components["schemas"]["ControllersTrackerWritebackView"][];
+            limit: number;
+            offset: number;
+        };
         ControllersRemoteHostAccountTokenResponse: {
             hostId: string;
             token: string;
@@ -4333,6 +4356,20 @@ export interface components {
         };
         ControllersSetSessionAutoReviewRequest: {
             enabled: boolean;
+        };
+        ControllersTrackerWritebackView: {
+            attempts: number;
+            /** Format: date-time */
+            claimedAt?: null | string;
+            /** Format: date-time */
+            createdAt: string;
+            failureCode?: string;
+            id: string;
+            projectId?: string;
+            sessionId: string;
+            status: string;
+            /** Format: date-time */
+            updatedAt: string;
         };
         ControllersUpdateCloudOfferingRequest: {
             enabled: null | boolean;
@@ -4765,6 +4802,9 @@ export interface components {
             revision: number;
             selection: string;
             sourceRole: string;
+        };
+        DomainTrackerWritebackConfig: {
+            enabled?: boolean;
         };
         EditConversationMessageRequest: {
             clientMessageId?: string;
@@ -5303,6 +5343,7 @@ export interface components {
             sessionPrefix?: string;
             symlinks?: string[];
             trackerIntake?: components["schemas"]["TrackerIntakeConfig"];
+            trackerWriteback?: components["schemas"]["DomainTrackerWritebackConfig"];
             worker?: components["schemas"]["RoleOverride"];
             workersRequestReview?: boolean;
         };
@@ -19880,6 +19921,60 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
+            };
+        };
+    };
+    listTrackerWritebacks: {
+        parameters: {
+            query?: {
+                /** @description Optional durable outbox status. */
+                status?: "pending" | "claimed" | "sent" | "uncertain" | "failed";
+                /** @description Maximum rows to return. Defaults to 50. */
+                limit?: number;
+                /** @description Rows to skip. */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ControllersListTrackerWritebacksResponse"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["APIError"];
+                };
             };
             /** @description Internal Server Error */
             500: {

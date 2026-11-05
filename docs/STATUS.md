@@ -283,8 +283,9 @@ surface (`npm run sqlc`, `npm run api`).
 
 - **Tracker mirroring**: GitHub/GitLab intake is wired and can spawn workers
   when both `AO_TRACKER_INTAKE=on` and a project assignee rule enable it.
-  It remains read-only toward issues: lifecycle-to-issue comments/transitions
-  are not implemented.
+  Intake remains read-only by default. A per-project default-off write-back can
+  post one deterministic PR-ready comment through a durable at-most-once
+  outbox; issue transitions, labels, assignees, and merges remain out of scope.
 - **Full raw PR/tracker fact surfacing**: the SCM observer writes facts and the
   desktop consumes concise PR summaries, but exposing the full raw `pr_*` /
   `tracker_*` CDC events to live consumers
