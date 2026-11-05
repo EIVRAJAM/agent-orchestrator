@@ -195,6 +195,28 @@ func (q *Queries) CommitSessionControllerEpoch(ctx context.Context, arg CommitSe
 	return result.RowsAffected()
 }
 
+const getActiveSessionIDByIssue = `-- name: GetActiveSessionIDByIssue :one
+SELECT id FROM sessions
+WHERE project_id = ? AND issue_id = ? AND kind = 'worker'
+  AND is_terminated = 0 AND is_task_preparation = 0
+ORDER BY num LIMIT 1
+`
+
+type GetActiveSessionIDByIssueParams struct {
+	ProjectID *domain.ProjectID
+	IssueID   domain.IssueID
+}
+
+// Intake and manual spawn share the canonical issue id. Only a live, visible
+// worker owns an issue; terminated rows and hidden task preparations do not
+// block a deliberate respawn.
+func (q *Queries) GetActiveSessionIDByIssue(ctx context.Context, arg GetActiveSessionIDByIssueParams) (domain.SessionID, error) {
+	row := q.db.QueryRowContext(ctx, getActiveSessionIDByIssue, arg.ProjectID, arg.IssueID)
+	var id domain.SessionID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getClientRequestSession = `-- name: GetClientRequestSession :one
 SELECT id, client_request_hash, client_request_committed FROM sessions WHERE client_request_id = ?
 `

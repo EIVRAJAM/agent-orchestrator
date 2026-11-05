@@ -252,6 +252,15 @@ SELECT id, project_id, num, issue_id, kind, harness,
     hibernated_at
 FROM sessions WHERE id = ?;
 
+-- name: GetActiveSessionIDByIssue :one
+-- Intake and manual spawn share the canonical issue id. Only a live, visible
+-- worker owns an issue; terminated rows and hidden task preparations do not
+-- block a deliberate respawn.
+SELECT id FROM sessions
+WHERE project_id = ? AND issue_id = ? AND kind = 'worker'
+  AND is_terminated = 0 AND is_task_preparation = 0
+ORDER BY num LIMIT 1;
+
 -- name: GetSessionByAutomationRunID :one
 SELECT id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
