@@ -448,12 +448,15 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	if err != nil {
 		return err
 	}
-	if ready {
+	if scmObservationReadyForTrackerWriteback(o) {
 		if sink := m.trackerWritebackSink(); sink != nil {
 			prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
 			if prURL != "" {
 				if err := sink.Enqueue(ctx, id, prURL); err != nil {
-					slog.Default().Warn("lifecycle: tracker writeback enqueue failed", "session", id)
+					// The SCM observer uses this return value as its acknowledgement
+					// barrier. Returning the persistence failure keeps the semantic
+					// hashes stale so the observation is delivered again.
+					return fmt.Errorf("tracker writeback enqueue: %w", err)
 				}
 			}
 		}
@@ -465,6 +468,17 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 	m.emitNotification(ctx, intent)
 	m.resolveNotifications(ctx, readyToMergeResolutions(id, o, ready, m.clock())...)
 	return nil
+}
+
+// scmObservationReadyForTrackerWriteback is intentionally narrower than the
+// ready-to-merge notification policy: the PR-comment contract only needs an
+// open, non-draft PR with explicitly green CI. Review state, open review
+// comments, and mergeability do not block a "ready for review" comment.
+func scmObservationReadyForTrackerWriteback(o ports.SCMObservation) bool {
+	if o.PR.Draft || o.PR.Merged || o.PR.Closed {
+		return false
+	}
+	return domain.CIState(o.CI.Summary) == domain.CIPassing
 }
 
 // readyToMergeResolutions reports the ready-to-merge notification this
