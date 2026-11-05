@@ -161,7 +161,7 @@ func TestPoll_SharedBaseCheckoutOrder(t *testing.T) {
 func remotePollStore(project domain.ProjectRecord) *fakeStore {
 	return &fakeStore{
 		projects:       map[string]domain.ProjectRecord{"kit": project},
-		sessions:       []domain.SessionRecord{{ID: "worker-7", ProjectID: "kit", Metadata: domain.SessionMetadata{Branch: "delivery"}}},
+		sessions:       []domain.SessionRecord{{ID: "worker-7", ProjectID: "kit", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "delivery"}}},
 		workspaceRepos: make(map[string][]domain.WorkspaceRepoRecord),
 	}
 }
@@ -184,7 +184,7 @@ func remotePollProvider(base ports.SCMRepo, heads []string, author, branch strin
 	for index, repositoryName := range heads {
 		number := 71 + index
 		address := fmt.Sprintf("https://%s/%s/pull/%d", base.Host, base.Repo, number)
-		listing := ports.SCMPRObservation{URL: address, Number: number, HeadRepo: repositoryName, SourceBranch: branch, TargetBranch: "trunk", Author: author, HeadSHA: "revision", State: "open"}
+		listing := ports.SCMPRObservation{URL: address, Number: number, HeadRepo: repositoryName, SourceBranch: branch, TargetBranch: "trunk", Author: author, HeadSHA: "revision", State: "open", CreatedAtProvider: time.Unix(2, 0).UTC()}
 		provider.openPRs[prKey(base, 0)] = append(provider.openPRs[prKey(base, 0)], listing)
 		provider.observations[prKey(base, number)] = ports.SCMObservation{
 			Fetched: true, Provider: base.Provider, Host: base.Host, Repo: base.Repo, PR: listing,

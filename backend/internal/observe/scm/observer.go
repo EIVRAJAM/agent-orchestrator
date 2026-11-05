@@ -1105,6 +1105,11 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			if !ok {
 				continue
 			}
+			if !prBelongsToSession(sr, pr) {
+				o.logger.Warn("scm observer: rejected ambiguous PR branch ownership",
+					"session", sr.session.ID, "branch", pr.SourceBranch, "reason", "pr_created_before_session")
+				continue
+			}
 			known := domain.PullRequest{
 				URL:          firstNonEmpty(pr.URL, pr.HTMLURL),
 				SessionID:    sr.session.ID,
@@ -1192,6 +1197,20 @@ func candidatesForHeadRepo(candidates []sessionRepo, headRepo string) []sessionR
 // also own hyphen siblings, but only under the validated AO session branch.
 // Equal specificity across different sessions is ambiguous: leave the PR for
 // explicit claiming rather than assigning it according to store iteration order.
+// prBelongsToSession requires an exact branch match or a namespace/stacked
+// match whose PR was created after the owning session. A fresh AO_DATA_DIR can
+// reuse session IDs and therefore branch namespaces; an old PR with the same
+// prefix must never be adopted by the new session.
+func prBelongsToSession(sr sessionRepo, pr ports.SCMPRObservation) bool {
+	if sr.branch == pr.SourceBranch {
+		return true
+	}
+	if sr.session.CreatedAt.IsZero() || pr.CreatedAtProvider.IsZero() {
+		return false
+	}
+	return !pr.CreatedAtProvider.Before(sr.session.CreatedAt)
+}
+
 func matchSession(candidates []sessionRepo, sourceBranch string) (sessionRepo, bool) {
 	var best sessionRepo
 	bestLen := -1

@@ -25,6 +25,7 @@ const defaultTick = 30 * time.Second
 type Store interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
+	GetPR(ctx context.Context, url string) (domain.PullRequest, bool, error)
 	EnqueueTrackerWriteback(ctx context.Context, w domain.TrackerWriteback) (bool, error)
 	ClaimTrackerWriteback(ctx context.Context, now time.Time) (domain.TrackerWriteback, bool, error)
 	FinishTrackerWriteback(ctx context.Context, id, status, commentURL, failureCode string, now time.Time) (bool, error)
@@ -96,6 +97,14 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 		return fmt.Errorf("load project for tracker writeback: %w", err)
 	}
 	if !ok || !project.Config.TrackerWriteback.Enabled {
+		return nil
+	}
+	pr, ok, err := s.store.GetPR(ctx, prURL)
+	if err != nil {
+		return fmt.Errorf("load PR for tracker writeback: %w", err)
+	}
+	if !ok || !exactPRForSession(pr, rec) {
+		s.logger.Warn("tracker writeback: rejected PR association", "session", rec.ID, "reason", "pr_session_mismatch")
 		return nil
 	}
 	now := s.now()
@@ -198,6 +207,15 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 		settle(domain.TrackerWritebackFailed, "", "writeback_disabled")
 		return nil
 	}
+	pr, ok, err := s.store.GetPR(ctx, row.PRURL)
+	if err != nil {
+		settle(domain.TrackerWritebackFailed, "", "pr_read")
+		return err
+	}
+	if !ok || !exactPRForSession(pr, rec) {
+		settle(domain.TrackerWritebackFailed, "", "pr_association_invalid")
+		return nil
+	}
 	issue, ok := domain.ParseCanonicalIssueID(string(row.IssueID))
 	if !ok {
 		settle(domain.TrackerWritebackFailed, "", "issue_invalid")
@@ -258,6 +276,16 @@ func (s *Service) Start(ctx context.Context) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// exactPRForSession requires the PR row to name this exact session and to have
+// been created after that session. A reused AO session id can otherwise make an
+// old PR with the same branch prefix look current.
+func exactPRForSession(pr domain.PullRequest, rec domain.SessionRecord) bool {
+	if pr.SessionID != rec.ID || pr.CreatedAtProvider.IsZero() || rec.CreatedAt.IsZero() {
+		return false
+	}
+	return !pr.CreatedAtProvider.Before(rec.CreatedAt)
 }
 
 func (s *Service) now() time.Time {

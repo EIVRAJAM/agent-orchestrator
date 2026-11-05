@@ -204,7 +204,13 @@ func (p *fakeProvider) ListPRsByRepo(_ context.Context, repo ports.SCMRepo, _ ti
 	if p.listErr != nil {
 		return nil, p.listErr
 	}
-	return p.openPRs[prKey(repo, 0)], nil
+	prs := append([]ports.SCMPRObservation(nil), p.openPRs[prKey(repo, 0)]...)
+	for i := range prs {
+		if prs[i].CreatedAtProvider.IsZero() {
+			prs[i].CreatedAtProvider = time.Unix(2, 0).UTC()
+		}
+	}
+	return prs, nil
 }
 func (p *fakeProvider) CommitChecksGuard(_ context.Context, repo ports.SCMRepo, sha, _ string) (ports.SCMGuardResult, error) {
 	return p.checkGuards[commitKey(repo, sha)], nil
@@ -329,7 +335,7 @@ func quietSlog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, 
 
 func testStoreWithSession() *fakeStore {
 	return &fakeStore{
-		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "feat"}}},
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "feat"}}},
 		projects: map[string]domain.ProjectRecord{"p": {ID: "p", RepoOriginURL: "https://github.com/o/r.git"}},
 		prs:      map[domain.SessionID][]domain.PullRequest{},
 		checks:   map[string][]domain.PullRequestCheck{},
@@ -339,7 +345,7 @@ func testStoreWithSession() *fakeStore {
 func testObs(num int) ports.SCMObservation {
 	return ports.SCMObservation{
 		Fetched: true, Provider: "github", Host: "github.com", Repo: "o/r",
-		PR:           ports.SCMPRObservation{URL: "https://github.com/o/r/pull/" + fmt.Sprint(num), Number: num, State: "open", SourceBranch: "feat", TargetBranch: "main", HeadSHA: "sha" + fmt.Sprint(num), Title: "PR"},
+		PR:           ports.SCMPRObservation{URL: "https://github.com/o/r/pull/" + fmt.Sprint(num), Number: num, State: "open", SourceBranch: "feat", TargetBranch: "main", HeadSHA: "sha" + fmt.Sprint(num), Title: "PR", CreatedAtProvider: time.Unix(2, 0).UTC()},
 		CI:           ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "sha" + fmt.Sprint(num), Checks: []ports.SCMCheckObservation{{Name: "build", Status: string(domain.PRCheckPassed), Conclusion: "success", URL: "ci"}}},
 		Review:       ports.SCMReviewObservation{Decision: string(domain.ReviewNone)},
 		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable), Mergeable: true},
@@ -1040,14 +1046,14 @@ func TestPoll_DiscoversCrossForkPRFromUpstreamRemote(t *testing.T) {
 
 	upstream := ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "up", Name: "r", Repo: "up/r"}
 	store := &fakeStore{
-		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "ao/p-1/root"}}},
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "ao/p-1/root"}}},
 		projects: map[string]domain.ProjectRecord{"p": {ID: "p", Path: dir, RepoOriginURL: "https://github.com/o/r.git"}},
 		prs:      map[domain.SessionID][]domain.PullRequest{},
 		checks:   map[string][]domain.PullRequestCheck{},
 	}
 	crossObs := ports.SCMObservation{
 		Fetched: true, Provider: "github", Host: "github.com", Repo: "up/r",
-		PR:           ports.SCMPRObservation{URL: "https://github.com/up/r/pull/1", Number: 1, State: "open", SourceBranch: "ao/p-1/feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1", Title: "PR"},
+		PR:           ports.SCMPRObservation{URL: "https://github.com/up/r/pull/1", Number: 1, State: "open", SourceBranch: "ao/p-1/feat", HeadRepo: "o/r", TargetBranch: "main", HeadSHA: "sha1", Title: "PR", CreatedAtProvider: time.Unix(2, 0).UTC()},
 		CI:           ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "sha1"},
 		Review:       ports.SCMReviewObservation{Decision: string(domain.ReviewNone)},
 		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable), Mergeable: true},
@@ -1101,7 +1107,7 @@ func TestPoll_IgnoresUpstreamPRFromForeignHead(t *testing.T) {
 
 	upstream := ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "up", Name: "r", Repo: "up/r"}
 	store := &fakeStore{
-		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", Metadata: domain.SessionMetadata{Branch: "ao/p-1/root"}}},
+		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "ao/p-1/root"}}},
 		projects: map[string]domain.ProjectRecord{"p": {ID: "p", Path: dir, RepoOriginURL: "https://github.com/o/r.git"}},
 		prs:      map[domain.SessionID][]domain.PullRequest{},
 		checks:   map[string][]domain.PullRequestCheck{},

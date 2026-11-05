@@ -19,6 +19,7 @@ type fakeStore struct {
 	mu            sync.Mutex
 	sessions      map[domain.SessionID]domain.SessionRecord
 	projects      map[string]domain.ProjectRecord
+	prs           map[string]domain.PullRequest
 	rows          map[string]domain.TrackerWriteback
 	key           map[string]string
 	finishErr     error
@@ -30,6 +31,7 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		sessions: map[domain.SessionID]domain.SessionRecord{},
 		projects: map[string]domain.ProjectRecord{},
+		prs:      map[string]domain.PullRequest{},
 		rows:     map[string]domain.TrackerWriteback{},
 		key:      map[string]string{},
 	}
@@ -40,6 +42,13 @@ func (f *fakeStore) GetSession(_ context.Context, id domain.SessionID) (domain.S
 	defer f.mu.Unlock()
 	r, ok := f.sessions[id]
 	return r, ok, nil
+}
+
+func (f *fakeStore) GetPR(_ context.Context, url string) (domain.PullRequest, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pr, ok := f.prs[url]
+	return pr, ok, nil
 }
 
 func (f *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectRecord, bool, error) {
@@ -161,6 +170,11 @@ func seedWriteback(t *testing.T, enabled bool) (*Service, *fakeStore, *fakeComme
 	}
 	st.sessions["proj-1"] = domain.SessionRecord{
 		ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker,
+		CreatedAt: time.Unix(100, 0).UTC(),
+	}
+	st.prs["https://github.com/acme/demo/pull/1"] = domain.PullRequest{
+		URL: "https://github.com/acme/demo/pull/1", SessionID: "proj-1",
+		CreatedAtProvider: time.Unix(101, 0).UTC(),
 	}
 	commenter := &fakeCommenter{}
 	svc := New(st, commenter, nil, time.Minute)
@@ -316,8 +330,9 @@ func TestTerminalLoggingIsSanitized(t *testing.T) {
 	var buf bytes.Buffer
 	st := newFakeStore()
 	st.projects["proj"] = domain.ProjectRecord{ID: "proj", Config: domain.ProjectConfig{TrackerWriteback: domain.TrackerWritebackConfig{Enabled: true}}}
-	st.sessions["proj-1"] = domain.SessionRecord{ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker}
+	st.sessions["proj-1"] = domain.SessionRecord{ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker, CreatedAt: time.Unix(100, 0).UTC()}
 	st.projects["proj"] = domain.ProjectRecord{ID: "proj", Config: domain.ProjectConfig{TrackerWriteback: domain.TrackerWritebackConfig{Enabled: true}}}
+	st.prs["https://github.com/acme/demo/pull/1"] = domain.PullRequest{URL: "https://github.com/acme/demo/pull/1", SessionID: "proj-1", CreatedAtProvider: time.Unix(101, 0).UTC()}
 	commenter := &fakeCommenter{}
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	svc := New(st, commenter, logger, time.Minute)
@@ -417,8 +432,11 @@ func TestSettlementErrorAfterPostDoesNotResend(t *testing.T) {
 func TestFailedTerminalLogIsVisibleWithoutIssueContent(t *testing.T) {
 	var buf bytes.Buffer
 	st := newFakeStore()
-	st.sessions["proj-1"] = domain.SessionRecord{ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker}
+	st.sessions["proj-1"] = domain.SessionRecord{ID: "proj-1", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker, CreatedAt: time.Unix(100, 0).UTC()}
 	st.projects["proj"] = domain.ProjectRecord{ID: "proj", Config: domain.ProjectConfig{TrackerWriteback: domain.TrackerWritebackConfig{Enabled: true}}}
+	st.prs["https://github.com/acme/demo/pull/1"] = domain.PullRequest{
+		URL: "https://github.com/acme/demo/pull/1", SessionID: "proj-1", CreatedAtProvider: time.Unix(101, 0).UTC(),
+	}
 	st.rows["wb-failed"] = domain.TrackerWriteback{
 		ID: "wb-failed", ProjectID: "proj", SessionID: "proj-1", IssueID: "github:acme/demo#12",
 		PRURL: "https://github.com/acme/demo/pull/1", Status: domain.TrackerWritebackPending,
@@ -458,5 +476,47 @@ func TestListExposesSentAndFailedWithoutContent(t *testing.T) {
 	}
 	if statuses["wb-sent"] != domain.TrackerWritebackSent || statuses["wb-failed"] != domain.TrackerWritebackFailed {
 		t.Fatalf("statuses = %+v", statuses)
+	}
+}
+
+func TestEnqueueRejectsPRFromAnotherSessionOrBeforeSession(t *testing.T) {
+	for name, mutate := range map[string]func(*domain.PullRequest){
+		"other session":    func(pr *domain.PullRequest) { pr.SessionID = "other" },
+		"before session":   func(pr *domain.PullRequest) { pr.CreatedAtProvider = time.Unix(99, 0).UTC() },
+		"missing creation": func(pr *domain.PullRequest) { pr.CreatedAtProvider = time.Time{} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, st, _ := seedWriteback(t, true)
+			pr := st.prs["https://github.com/acme/demo/pull/1"]
+			mutate(&pr)
+			st.prs[pr.URL] = pr
+			if err := svc.Enqueue(context.Background(), "proj-1", pr.URL); err != nil {
+				t.Fatal(err)
+			}
+			if st.rowCount() != 0 {
+				t.Fatal("ambiguous PR association was enqueued")
+			}
+		})
+	}
+}
+
+func TestProcessOnceRejectsAmbiguousPRAssociationBeforeComment(t *testing.T) {
+	svc, st, commenter := seedWriteback(t, true)
+	prURL := "https://github.com/acme/demo/pull/1"
+	pr := st.prs[prURL]
+	pr.SessionID = "other"
+	st.prs[prURL] = pr
+	st.rows["wb-1"] = domain.TrackerWriteback{
+		ID: "wb-1", ProjectID: "proj", SessionID: "proj-1", IssueID: "github:acme/demo#12",
+		PRURL: prURL, Status: domain.TrackerWritebackPending,
+	}
+	if err := svc.ProcessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if commenter.calls != 0 {
+		t.Fatalf("comment calls = %d, want 0", commenter.calls)
+	}
+	if got := st.row("wb-1"); got.Status != domain.TrackerWritebackFailed || got.FailureCode != "pr_association_invalid" {
+		t.Fatalf("row = %+v, want failed pr_association_invalid", got)
 	}
 }
