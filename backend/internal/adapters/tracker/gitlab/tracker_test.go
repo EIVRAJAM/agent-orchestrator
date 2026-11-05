@@ -16,6 +16,7 @@ import (
 
 	scmgitlab "github.com/aoagents/agent-orchestrator/backend/internal/adapters/scm/gitlab"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 // recordedReq captures one inbound HTTP request so tests can assert against
@@ -971,5 +972,29 @@ func TestCreateIssueCommentPostsGitLabNote(t *testing.T) {
 	}
 	if !strings.Contains(calls[0].Body, `"body":"AO: PR ready for review: https://gitlab.com/acme/demo/-/merge_requests/3"`) {
 		t.Fatalf("comment body = %s", calls[0].Body)
+	}
+}
+
+func TestCreateIssueCommentRejectsMissingOrInvalidReceiptURL(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing": `{"id":77}`,
+		"invalid": `{"id":77,"web_url":"/note_77"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeGL(t)
+			tr := newTrackerForTest(t, f)
+			f.on(http.MethodPost, "/projects/acme/demo/issues/12/notes", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			})
+			if _, err := tr.CreateIssueComment(context.Background(), domain.TrackerID{
+				Provider: domain.TrackerProviderGitLab, Native: "acme/demo#12",
+			}, "AO: PR ready for review: https://gitlab.com/acme/demo/-/merge_requests/3"); !errors.Is(err, ports.ErrTrackerCommentReceipt) {
+				t.Fatalf("err = %v, want ErrTrackerCommentReceipt", err)
+			}
+			if len(f.calls()) != 1 {
+				t.Fatalf("calls = %+v, want one POST", f.calls())
+			}
+		})
 	}
 }

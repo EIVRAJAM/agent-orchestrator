@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 // recordedReq captures one inbound HTTP request so tests can assert against
@@ -859,5 +860,29 @@ func TestCreateIssueCommentPostsOnlyTheProvidedBody(t *testing.T) {
 	}
 	if !strings.Contains(calls[0].Body, `"body":"AO: PR ready for review: https://github.com/acme/demo/pull/3"`) {
 		t.Fatalf("comment body = %s", calls[0].Body)
+	}
+}
+
+func TestCreateIssueCommentRejectsMissingOrInvalidReceiptURL(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing": `{"id":77}`,
+		"invalid": `{"id":77,"html_url":"/issuecomment-77"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeGH(t)
+			tr := newTrackerForTest(t, f)
+			f.on(http.MethodPost, "/repos/acme/demo/issues/12/comments", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			})
+			if _, err := tr.CreateIssueComment(context.Background(), domain.TrackerID{
+				Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12",
+			}, "AO: PR ready for review: https://github.com/acme/demo/pull/3"); !errors.Is(err, ports.ErrTrackerCommentReceipt) {
+				t.Fatalf("err = %v, want ErrTrackerCommentReceipt", err)
+			}
+			if len(f.calls()) != 1 {
+				t.Fatalf("calls = %+v, want one POST", f.calls())
+			}
+		})
 	}
 }

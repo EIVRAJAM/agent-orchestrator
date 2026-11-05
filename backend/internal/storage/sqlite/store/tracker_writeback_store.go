@@ -94,6 +94,24 @@ func (s *Store) RecoverStaleTrackerWritebacks(ctx context.Context, now time.Time
 	return rows, nil
 }
 
+// ListTrackerWritebacks returns a bounded page ordered newest-first. The
+// caller requests one extra row to determine hasMore.
+func (s *Store) ListTrackerWritebacks(ctx context.Context, status string, limit, offset int) ([]domain.TrackerWriteback, error) {
+	rows, err := s.qr.ListTrackerWritebacks(ctx, gen.ListTrackerWritebacksParams{
+		Status:    status,
+		RowLimit:  int64(limit),
+		RowOffset: int64(offset),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list tracker writebacks: %w", err)
+	}
+	out := make([]domain.TrackerWriteback, len(rows))
+	for i, row := range rows {
+		out[i] = trackerWritebackFromRow(row)
+	}
+	return out, nil
+}
+
 func trackerWritebackFromRow(row gen.TrackerWriteback) domain.TrackerWriteback {
 	out := domain.TrackerWriteback{
 		ID:          row.ID,

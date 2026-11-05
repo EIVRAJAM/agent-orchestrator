@@ -63,6 +63,14 @@ This does not close or transition issues, change labels/assignees/milestones, or
 
 AO records a durable intent keyed by project, canonical issue ID, and PR URL. Repeated observations or restarts cannot enqueue a second comment. If a provider response is lost after the request, the row is marked `uncertain` and is deliberately not retried: at-most-once is safer than risking a duplicate comment. A project opt-in does not guarantee a comment if the tracker token lacks comment scope; that failure remains visible in the write-back state and logs without exposing tokens or issue content.
 
+Inspect the durable states without mutating them:
+
+```bash
+ao tracker writebacks --status uncertain --limit 20
+```
+
+The read-only API route is `GET /api/v1/tracker/writebacks` with the same bounded `status`, `limit` (maximum 100), and `offset` filters. Its response deliberately omits issue IDs, PR URLs, comment URLs, comment bodies, prompts, and credentials.
+
 ## Current boundary
 
 Matching issues may create sessions and provide issue context. Intake itself remains read-only. The optional write-back above is the only tracker mutation; it does not assign workflow states or close issues. PR and CI observation belongs to Orchestrator's separate [source-control capability](/plugins/scm).

@@ -27,3 +27,11 @@ WHERE id = ? AND status = 'claimed';
 UPDATE tracker_writebacks
 SET status = 'uncertain', failure_code = 'restart', updated_at = ?
 WHERE status = 'claimed';
+
+-- name: ListTrackerWritebacks :many
+SELECT id, project_id, session_id, issue_id, pr_url, status, attempts,
+    comment_url, failure_code, created_at, updated_at, claimed_at
+FROM tracker_writebacks
+WHERE (sqlc.arg(status) = '' OR status = sqlc.arg(status))
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.arg(row_limit) OFFSET sqlc.arg(row_offset);

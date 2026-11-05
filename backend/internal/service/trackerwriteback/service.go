@@ -6,6 +6,7 @@ package trackerwriteback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -28,6 +29,7 @@ type Store interface {
 	ClaimTrackerWriteback(ctx context.Context, now time.Time) (domain.TrackerWriteback, bool, error)
 	FinishTrackerWriteback(ctx context.Context, id, status, commentURL, failureCode string, now time.Time) (bool, error)
 	RecoverStaleTrackerWritebacks(ctx context.Context, now time.Time) (int64, error)
+	ListTrackerWritebacks(ctx context.Context, status string, limit, offset int) ([]domain.TrackerWriteback, error)
 }
 
 // Service enqueues lifecycle intents and delivers them through one tracker
@@ -113,6 +115,39 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 	return nil
 }
 
+// List returns a bounded, read-only page of durable outbox states. It exposes
+// no issue/comment body, PR URL, or credential material.
+func (s *Service) List(ctx context.Context, status string, limit, offset int) ([]domain.TrackerWriteback, bool, error) {
+	if s == nil || s.store == nil {
+		return nil, false, nil
+	}
+	status = strings.TrimSpace(status)
+	switch status {
+	case "", domain.TrackerWritebackPending, domain.TrackerWritebackClaimed,
+		domain.TrackerWritebackSent, domain.TrackerWritebackUncertain, domain.TrackerWritebackFailed:
+	default:
+		return nil, false, fmt.Errorf("tracker writeback: unsupported status %q", status)
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.store.ListTrackerWritebacks(ctx, status, limit+1, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	return rows, hasMore, nil
+}
+
 // ProcessOnce claims at most one pending row and attempts its single delivery.
 // Provider errors settle the row as uncertain; they never leave it pending for
 // a blind retry.
@@ -128,50 +163,70 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	finish := func(status, commentURL, code string) {
-		if _, err := s.store.FinishTrackerWriteback(context.WithoutCancel(ctx), row.ID, status, commentURL, code, s.now()); err != nil {
-			s.logger.Warn("tracker writeback: settle failed", "id", row.ID, "status", status)
+	settle := func(status, commentURL, code string) {
+		updated, err := s.store.FinishTrackerWriteback(context.WithoutCancel(ctx), row.ID, status, commentURL, code, s.now())
+		if err != nil || !updated {
+			s.logger.Warn("tracker writeback: settlement unconfirmed",
+				"writeback_id", row.ID, "desired_status", status, "code", "settlement_unconfirmed")
+			return
+		}
+		attrs := []any{"writeback_id", row.ID, "status", status}
+		if code != "" {
+			attrs = append(attrs, "code", code)
+		}
+		if status == domain.TrackerWritebackSent {
+			s.logger.Info("tracker writeback: settled", attrs...)
+		} else {
+			s.logger.Warn("tracker writeback: settled", attrs...)
 		}
 	}
 	rec, ok, err := s.store.GetSession(ctx, row.SessionID)
 	if err != nil {
-		finish(domain.TrackerWritebackFailed, "", "session_read")
+		settle(domain.TrackerWritebackFailed, "", "session_read")
 		return err
 	}
 	if !ok {
-		finish(domain.TrackerWritebackFailed, "", "session_missing")
+		settle(domain.TrackerWritebackFailed, "", "session_missing")
 		return nil
 	}
 	project, ok, err := s.store.GetProject(ctx, string(rec.ProjectID))
 	if err != nil {
-		finish(domain.TrackerWritebackFailed, "", "project_read")
+		settle(domain.TrackerWritebackFailed, "", "project_read")
 		return err
 	}
 	if !ok || !project.Config.TrackerWriteback.Enabled {
-		finish(domain.TrackerWritebackFailed, "", "writeback_disabled")
+		settle(domain.TrackerWritebackFailed, "", "writeback_disabled")
 		return nil
 	}
 	issue, ok := domain.ParseCanonicalIssueID(string(row.IssueID))
 	if !ok {
-		finish(domain.TrackerWritebackFailed, "", "issue_invalid")
+		settle(domain.TrackerWritebackFailed, "", "issue_invalid")
 		return nil
 	}
 	if s.commenter == nil {
-		finish(domain.TrackerWritebackFailed, "", "tracker_unsupported")
+		settle(domain.TrackerWritebackFailed, "", "tracker_unsupported")
 		return nil
 	}
 	if !validPRURL(row.PRURL) {
-		finish(domain.TrackerWritebackFailed, "", "pr_url_invalid")
+		settle(domain.TrackerWritebackFailed, "", "pr_url_invalid")
 		return nil
 	}
 	comment, err := s.commenter.CreateIssueComment(ctx, issue, commentBody(row.PRURL))
 	if err != nil {
+		code := "remote_uncertain"
+		if errors.Is(err, ports.ErrTrackerCommentReceipt) {
+			code = "missing_comment_receipt"
+		}
 		// The request may have reached the provider before the response was
 		// lost. At-most-once wins over speculative retries.
-		finish(domain.TrackerWritebackUncertain, "", "remote_uncertain")
+		settle(domain.TrackerWritebackUncertain, "", code)
 		return nil //nolint:nilerr // remote failure is settled as uncertain, never blindly retried
 	}
-	finish(domain.TrackerWritebackSent, comment.URL, "")
+	if !ports.ValidTrackerCommentURL(comment.URL) {
+		settle(domain.TrackerWritebackUncertain, "", "missing_comment_receipt")
+		return nil
+	}
+	settle(domain.TrackerWritebackSent, comment.URL, "")
 	return nil
 }
 

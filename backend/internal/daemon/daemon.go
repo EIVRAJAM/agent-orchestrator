@@ -997,6 +997,7 @@ func Run() error {
 		Cues:               cuesvc.New(cuesvc.Deps{Store: store, Sessions: sessionSvc, Terminals: shellTermSvc}),
 		AgentAuth:          agentAuthSvc,
 		GitHub:             githubpat.New(cfg.DataDir),
+		TrackerWritebacks:  trackerWriteback,
 		Conversations:      chatSvc,
 		Settings:           settingsSvc,
 		CDC:                store,

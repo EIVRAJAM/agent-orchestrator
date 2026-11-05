@@ -122,6 +122,57 @@ func (q *Queries) FinishTrackerWriteback(ctx context.Context, arg FinishTrackerW
 	return result.RowsAffected()
 }
 
+const listTrackerWritebacks = `-- name: ListTrackerWritebacks :many
+SELECT id, project_id, session_id, issue_id, pr_url, status, attempts,
+    comment_url, failure_code, created_at, updated_at, claimed_at
+FROM tracker_writebacks
+WHERE (?1 = '' OR status = ?1)
+ORDER BY created_at DESC, id DESC
+LIMIT ?3 OFFSET ?2
+`
+
+type ListTrackerWritebacksParams struct {
+	Status    interface{}
+	RowOffset int64
+	RowLimit  int64
+}
+
+func (q *Queries) ListTrackerWritebacks(ctx context.Context, arg ListTrackerWritebacksParams) ([]TrackerWriteback, error) {
+	rows, err := q.db.QueryContext(ctx, listTrackerWritebacks, arg.Status, arg.RowOffset, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []TrackerWriteback{}
+	for rows.Next() {
+		var i TrackerWriteback
+		if err := rows.Scan(
+			&i.ID,
+			&i.ProjectID,
+			&i.SessionID,
+			&i.IssueID,
+			&i.PRURL,
+			&i.Status,
+			&i.Attempts,
+			&i.CommentURL,
+			&i.FailureCode,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ClaimedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recoverStaleTrackerWritebacks = `-- name: RecoverStaleTrackerWritebacks :execrows
 UPDATE tracker_writebacks
 SET status = 'uncertain', failure_code = 'restart', updated_at = ?

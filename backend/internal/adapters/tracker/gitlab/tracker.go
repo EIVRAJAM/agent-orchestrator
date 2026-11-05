@@ -367,7 +367,11 @@ func (t *Tracker) CreateIssueComment(ctx context.Context, id domain.TrackerID, b
 	if err := json.Unmarshal(resp, &raw); err != nil {
 		return ports.TrackerComment{}, fmt.Errorf("gitlab tracker: decode note: %w", err)
 	}
-	return ports.TrackerComment{ID: strconv.FormatInt(raw.ID, 10), URL: raw.WebURL}, nil
+	comment := ports.TrackerComment{ID: strconv.FormatInt(raw.ID, 10), URL: raw.WebURL}
+	if !ports.ValidTrackerCommentURL(comment.URL) {
+		return ports.TrackerComment{}, fmt.Errorf("%w: missing or invalid comment URL", ports.ErrTrackerCommentReceipt)
+	}
+	return comment, nil
 }
 
 // ---------------------------------------------------------------------------

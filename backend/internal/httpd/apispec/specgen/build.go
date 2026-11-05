@@ -672,6 +672,7 @@ func operations() []operation {
 	ops = append(ops, reviewOperations()...)
 	ops = append(ops, notificationOperations()...)
 	ops = append(ops, reportOperations()...)
+	ops = append(ops, trackerWritebackOperations()...)
 	ops = append(ops, usageOperations()...)
 	ops = append(ops, pushOperations()...)
 	ops = append(ops, importOperations()...)
@@ -758,6 +759,20 @@ func identityOperations() []operation {
 			},
 		},
 	}
+}
+
+func trackerWritebackOperations() []operation {
+	return []operation{{
+		method: http.MethodGet, path: "/api/v1/tracker/writebacks", id: "listTrackerWritebacks", tag: "trackers",
+		summary:    "List durable tracker write-back states without changing them",
+		pathParams: []any{controllers.ListTrackerWritebacksQuery{}},
+		resps: []respUnit{
+			{http.StatusOK, controllers.ListTrackerWritebacksResponse{}},
+			{http.StatusBadRequest, envelope.APIError{}},
+			{http.StatusInternalServerError, envelope.APIError{}},
+			{http.StatusNotImplemented, envelope.APIError{}},
+		},
+	}}
 }
 
 func reportOperations() []operation {
