@@ -109,6 +109,9 @@ func (p *cannedSCMProvider) ListPRsByRepo(_ context.Context, _ ports.SCMRepo, _ 
 	defer p.mu.Unlock()
 	out := make([]ports.SCMPRObservation, 0, len(p.detected))
 	for _, pr := range p.detected {
+		if pr.CreatedAtProvider.IsZero() {
+			pr.CreatedAtProvider = time.Now().UTC()
+		}
 		out = append(out, pr)
 	}
 	return out, nil
