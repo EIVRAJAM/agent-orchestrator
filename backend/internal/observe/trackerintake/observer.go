@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -86,6 +87,7 @@ type Observer struct {
 	clock          func() time.Time
 	logger         *slog.Logger
 	backoffUntil   map[string]time.Time
+	pollMu         sync.Mutex
 }
 
 // New constructs an Observer with safe defaults.
@@ -117,6 +119,8 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 // spawn failures are logged and skipped so one bad issue/project does not block
 // the rest of the daemon.
 func (o *Observer) Poll(ctx context.Context) error {
+	o.pollMu.Lock()
+	defer o.pollMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
