@@ -25,6 +25,7 @@ import (
 var (
 	testRepo    = ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "o", Name: "r", Repo: "o/r"}
 	testAPIRepo = ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "o", Name: "api", Repo: "o/api"}
+	testRepoKey = scmRepoKey(testRepo)
 )
 
 type fakeStore struct {
@@ -35,7 +36,7 @@ type fakeStore struct {
 	workspaceRepos map[string][]domain.WorkspaceRepoRecord
 	prs            map[domain.SessionID][]domain.PullRequest
 	checks         map[string][]domain.PullRequestCheck
-	branchTips     map[string]map[string]map[string]struct{}
+	branchTips     map[string]map[string]map[string]struct{} // instance\x00repo -> branch -> sha
 	prOwnerships   map[string]domain.SessionPROwnership
 	writeErr       error
 
@@ -103,68 +104,74 @@ func (s *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]
 	return append([]domain.PullRequest(nil), s.prs[id]...), nil
 }
 
-func (s *fakeStore) addBranchTip(instanceID, branch, headSHA string) {
+func (s *fakeStore) addBranchTip(instanceID, repoKey, branch, headSHA string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if instanceID == "" || branch == "" || headSHA == "" {
+	if instanceID == "" || repoKey == "" || branch == "" || headSHA == "" {
 		return
 	}
 	if s.branchTips == nil {
 		s.branchTips = map[string]map[string]map[string]struct{}{}
 	}
-	if s.branchTips[instanceID] == nil {
-		s.branchTips[instanceID] = map[string]map[string]struct{}{}
+	key := instanceID + "\x00" + repoKey
+	if s.branchTips[key] == nil {
+		s.branchTips[key] = map[string]map[string]struct{}{}
 	}
-	if s.branchTips[instanceID][branch] == nil {
-		s.branchTips[instanceID][branch] = map[string]struct{}{}
+	if s.branchTips[key][branch] == nil {
+		s.branchTips[key][branch] = map[string]struct{}{}
 	}
-	s.branchTips[instanceID][branch][headSHA] = struct{}{}
+	s.branchTips[key][branch][headSHA] = struct{}{}
 }
 
 func (s *fakeStore) ListSessionBranchTips(_ context.Context, instanceID string) ([]domain.SessionBranchTip, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []domain.SessionBranchTip
-	for branch, tips := range s.branchTips[instanceID] {
-		for sha := range tips {
-			out = append(out, domain.SessionBranchTip{SessionInstanceID: instanceID, Branch: branch, HeadSHA: sha})
+	for key, branches := range s.branchTips {
+		instance, repoKey, ok := strings.Cut(key, "\x00")
+		if !ok || instance != instanceID {
+			continue
+		}
+		for branch, tips := range branches {
+			for sha := range tips {
+				out = append(out, domain.SessionBranchTip{SessionInstanceID: instanceID, RepoKey: repoKey, Branch: branch, HeadSHA: sha})
+			}
 		}
 	}
 	return out, nil
 }
 
-func (s *fakeStore) RegisterSessionPROwnership(_ context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error) {
+func (s *fakeStore) RegisterSessionPROwnership(_ context.Context, instanceID, repoKey, prURL, sourceBranch, headSHA string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.prOwnerships == nil {
 		s.prOwnerships = map[string]domain.SessionPROwnership{}
 	}
-	if !s.hasBranchTipLocked(instanceID, sourceBranch, headSHA) {
+	if !s.hasBranchTipLocked(instanceID, repoKey, sourceBranch, headSHA) {
 		return false, nil
 	}
 	if existing, ok := s.prOwnerships[prURL]; ok {
-		return existing.SessionInstanceID == instanceID &&
-			existing.SourceBranch == sourceBranch &&
-			existing.HeadSHA == headSHA, nil
+		return existing.SessionInstanceID == instanceID && existing.RepoKey == repoKey &&
+			existing.SourceBranch == sourceBranch && existing.HeadSHA == headSHA, nil
 	}
 	s.prOwnerships[prURL] = domain.SessionPROwnership{
-		PRURL: prURL, SessionInstanceID: instanceID, SourceBranch: sourceBranch,
-		HeadSHA: headSHA, RegisteredAt: now,
+		PRURL: prURL, SessionInstanceID: instanceID, RepoKey: repoKey,
+		SourceBranch: sourceBranch, HeadSHA: headSHA, RegisteredAt: now,
 	}
 	return true, nil
 }
 
-func (s *fakeStore) RefreshSessionPROwnership(_ context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error) {
+func (s *fakeStore) RefreshSessionPROwnership(_ context.Context, instanceID, repoKey, prURL, sourceBranch, headSHA string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.prOwnerships == nil {
 		return false, nil
 	}
 	existing, ok := s.prOwnerships[prURL]
-	if !ok || existing.SessionInstanceID != instanceID || existing.SourceBranch != sourceBranch {
+	if !ok || existing.SessionInstanceID != instanceID || existing.RepoKey != repoKey || existing.SourceBranch != sourceBranch {
 		return false, nil
 	}
-	if !s.hasBranchTipLocked(instanceID, sourceBranch, headSHA) {
+	if !s.hasBranchTipLocked(instanceID, repoKey, sourceBranch, headSHA) {
 		return false, nil
 	}
 	existing.HeadSHA = headSHA
@@ -173,11 +180,11 @@ func (s *fakeStore) RefreshSessionPROwnership(_ context.Context, instanceID, prU
 	return true, nil
 }
 
-func (s *fakeStore) hasBranchTipLocked(instanceID, branch, headSHA string) bool {
+func (s *fakeStore) hasBranchTipLocked(instanceID, repoKey, branch, headSHA string) bool {
 	if s.branchTips == nil {
 		return false
 	}
-	tips, ok := s.branchTips[instanceID][branch]
+	tips, ok := s.branchTips[instanceID+"\x00"+repoKey][branch]
 	if !ok {
 		return false
 	}
@@ -207,14 +214,26 @@ func (s *fakeStore) seedDiscovery(provider *fakeProvider) {
 	for i := range s.sessions {
 		instanceID := s.sessions[i].InstanceID
 		branch := s.sessions[i].Metadata.Branch
-		for _, prs := range provider.openPRs {
+		for repoKey, prs := range provider.openPRs {
 			for _, pr := range prs {
 				if pr.SourceBranch == branch {
-					s.addBranchTip(instanceID, branch, pr.HeadSHA)
+					s.addBranchTip(instanceID, repoKeyToOwnershipKey(repoKey), branch, pr.HeadSHA)
 				}
 			}
 		}
 	}
+}
+
+func repoKeyToOwnershipKey(repoKey string) string {
+	parts := strings.SplitN(repoKey, ":", 3)
+	if len(parts) != 3 {
+		return ""
+	}
+	owner, name, ok := strings.Cut(parts[2], "/")
+	if !ok {
+		return ""
+	}
+	return domain.RepositoryIdentity{Provider: parts[0], Host: parts[1], Namespace: owner, Name: name}.Key()
 }
 
 func (s *fakeStore) ListChecks(_ context.Context, prURL string) ([]domain.PullRequestCheck, error) {
@@ -934,7 +953,7 @@ func TestPoll_DiscoversStackedChildByBranchPrefix(t *testing.T) {
 	}
 	lc := &fakeLifecycle{}
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
-	store.addBranchTip("inst-p-1", "feat/child", "sha2")
+	store.addBranchTip("inst-p-1", testRepoKey, "feat/child", "sha2")
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -964,7 +983,7 @@ func TestPoll_DiscoversSiblingUnderRootSessionNamespace(t *testing.T) {
 	}
 	lc := &fakeLifecycle{}
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
-	store.addBranchTip("inst-p-1", "ao/p-1/fix", "sha1")
+	store.addBranchTip("inst-p-1", testRepoKey, "ao/p-1/fix", "sha1")
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1015,7 +1034,7 @@ func TestPoll_DiscoversWorkspaceChildRepoPR(t *testing.T) {
 		observations: map[string]ports.SCMObservation{prKey(testAPIRepo, 12): prObs},
 	}
 	lc := &fakeLifecycle{}
-	store.addBranchTip("inst-p-1", "ao/p-1/api-billing", "api-sha")
+	store.addBranchTip("inst-p-1", scmRepoKey(testAPIRepo), "ao/p-1/api-billing", "api-sha")
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1178,7 +1197,7 @@ func TestPoll_DiscoversCrossForkPRFromUpstreamRemote(t *testing.T) {
 		observations: map[string]ports.SCMObservation{prKey(upstream, 1): crossObs},
 	}
 	lc := &fakeLifecycle{}
-	store.addBranchTip("inst-p-1", "ao/p-1/feat", "sha1")
+	store.addBranchTip("inst-p-1", scmRepoKey(upstream), "ao/p-1/feat", "sha1")
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)

@@ -518,6 +518,7 @@ func (s Session) LastEventAt() time.Time {
 type SessionPROwnership struct {
 	PRURL             string
 	SessionInstanceID string
+	RepoKey           string
 	SourceBranch      string
 	HeadSHA           string
 	RegisteredAt      time.Time
@@ -527,6 +528,7 @@ type SessionPROwnership struct {
 // Ownership matching requires an exact branch + HEAD SHA pair.
 type SessionBranchTip struct {
 	SessionInstanceID string
+	RepoKey           string
 	Branch            string
 	HeadSHA           string
 }

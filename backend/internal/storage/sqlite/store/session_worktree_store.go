@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -25,9 +26,18 @@ func (s *Store) UpsertSessionWorktree(ctx context.Context, row domain.SessionWor
 	if state == "" {
 		state = "active"
 	}
+	repoKey := strings.TrimSpace(row.RepoKey)
+	if repoKey == "" {
+		var keyErr error
+		repoKey, keyErr = s.sessionWorktreeRepoKeyLocked(ctx, row.SessionID, row.RepoName)
+		if keyErr != nil {
+			return keyErr
+		}
+	}
 	if err := s.qw.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{
 		SessionID:    row.SessionID,
 		RepoName:     row.RepoName,
+		RepoKey:      repoKey,
 		Branch:       row.Branch,
 		BaseSha:      row.BaseSHA,
 		BaseRef:      row.BaseRef,
@@ -42,7 +52,7 @@ func (s *Store) UpsertSessionWorktree(ctx context.Context, row domain.SessionWor
 	if headSHA == "" {
 		headSHA = row.BaseSHA
 	}
-	_, err := s.recordSessionBranchTipLocked(ctx, row.SessionID, row.Branch, headSHA, row.WorktreePath, time.Now().UTC())
+	_, err := s.recordSessionBranchTipLocked(ctx, row.SessionID, repoKey, row.Branch, headSHA, row.WorktreePath, time.Now().UTC())
 	return err
 }
 
@@ -55,7 +65,7 @@ func (s *Store) GetSessionWorktree(ctx context.Context, sessionID domain.Session
 	if err != nil {
 		return domain.SessionWorktreeRecord{}, false, fmt.Errorf("get session worktree %s/%s: %w", sessionID, repoName, err)
 	}
-	return sessionWorktreeFromGen(row), true, nil
+	return sessionWorktreeFromGetRow(row), true, nil
 }
 
 // ListSessionWorktrees returns every repo worktree for a session, root first.
@@ -66,7 +76,7 @@ func (s *Store) ListSessionWorktrees(ctx context.Context, sessionID domain.Sessi
 	}
 	out := make([]domain.SessionWorktreeRecord, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, sessionWorktreeFromGen(row))
+		out = append(out, sessionWorktreeFromListRow(row))
 	}
 	return out, nil
 }
@@ -78,18 +88,55 @@ func (s *Store) DeleteSessionWorktrees(ctx context.Context, sessionID domain.Ses
 	return s.qw.DeleteSessionWorktrees(ctx, sessionID)
 }
 
-func sessionWorktreeFromGen(row gen.SessionWorktree) domain.SessionWorktreeRecord {
+// sessionWorktreeRepoKeyLocked derives the canonical repository identity from
+// the registered project/workspace origin. A missing or invalid origin yields
+// an empty key, which disables ownership for that worktree rather than using a
+// symbolic AO repo name as a substitute.
+func (s *Store) sessionWorktreeRepoKeyLocked(ctx context.Context, sessionID domain.SessionID, repoName string) (string, error) {
+	origin, err := s.qw.GetSessionProjectOrigin(ctx, sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read project origin for %s: %w", sessionID, err)
+	}
+	if repoName != domain.RootWorkspaceRepoName {
+		origin, err = s.qw.GetWorkspaceRepoOrigin(ctx, gen.GetWorkspaceRepoOriginParams{
+			ID: sessionID, Name: repoName,
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("read workspace repo origin for %s/%s: %w", sessionID, repoName, err)
+		}
+	}
+	identity, err := domain.ParseRepositoryIdentity(origin)
+	if err != nil || identity.Provider == "" || identity.Host == "" {
+		// A missing/invalid origin only disables ownership; it must not block
+		// the worktree lifecycle itself.
+		return "", nil //nolint:nilerr // invalid origin disables ownership only
+	}
+	return identity.Key(), nil
+}
+
+func sessionWorktreeFromGetRow(row gen.GetSessionWorktreeRow) domain.SessionWorktreeRecord {
+	return sessionWorktreeFromValues(row.SessionID, row.RepoName, row.RepoKey, row.Branch, row.BaseSha, row.BaseRef, row.CreationSha, row.WorktreePath, row.PreservedRef, row.State)
+}
+
+func sessionWorktreeFromListRow(row gen.ListSessionWorktreesRow) domain.SessionWorktreeRecord {
+	return sessionWorktreeFromValues(row.SessionID, row.RepoName, row.RepoKey, row.Branch, row.BaseSha, row.BaseRef, row.CreationSha, row.WorktreePath, row.PreservedRef, row.State)
+}
+
+func sessionWorktreeFromValues(
+	sessionID domain.SessionID, repoName, repoKey, branch, baseSHA, baseRef, creationSHA, worktreePath, preservedRef, state string,
+) domain.SessionWorktreeRecord {
 	return domain.SessionWorktreeRecord{
-		SessionID:    row.SessionID,
-		RepoName:     row.RepoName,
-		Branch:       row.Branch,
-		BaseSHA:      row.BaseSha,
-		BaseRef:      row.BaseRef,
-		CreationSHA:  row.CreationSha,
-		WorktreePath: row.WorktreePath,
-		PreservedRef: row.PreservedRef,
+		SessionID: sessionID, RepoName: repoName, RepoKey: repoKey, Branch: branch,
+		BaseSHA: baseSHA, BaseRef: baseRef, CreationSHA: creationSHA,
+		WorktreePath: worktreePath, PreservedRef: preservedRef,
 		// ponytail: state is read back from the DB but no caller uses it;
 		// it is unused multi-repo scaffolding (see UpsertSessionWorktree above).
-		State: row.State,
+		State: state,
 	}
 }

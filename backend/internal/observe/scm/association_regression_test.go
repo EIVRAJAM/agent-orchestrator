@@ -30,8 +30,8 @@ func TestPoll_RequiresDurableInstanceBranchAndHead(t *testing.T) {
 	store.sessions[0].Metadata.Branch = "ao/praxas-mini-1/root"
 	store.sessions[0].InstanceID = "inst-current"
 	store.sessions[0].CreatedAt = time.Unix(1, 0).UTC()
-	store.addBranchTip("inst-current", "ao/praxas-mini-1/root", "root-sha")
-	store.addBranchTip("inst-current", "ao/praxas-mini-1/stack", "stack-sha")
+	store.addBranchTip("inst-current", testRepoKey, "ao/praxas-mini-1/root", "root-sha")
+	store.addBranchTip("inst-current", testRepoKey, "ao/praxas-mini-1/stack", "stack-sha")
 
 	future := time.Unix(9_999_999_999, 0).UTC()
 	provider := &fakeProvider{
@@ -74,7 +74,7 @@ func TestPoll_StackedPRAssociatesOnlyAfterExplicitRegistration(t *testing.T) {
 	store := testStoreWithSession()
 	store.sessions[0].Metadata.Branch = "ao/p-1/root"
 	store.sessions[0].InstanceID = "inst-p-1"
-	store.addBranchTip("inst-p-1", "ao/p-1/root", "root-sha")
+	store.addBranchTip("inst-p-1", testRepoKey, "ao/p-1/root", "root-sha")
 	provider := &fakeProvider{
 		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
 		openPRs: map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {
@@ -89,7 +89,7 @@ func TestPoll_StackedPRAssociatesOnlyAfterExplicitRegistration(t *testing.T) {
 		t.Fatalf("unregistered stacked PR was associated: %+v", store.writes)
 	}
 
-	store.addBranchTip("inst-p-1", "ao/p-1/stack", "stack-sha")
+	store.addBranchTip("inst-p-1", testRepoKey, "ao/p-1/stack", "stack-sha")
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +132,8 @@ func TestPoll_AmbiguousOwnershipFailsClosed(t *testing.T) {
 	})
 	store.sessions[0].Metadata.Branch = "ao/shared"
 	store.sessions[0].InstanceID = "inst-p-1"
-	store.addBranchTip("inst-p-1", "ao/shared", "sha1")
-	store.addBranchTip("inst-p-2", "ao/shared", "sha1")
+	store.addBranchTip("inst-p-1", testRepoKey, "ao/shared", "sha1")
+	store.addBranchTip("inst-p-2", testRepoKey, "ao/shared", "sha1")
 	provider := &fakeProvider{
 		repoGuards: map[string]ports.SCMGuardResult{prKey(testRepo, 0): {ETag: "v2"}},
 		openPRs: map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {
@@ -146,5 +146,54 @@ func TestPoll_AmbiguousOwnershipFailsClosed(t *testing.T) {
 	}
 	if len(store.writes) != 0 || len(store.prOwnerships) != 0 {
 		t.Fatalf("ambiguous ownership was associated: writes=%+v ownership=%+v", store.writes, store.prOwnerships)
+	}
+}
+
+func TestPoll_RepoScopedOwnershipRejectsSameBranchAndHeadInAnotherRepo(t *testing.T) {
+	store := testStoreWithSession()
+	store.sessions[0].Metadata.Branch = "ao/p-1/root"
+	store.sessions[0].InstanceID = "inst-p-1"
+	store.projects["p"] = domain.ProjectRecord{ID: "p", Kind: domain.ProjectKindWorkspace, RepoOriginURL: "https://github.com/o/r.git"}
+	store.workspaceRepos = map[string][]domain.WorkspaceRepoRecord{
+		"p": {{ProjectID: "p", Name: "api", RelativePath: "api", RepoOriginURL: "https://github.com/o/api.git"}},
+	}
+	// Ownership is registered for repository A only.
+	store.addBranchTip("inst-p-1", scmRepoKey(testRepo), "ao/p-1/root", "same-sha")
+
+	provider := &fakeProvider{
+		repoGuards: map[string]ports.SCMGuardResult{
+			prKey(testRepo, 0):    {ETag: "root-v1"},
+			prKey(testAPIRepo, 0): {ETag: "api-v1"},
+		},
+		openPRs: map[string][]ports.SCMPRObservation{
+			prKey(testAPIRepo, 0): {
+				{URL: "https://github.com/o/api/pull/77", Number: 77, SourceBranch: "ao/p-1/root", HeadRepo: "o/api", HeadSHA: "same-sha"},
+			},
+		},
+		observations: map[string]ports.SCMObservation{prKey(testAPIRepo, 77): testObs(77)},
+	}
+	obs := ownershipObserver(store, provider, time.Unix(2, 0).UTC())
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, write := range store.writes {
+		if write.pr.Number == 77 {
+			t.Fatalf("repository B PR was associated using repository A ownership: %+v", write.pr)
+		}
+	}
+
+	// Once the exact repository-B tip is registered, the same PR is allowed.
+	store.addBranchTip("inst-p-1", scmRepoKey(testAPIRepo), "ao/p-1/root", "same-sha")
+	if err := obs.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, write := range store.writes {
+		if write.pr.Number == 77 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("repository B PR was not associated after its exact ownership was registered")
 	}
 }

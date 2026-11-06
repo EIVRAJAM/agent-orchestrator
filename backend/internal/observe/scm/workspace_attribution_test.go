@@ -7,15 +7,18 @@ import (
 )
 
 func ownedSessionRepo(id, instance, branch string, tips ...string) sessionRepo {
+	repoKey := testRepoKey
 	index := map[string]map[string]struct{}{}
 	if branch != "" {
-		index[branch] = map[string]struct{}{}
+		key := branchTipKey(repoKey, branch)
+		index[key] = map[string]struct{}{}
 		for _, tip := range tips {
-			index[branch][tip] = struct{}{}
+			index[key][tip] = struct{}{}
 		}
 	}
 	return sessionRepo{
 		session:    domain.SessionRecord{ID: domain.SessionID(id), InstanceID: instance},
+		repoKey:    repoKey,
 		branch:     branch,
 		instanceID: instance,
 		branchTips: index,

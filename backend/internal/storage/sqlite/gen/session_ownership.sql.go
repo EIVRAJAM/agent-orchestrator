@@ -24,12 +24,15 @@ func (q *Queries) GetSessionInstanceID(ctx context.Context, id domain.SessionID)
 }
 
 const getSessionPROwnership = `-- name: GetSessionPROwnership :one
-SELECT p.pr_url, p.session_instance_id, p.source_branch, p.head_sha, p.registered_at
+SELECT p.pr_url, p.session_instance_id, p.repo_key, p.source_branch, p.head_sha, p.registered_at
 FROM session_pr_ownerships p
 JOIN session_branch_ownerships b
-  ON b.session_instance_id = p.session_instance_id AND b.branch = p.source_branch
+  ON b.session_instance_id = p.session_instance_id
+ AND b.repo_key = p.repo_key
+ AND b.branch = p.source_branch
 JOIN session_branch_tips t
   ON t.session_instance_id = p.session_instance_id
+ AND t.repo_key = p.repo_key
  AND t.branch = p.source_branch
  AND t.head_sha = p.head_sha
 WHERE p.pr_url = ?
@@ -41,6 +44,7 @@ func (q *Queries) GetSessionPROwnership(ctx context.Context, prUrl string) (Sess
 	err := row.Scan(
 		&i.PRURL,
 		&i.SessionInstanceID,
+		&i.RepoKey,
 		&i.SourceBranch,
 		&i.HeadSha,
 		&i.RegisteredAt,
@@ -48,15 +52,49 @@ func (q *Queries) GetSessionPROwnership(ctx context.Context, prUrl string) (Sess
 	return i, err
 }
 
+const getSessionProjectOrigin = `-- name: GetSessionProjectOrigin :one
+SELECT p.repo_origin_url
+FROM sessions s
+JOIN projects p ON p.id = s.project_id
+WHERE s.id = ?
+`
+
+func (q *Queries) GetSessionProjectOrigin(ctx context.Context, id domain.SessionID) (string, error) {
+	row := q.db.QueryRowContext(ctx, getSessionProjectOrigin, id)
+	var repo_origin_url string
+	err := row.Scan(&repo_origin_url)
+	return repo_origin_url, err
+}
+
+const getWorkspaceRepoOrigin = `-- name: GetWorkspaceRepoOrigin :one
+SELECT wr.repo_origin_url
+FROM sessions s
+JOIN workspace_repos wr ON wr.project_id = s.project_id
+WHERE s.id = ? AND wr.name = ?
+`
+
+type GetWorkspaceRepoOriginParams struct {
+	ID   domain.SessionID
+	Name string
+}
+
+func (q *Queries) GetWorkspaceRepoOrigin(ctx context.Context, arg GetWorkspaceRepoOriginParams) (string, error) {
+	row := q.db.QueryRowContext(ctx, getWorkspaceRepoOrigin, arg.ID, arg.Name)
+	var repo_origin_url string
+	err := row.Scan(&repo_origin_url)
+	return repo_origin_url, err
+}
+
 const listSessionBranchTips = `-- name: ListSessionBranchTips :many
-SELECT session_instance_id, branch, head_sha
+SELECT session_instance_id, repo_key, branch, head_sha
 FROM session_branch_tips
 WHERE session_instance_id = ?
-ORDER BY branch, head_sha
+ORDER BY repo_key, branch, head_sha
 `
 
 type ListSessionBranchTipsRow struct {
 	SessionInstanceID string
+	RepoKey           string
 	Branch            string
 	HeadSha           string
 }
@@ -70,7 +108,12 @@ func (q *Queries) ListSessionBranchTips(ctx context.Context, sessionInstanceID s
 	items := []ListSessionBranchTipsRow{}
 	for rows.Next() {
 		var i ListSessionBranchTipsRow
-		if err := rows.Scan(&i.SessionInstanceID, &i.Branch, &i.HeadSha); err != nil {
+		if err := rows.Scan(
+			&i.SessionInstanceID,
+			&i.RepoKey,
+			&i.Branch,
+			&i.HeadSha,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -90,12 +133,14 @@ SET head_sha = ?1,
     registered_at = ?2
 WHERE session_pr_ownerships.pr_url = ?3
   AND session_pr_ownerships.session_instance_id = ?4
-  AND session_pr_ownerships.source_branch = ?5
+  AND session_pr_ownerships.repo_key = ?5
+  AND session_pr_ownerships.source_branch = ?6
   AND EXISTS (
       SELECT 1
       FROM session_branch_tips AS t
       WHERE t.session_instance_id = ?4
-        AND t.branch = ?5
+        AND t.repo_key = ?5
+        AND t.branch = ?6
         AND t.head_sha = ?1
   )
 `
@@ -105,18 +150,20 @@ type RefreshSessionPROwnershipParams struct {
 	NewRegisteredAt      time.Time
 	TargetPRURL          string
 	ExpectedInstanceID   string
+	ExpectedRepoKey      string
 	ExpectedSourceBranch string
 }
 
 // Advance an existing PR ownership row only when the new head is already a
-// registered tip of the same instance-scoped source branch. This is the
-// branch-move path; a foreign head cannot replace the ownership row.
+// registered tip of the same instance/repository/source branch. This is the
+// branch-move path; a foreign head or repository cannot replace ownership.
 func (q *Queries) RefreshSessionPROwnership(ctx context.Context, arg RefreshSessionPROwnershipParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, refreshSessionPROwnership,
 		arg.NewHeadSha,
 		arg.NewRegisteredAt,
 		arg.TargetPRURL,
 		arg.ExpectedInstanceID,
+		arg.ExpectedRepoKey,
 		arg.ExpectedSourceBranch,
 	)
 	if err != nil {
@@ -126,26 +173,30 @@ func (q *Queries) RefreshSessionPROwnership(ctx context.Context, arg RefreshSess
 }
 
 const registerSessionBranch = `-- name: RegisterSessionBranch :execrows
-INSERT INTO session_branch_ownerships (session_id, session_instance_id, branch, worktree_path, registered_at)
-SELECT s.id, s.instance_id, ?1, ?2, ?3
+INSERT INTO session_branch_ownerships (session_id, session_instance_id, repo_key, branch, worktree_path, registered_at)
+SELECT s.id, s.instance_id, ?1, ?2, ?3, ?4
 FROM sessions s
-WHERE s.id = ?4
+WHERE s.id = ?5
   AND s.instance_id <> ''
   AND ?1 <> ''
-ON CONFLICT (session_instance_id, branch) DO NOTHING
+  AND ?2 <> ''
+ON CONFLICT (session_instance_id, repo_key, branch) DO NOTHING
 `
 
 type RegisterSessionBranchParams struct {
+	RepoKey      string
 	Branch       string
 	WorktreePath string
 	RegisteredAt time.Time
 	SessionID    domain.SessionID
 }
 
-// Register one exact branch/worktree relation for a session instance. The
-// subquery binds the branch to the instance that actually owns session_id.
+// Register one exact branch/worktree relation for a session instance and
+// canonical repository identity. The subquery binds the branch to the
+// instance that actually owns session_id.
 func (q *Queries) RegisterSessionBranch(ctx context.Context, arg RegisterSessionBranchParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, registerSessionBranch,
+		arg.RepoKey,
 		arg.Branch,
 		arg.WorktreePath,
 		arg.RegisteredAt,
@@ -158,19 +209,21 @@ func (q *Queries) RegisterSessionBranch(ctx context.Context, arg RegisterSession
 }
 
 const registerSessionBranchTip = `-- name: RegisterSessionBranchTip :execrows
-INSERT INTO session_branch_tips (session_instance_id, branch, head_sha, observed_at)
-SELECT b.session_instance_id, b.branch, ?1, ?2
+INSERT INTO session_branch_tips (session_instance_id, repo_key, branch, head_sha, observed_at)
+SELECT b.session_instance_id, b.repo_key, b.branch, ?1, ?2
 FROM session_branch_ownerships b
 WHERE b.session_instance_id = ?3
-  AND b.branch = ?4
+  AND b.repo_key = ?4
+  AND b.branch = ?5
   AND ?1 <> ''
-ON CONFLICT (session_instance_id, branch, head_sha) DO NOTHING
+ON CONFLICT (session_instance_id, repo_key, branch, head_sha) DO NOTHING
 `
 
 type RegisterSessionBranchTipParams struct {
 	HeadSha           string
 	ObservedAt        time.Time
 	SessionInstanceID string
+	RepoKey           string
 	Branch            string
 }
 
@@ -179,6 +232,7 @@ func (q *Queries) RegisterSessionBranchTip(ctx context.Context, arg RegisterSess
 		arg.HeadSha,
 		arg.ObservedAt,
 		arg.SessionInstanceID,
+		arg.RepoKey,
 		arg.Branch,
 	)
 	if err != nil {
@@ -188,15 +242,17 @@ func (q *Queries) RegisterSessionBranchTip(ctx context.Context, arg RegisterSess
 }
 
 const registerSessionPROwnership = `-- name: RegisterSessionPROwnership :execrows
-INSERT INTO session_pr_ownerships (pr_url, session_instance_id, source_branch, head_sha, registered_at)
-SELECT ?1, b.session_instance_id, b.branch, ?2, ?3
+INSERT INTO session_pr_ownerships (pr_url, session_instance_id, repo_key, source_branch, head_sha, registered_at)
+SELECT ?1, b.session_instance_id, b.repo_key, b.branch, ?2, ?3
 FROM session_branch_ownerships b
 JOIN session_branch_tips t
   ON t.session_instance_id = b.session_instance_id
+ AND t.repo_key = b.repo_key
  AND t.branch = b.branch
  AND t.head_sha = ?2
 WHERE b.session_instance_id = ?4
-  AND b.branch = ?5
+  AND b.repo_key = ?5
+  AND b.branch = ?6
 ON CONFLICT (pr_url) DO NOTHING
 `
 
@@ -205,6 +261,7 @@ type RegisterSessionPROwnershipParams struct {
 	HeadSha           string
 	RegisteredAt      time.Time
 	SessionInstanceID string
+	RepoKey           string
 	SourceBranch      string
 }
 
@@ -214,6 +271,7 @@ func (q *Queries) RegisterSessionPROwnership(ctx context.Context, arg RegisterSe
 		arg.HeadSha,
 		arg.RegisteredAt,
 		arg.SessionInstanceID,
+		arg.RepoKey,
 		arg.SourceBranch,
 	)
 	if err != nil {

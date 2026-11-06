@@ -18,8 +18,8 @@ type branchStateStore struct {
 	recorded []string
 }
 
-func (s *branchStateStore) RecordSessionBranchTip(_ context.Context, _ domain.SessionID, branch, headSHA, _ string) (bool, error) {
-	s.recorded = append(s.recorded, branch+"@"+headSHA)
+func (s *branchStateStore) RecordSessionBranchTip(_ context.Context, _ domain.SessionID, repoKey, branch, headSHA, _ string) (bool, error) {
+	s.recorded = append(s.recorded, repoKey+"|"+branch+"@"+headSHA)
 	return true, nil
 }
 
@@ -94,7 +94,8 @@ func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
 	commitFile(t, repo, "owned.go")
 	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
 	st := &branchStateStore{fakeStore: newFakeStore()}
-	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", Metadata: domain.SessionMetadata{
+	st.projects["p"] = domain.ProjectRecord{ID: "p", RepoOriginURL: "https://github.com/o/r.git"}
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", ProjectID: "p", Metadata: domain.SessionMetadata{
 		Branch: "feature/owned", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
 	}}
 	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "ao-1"); err != nil {
@@ -102,7 +103,7 @@ func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
 	}
 	found := false
 	for _, record := range st.recorded {
-		if record == "feature/owned@"+head {
+		if record == "github|github.com|o/r|feature/owned@"+head {
 			found = true
 		}
 	}
@@ -122,7 +123,8 @@ func TestReconcileBranchStatesDoesNotAdoptRemoteOnlyBranchTip(t *testing.T) {
 	runGit(t, repo, "checkout", "main")
 	runGit(t, repo, "branch", "ao/s1/root", "main")
 	st := &branchStateStore{fakeStore: newFakeStore()}
-	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Metadata: domain.SessionMetadata{
+	st.projects["p"] = domain.ProjectRecord{ID: "p", RepoOriginURL: "https://github.com/o/r.git"}
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", ProjectID: "p", Metadata: domain.SessionMetadata{
 		Branch: "ao/s1/root", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
 	}}
 	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "s1"); err != nil {
@@ -142,17 +144,17 @@ func TestReconcileWorkspaceOwnershipRecordsChildWorktreeTip(t *testing.T) {
 	commitFile(t, child, "api.go")
 	head := strings.TrimSpace(runGit(t, child, "rev-parse", "HEAD"))
 	st := &branchStateStore{fakeStore: newFakeStore()}
-	st.projects["ws"] = domain.ProjectRecord{ID: "ws", Kind: domain.ProjectKindWorkspace}
+	st.projects["ws"] = domain.ProjectRecord{ID: "ws", Kind: domain.ProjectKindWorkspace, RepoOriginURL: "https://github.com/o/api.git"}
 	st.sessions["ws-1"] = domain.SessionRecord{ID: "ws-1", ProjectID: "ws", Metadata: domain.SessionMetadata{
 		Branch: "ao/ws-1", WorkspacePath: child,
 	}}
-	st.worktrees["ws-1"] = []domain.SessionWorktreeRecord{{RepoName: "api", Branch: "ao/ws-1/api", WorktreePath: child}}
+	st.worktrees["ws-1"] = []domain.SessionWorktreeRecord{{RepoName: "api", RepoKey: "github|github.com|o/api", Branch: "ao/ws-1/api", WorktreePath: child}}
 	if err := (&Service{store: st}).reconcileWorkspaceOwnership(context.Background(), st, st.sessions["ws-1"]); err != nil {
 		t.Fatal(err)
 	}
 	found := false
 	for _, record := range st.recorded {
-		if record == "ao/ws-1/api@"+head {
+		if record == "github|github.com|o/api|ao/ws-1/api@"+head {
 			found = true
 		}
 	}

@@ -80,8 +80,8 @@ type Store interface {
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
 	ListSessionBranchTips(ctx context.Context, instanceID string) ([]domain.SessionBranchTip, error)
-	RegisterSessionPROwnership(ctx context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
-	RefreshSessionPROwnership(ctx context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
+	RegisterSessionPROwnership(ctx context.Context, instanceID, repoKey, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
+	RefreshSessionPROwnership(ctx context.Context, instanceID, repoKey, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
 	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
 	WriteSCMObservation(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode) error
 }
@@ -305,6 +305,7 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 type subject struct {
 	session domain.SessionRecord
 	repo    ports.SCMRepo
+	repoKey string
 	branch  string
 	known   domain.PullRequest
 	hasPR   bool
@@ -319,14 +320,19 @@ type sessionRepo struct {
 	branch     string
 	workspace  bool
 	instanceID string
+	repoKey    string
 	branchTips map[string]map[string]struct{}
 }
 
+func branchTipKey(repoKey, branch string) string {
+	return repoKey + "\x00" + branch
+}
+
 func (sr sessionRepo) ownsBranchHead(branch, headSHA string) bool {
-	if strings.TrimSpace(sr.instanceID) == "" || branch == "" || headSHA == "" {
+	if strings.TrimSpace(sr.instanceID) == "" || sr.repoKey == "" || branch == "" || headSHA == "" {
 		return false
 	}
-	tips, ok := sr.branchTips[branch]
+	tips, ok := sr.branchTips[branchTipKey(sr.repoKey, branch)]
 	if !ok {
 		return false
 	}
@@ -340,10 +346,11 @@ func branchTipIndex(tips []domain.SessionBranchTip) map[string]map[string]struct
 		if tip.Branch == "" || tip.HeadSHA == "" {
 			continue
 		}
-		if out[tip.Branch] == nil {
-			out[tip.Branch] = map[string]struct{}{}
+		key := branchTipKey(tip.RepoKey, tip.Branch)
+		if out[key] == nil {
+			out[key] = map[string]struct{}{}
 		}
-		out[tip.Branch][tip.HeadSHA] = struct{}{}
+		out[key][tip.HeadSHA] = struct{}{}
 	}
 	return out
 }
@@ -652,7 +659,7 @@ func (o *Observer) Poll(ctx context.Context) error {
 		if subj.session.InstanceID != "" {
 			prURL := firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL)
 			if prURL != "" && prepared.PR.SourceBranch != "" && prepared.PR.HeadSHA != "" {
-				refreshed, refreshErr := o.store.RefreshSessionPROwnership(ctx, subj.session.InstanceID, prURL, prepared.PR.SourceBranch, prepared.PR.HeadSHA, now)
+				refreshed, refreshErr := o.store.RefreshSessionPROwnership(ctx, subj.session.InstanceID, subj.repoKey, prURL, prepared.PR.SourceBranch, prepared.PR.HeadSHA, now)
 				if refreshErr != nil {
 					o.logger.Error("scm observer: refresh PR ownership failed", "session", subj.session.ID, "pr", prURL, "err", refreshErr)
 					markRepoRefreshFailed(subj.repo)
@@ -859,7 +866,7 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 				o.logger.Warn("scm observer: duplicate tracked PR subject skipped", "pr", key, "kept_session", existing.session.ID, "skipped_session", sess.ID)
 				continue
 			}
-			out[key] = &subject{session: sess, repo: prRepo, branch: branch, known: pr, hasPR: true}
+			out[key] = &subject{session: sess, repo: prRepo, repoKey: scmRepoKey(prRepo), branch: branch, known: pr, hasPR: true}
 		}
 	}
 	return out, sessionRepos, nil
@@ -898,7 +905,7 @@ func checkoutSessionRepos(sess domain.SessionRecord, branch string, workspace bo
 				position = len(result)
 				byBase[key] = position
 				result = append(result, sessionRepo{
-					session: sess, repo: base, branch: branch, workspace: workspace,
+					session: sess, repo: base, repoKey: scmRepoKey(base), branch: branch, workspace: workspace,
 					headNames: make(map[string]struct{}),
 				})
 			}
@@ -939,10 +946,11 @@ func (o *Observer) workspaceSCMSessionRepos(ctx context.Context, proj domain.Pro
 
 func repoForTrackedPR(pr domain.PullRequest, repos []ports.SCMRepo) (ports.SCMRepo, bool) {
 	if pr.Provider != "" && pr.Host != "" && pr.Repo != "" {
-		owner, name, ok := strings.Cut(pr.Repo, "/")
-		if !ok || owner == "" || name == "" {
+		slash := strings.LastIndex(pr.Repo, "/")
+		if slash <= 0 || slash >= len(pr.Repo)-1 {
 			return ports.SCMRepo{}, false
 		}
+		owner, name := pr.Repo[:slash], pr.Repo[slash+1:]
 		return ports.SCMRepo{Provider: pr.Provider, Host: pr.Host, Owner: owner, Name: name, Repo: pr.Repo}, true
 	}
 	if pr.Repo != "" {
@@ -1172,7 +1180,7 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 			if url == "" {
 				continue
 			}
-			owned, err := o.store.RegisterSessionPROwnership(ctx, sr.instanceID, url, pr.SourceBranch, pr.HeadSHA, now)
+			owned, err := o.store.RegisterSessionPROwnership(ctx, sr.instanceID, sr.repoKey, url, pr.SourceBranch, pr.HeadSHA, now)
 			if err != nil {
 				o.logger.Error("scm observer: register PR ownership failed", "session", sr.session.ID, "branch", pr.SourceBranch, "err", err)
 				if markRepoFailed != nil {
@@ -1265,6 +1273,24 @@ func candidatesForHeadRepo(candidates []sessionRepo, headRepo string) []sessionR
 		}
 	}
 	return out
+}
+
+// scmRepoKey returns the canonical provider|host|namespace/name identity for
+// a normalized SCM repository. A missing provider/host/namespace/name fails
+// closed by returning an empty key.
+func scmRepoKey(repo ports.SCMRepo) string {
+	owner, name := repo.Owner, repo.Name
+	if owner == "" || name == "" {
+		if slash := strings.LastIndex(repo.Repo, "/"); slash > 0 && slash < len(repo.Repo)-1 {
+			owner, name = repo.Repo[:slash], repo.Repo[slash+1:]
+		}
+	}
+	if strings.TrimSpace(repo.Provider) == "" || strings.TrimSpace(repo.Host) == "" || strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	return domain.RepositoryIdentity{
+		Provider: repo.Provider, Host: repo.Host, Namespace: owner, Name: name,
+	}.Key()
 }
 
 // matchSession requires an exact, instance-owned branch tip. The branch name

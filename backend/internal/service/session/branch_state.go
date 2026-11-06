@@ -19,7 +19,7 @@ type branchStateWriter interface {
 // linked to. It is optional so older embedders that only persist branch state
 // keep working; the SCM observer simply fails closed without ownership.
 type branchOwnershipWriter interface {
-	RecordSessionBranchTip(ctx context.Context, id domain.SessionID, branch, headSHA, worktreePath string) (bool, error)
+	RecordSessionBranchTip(ctx context.Context, id domain.SessionID, repoKey, branch, headSHA, worktreePath string) (bool, error)
 }
 
 // branchStateRemote is the remote AO pushes session branches to.
@@ -27,6 +27,7 @@ const branchStateRemote = "origin"
 
 type branchTarget struct {
 	rec        domain.SessionRecord
+	repoKey    string
 	branch     string // current HEAD branch; empty on detached HEAD
 	rootBranch string // AO's original session branch
 	head       string // detached HEAD commit
@@ -104,8 +105,13 @@ func (s *Service) reconcileBranchStates(ctx context.Context, writer branchStateW
 		if !ok {
 			continue
 		}
+		repoKey := ""
+		if identity, err := domain.ParseRepositoryIdentity(project.rec.RepoOriginURL); err == nil && identity.Provider != "" && identity.Host != "" {
+			repoKey = identity.Key()
+		}
 		repos[commonDir] = append(repos[commonDir], branchTarget{
 			rec:        rec,
+			repoKey:    repoKey,
 			branch:     branch,
 			rootBranch: strings.TrimSpace(rec.Metadata.Branch),
 			head:       head,
@@ -135,6 +141,31 @@ func (s *Service) reconcileBranchStates(ctx context.Context, writer branchStateW
 	return nil
 }
 
+func (s *Service) workspaceRepoKey(ctx context.Context, rec domain.SessionRecord, repoName string) string {
+	project, ok, err := s.sessionProject(ctx, rec)
+	if err != nil || !ok {
+		return ""
+	}
+	origin := project.RepoOriginURL
+	if repoName != domain.RootWorkspaceRepoName {
+		repos, err := s.store.ListWorkspaceRepos(ctx, string(rec.ProjectID))
+		if err != nil {
+			return ""
+		}
+		for _, repo := range repos {
+			if repo.Name == repoName {
+				origin = repo.RepoOriginURL
+				break
+			}
+		}
+	}
+	identity, err := domain.ParseRepositoryIdentity(origin)
+	if err != nil || identity.Provider == "" || identity.Host == "" {
+		return ""
+	}
+	return identity.Key()
+}
+
 // reconcileWorkspaceOwnership records exact branch tips for each materialized
 // child worktree in a workspace project. Workspace projects skip the
 // single-repo branch-state path because their root may not be a Git checkout,
@@ -152,14 +183,21 @@ func (s *Service) reconcileWorkspaceOwnership(ctx context.Context, writer branch
 		if row.Branch == "" || row.WorktreePath == "" {
 			continue
 		}
+		repoKey := row.RepoKey
+		if repoKey == "" {
+			repoKey = s.workspaceRepoKey(ctx, rec, row.RepoName)
+		}
+		if repoKey == "" {
+			continue
+		}
 		_, branch, _, ok := readGitHead(row.WorktreePath)
 		if !ok {
 			continue
 		}
-		if branch != "" {
+		if row.RepoKey != "" && branch != "" {
 			if raw, err := gitWorkspaceOutput(ctx, row.WorktreePath, "rev-parse", "refs/heads/"+branch); err == nil {
 				if headSHA := strings.TrimSpace(raw); headSHA != "" {
-					if _, err := owner.RecordSessionBranchTip(ctx, rec.ID, branch, headSHA, row.WorktreePath); err != nil {
+					if _, err := owner.RecordSessionBranchTip(ctx, rec.ID, row.RepoKey, branch, headSHA, row.WorktreePath); err != nil {
 						return err
 					}
 				}
@@ -168,7 +206,7 @@ func (s *Service) reconcileWorkspaceOwnership(ctx context.Context, writer branch
 		if row.Branch != branch {
 			if raw, err := gitWorkspaceOutput(ctx, row.WorktreePath, "rev-parse", "refs/heads/"+row.Branch); err == nil {
 				if headSHA := strings.TrimSpace(raw); headSHA != "" {
-					if _, err := owner.RecordSessionBranchTip(ctx, rec.ID, row.Branch, headSHA, row.WorktreePath); err != nil {
+					if _, err := owner.RecordSessionBranchTip(ctx, rec.ID, repoKey, row.Branch, headSHA, row.WorktreePath); err != nil {
 						return err
 					}
 				}
@@ -199,16 +237,16 @@ func (s *Service) reconcileBranchTarget(ctx context.Context, writer branchStateW
 		// Only local branch refs are evidence that this workspace owns a tip.
 		// origin/<branch> may be a stale remote left by another session/data dir;
 		// it is useful for BranchState, not for ownership.
-		if target.branch != "" {
+		if target.repoKey != "" && target.branch != "" {
 			if local := tips["refs/heads/"+target.branch]; local != "" {
-				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.branch, local, target.rec.Metadata.WorkspacePath); err != nil {
+				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.repoKey, target.branch, local, target.rec.Metadata.WorkspacePath); err != nil {
 					return err
 				}
 			}
 		}
-		if target.rootBranch != "" {
+		if target.repoKey != "" && target.rootBranch != "" {
 			if rootLocal := tips["refs/heads/"+target.rootBranch]; rootLocal != "" {
-				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.rootBranch, rootLocal, target.rec.Metadata.WorkspacePath); err != nil {
+				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.repoKey, target.rootBranch, rootLocal, target.rec.Metadata.WorkspacePath); err != nil {
 					return err
 				}
 			}

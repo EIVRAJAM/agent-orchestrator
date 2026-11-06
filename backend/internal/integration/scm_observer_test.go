@@ -38,6 +38,10 @@ var scmTestRepo = ports.SCMRepo{
 
 const scmTestOriginURL = "https://github.com/octocat/hello.git"
 
+func integrationRepoKey() string {
+	return domain.RepositoryIdentity{Provider: "github", Host: "github.com", Namespace: "octocat", Name: "hello"}.Key()
+}
+
 // scmMessengerSpy is a minimal lifecycle.messenger that records every nudge so
 // tests can assert exactly which lifecycle reactions fired and what they sent.
 type scmMessengerSpy struct {
@@ -248,7 +252,7 @@ func (f *scmFixture) poll(ctx context.Context) error {
 		if pr.SourceBranch == "" || pr.HeadSHA == "" {
 			continue
 		}
-		if _, err := f.store.RecordSessionBranchTip(ctx, f.session.ID, pr.SourceBranch, pr.HeadSHA, "/ws/octo"); err != nil {
+		if _, err := f.store.RecordSessionBranchTip(ctx, f.session.ID, integrationRepoKey(), pr.SourceBranch, pr.HeadSHA, "/ws/octo"); err != nil {
 			return err
 		}
 	}

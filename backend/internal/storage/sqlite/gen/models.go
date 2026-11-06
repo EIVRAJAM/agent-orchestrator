@@ -714,6 +714,7 @@ type SessionArtifactVersion struct {
 type SessionBranchOwnership struct {
 	SessionID         string
 	SessionInstanceID string
+	RepoKey           string
 	Branch            string
 	WorktreePath      string
 	RegisteredAt      time.Time
@@ -721,6 +722,7 @@ type SessionBranchOwnership struct {
 
 type SessionBranchTip struct {
 	SessionInstanceID string
+	RepoKey           string
 	Branch            string
 	HeadSha           string
 	ObservedAt        time.Time
@@ -768,6 +770,7 @@ type SessionInterfaceTransitionMessage struct {
 type SessionPROwnership struct {
 	PRURL             string
 	SessionInstanceID string
+	RepoKey           string
 	SourceBranch      string
 	HeadSha           string
 	RegisteredAt      time.Time
@@ -783,6 +786,7 @@ type SessionWorktree struct {
 	State        string
 	BaseRef      string
 	CreationSha  string
+	RepoKey      string
 }
 
 type ShellTerminal struct {

@@ -18,24 +18,26 @@ import (
 func (s *Store) RecordSessionBranchTip(
 	ctx context.Context,
 	sessionID domain.SessionID,
-	branch, headSHA, worktreePath string,
+	repoKey, branch, headSHA, worktreePath string,
 ) (bool, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.recordSessionBranchTipLocked(ctx, sessionID, branch, headSHA, worktreePath, time.Now().UTC())
+	return s.recordSessionBranchTipLocked(ctx, sessionID, repoKey, branch, headSHA, worktreePath, time.Now().UTC())
 }
 
 func (s *Store) recordSessionBranchTipLocked(
 	ctx context.Context,
 	sessionID domain.SessionID,
-	branch, headSHA, worktreePath string,
+	repoKey, branch, headSHA, worktreePath string,
 	now time.Time,
 ) (bool, error) {
+	repoKey = strings.TrimSpace(repoKey)
 	branch = strings.TrimSpace(branch)
-	if branch == "" {
+	if repoKey == "" || branch == "" {
 		return false, nil
 	}
 	if _, err := s.qw.RegisterSessionBranch(ctx, gen.RegisterSessionBranchParams{
+		RepoKey:      repoKey,
 		Branch:       branch,
 		WorktreePath: strings.TrimSpace(worktreePath),
 		RegisteredAt: now,
@@ -61,6 +63,7 @@ func (s *Store) recordSessionBranchTipLocked(
 		HeadSha:           headSHA,
 		ObservedAt:        now,
 		SessionInstanceID: instanceID,
+		RepoKey:           repoKey,
 		Branch:            branch,
 	}); err != nil {
 		return false, fmt.Errorf("register session branch tip %s/%s: %w", branch, headSHA, err)
@@ -83,6 +86,7 @@ func (s *Store) ListSessionBranchTips(ctx context.Context, instanceID string) ([
 	for _, row := range rows {
 		out = append(out, domain.SessionBranchTip{
 			SessionInstanceID: row.SessionInstanceID,
+			RepoKey:           row.RepoKey,
 			Branch:            row.Branch,
 			HeadSHA:           row.HeadSha,
 		})
@@ -95,10 +99,10 @@ func (s *Store) ListSessionBranchTips(ctx context.Context, instanceID string) ([
 // that instance and no other instance owns the PR URL.
 func (s *Store) RegisterSessionPROwnership(
 	ctx context.Context,
-	instanceID, prURL, sourceBranch, headSHA string,
+	instanceID, repoKey, prURL, sourceBranch, headSHA string,
 	now time.Time,
 ) (bool, error) {
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(prURL) == "" || strings.TrimSpace(sourceBranch) == "" || strings.TrimSpace(headSHA) == "" {
+	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(repoKey) == "" || strings.TrimSpace(prURL) == "" || strings.TrimSpace(sourceBranch) == "" || strings.TrimSpace(headSHA) == "" {
 		return false, nil
 	}
 	s.writeMu.Lock()
@@ -108,6 +112,7 @@ func (s *Store) RegisterSessionPROwnership(
 		HeadSha:           headSHA,
 		RegisteredAt:      now,
 		SessionInstanceID: instanceID,
+		RepoKey:           repoKey,
 		SourceBranch:      sourceBranch,
 	})
 	if err != nil {
@@ -124,6 +129,7 @@ func (s *Store) RegisterSessionPROwnership(
 		return false, fmt.Errorf("read PR ownership %s: %w", prURL, findErr)
 	}
 	return existing.SessionInstanceID == instanceID &&
+		existing.RepoKey == repoKey &&
 		existing.SourceBranch == sourceBranch &&
 		existing.HeadSha == headSHA, nil
 }
@@ -133,10 +139,10 @@ func (s *Store) RegisterSessionPROwnership(
 // false for missing ownership, a different branch, or an unregistered head.
 func (s *Store) RefreshSessionPROwnership(
 	ctx context.Context,
-	instanceID, prURL, sourceBranch, headSHA string,
+	instanceID, repoKey, prURL, sourceBranch, headSHA string,
 	now time.Time,
 ) (bool, error) {
-	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(prURL) == "" ||
+	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(repoKey) == "" || strings.TrimSpace(prURL) == "" ||
 		strings.TrimSpace(sourceBranch) == "" || strings.TrimSpace(headSHA) == "" {
 		return false, nil
 	}
@@ -147,6 +153,7 @@ func (s *Store) RefreshSessionPROwnership(
 		NewRegisteredAt:      now,
 		TargetPRURL:          prURL,
 		ExpectedInstanceID:   instanceID,
+		ExpectedRepoKey:      repoKey,
 		ExpectedSourceBranch: sourceBranch,
 	})
 	if err != nil {
@@ -168,6 +175,7 @@ func (s *Store) GetSessionPROwnership(ctx context.Context, prURL string) (domain
 	return domain.SessionPROwnership{
 		PRURL:             row.PRURL,
 		SessionInstanceID: row.SessionInstanceID,
+		RepoKey:           row.RepoKey,
 		SourceBranch:      row.SourceBranch,
 		HeadSHA:           row.HeadSha,
 		RegisteredAt:      row.RegisteredAt,

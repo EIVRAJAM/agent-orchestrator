@@ -52,10 +52,10 @@ func TestSessionPROwnershipSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	branch, head, prURL := "ao/mer-1/root", "abc123", "https://github.com/acme/demo/pull/1"
-	if ok, err := s.RecordSessionBranchTip(ctx, sess.ID, branch, head, "/ws/mer-1"); err != nil || !ok {
+	if ok, err := s.RecordSessionBranchTip(ctx, sess.ID, "github|github.com|acme/demo", branch, head, "/ws/mer-1"); err != nil || !ok {
 		t.Fatalf("record branch tip: ok=%v err=%v", ok, err)
 	}
-	if ok, err := s.RegisterSessionPROwnership(ctx, sess.InstanceID, prURL, branch, head, time.Now().UTC()); err != nil || !ok {
+	if ok, err := s.RegisterSessionPROwnership(ctx, sess.InstanceID, "github|github.com|acme/demo", prURL, branch, head, time.Now().UTC()); err != nil || !ok {
 		t.Fatalf("register ownership: ok=%v err=%v", ok, err)
 	}
 	if err := s.Close(); err != nil {
@@ -75,8 +75,8 @@ func TestSessionPROwnershipSurvivesRestart(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("reopened ownership: ok=%v err=%v", ok, err)
 	}
-	if ownership.SessionInstanceID != sess.InstanceID || ownership.SourceBranch != branch || ownership.HeadSHA != head {
-		t.Fatalf("ownership = %+v, want instance=%s branch=%s head=%s", ownership, sess.InstanceID, branch, head)
+	if ownership.SessionInstanceID != sess.InstanceID || ownership.RepoKey != "github|github.com|acme/demo" || ownership.SourceBranch != branch || ownership.HeadSHA != head {
+		t.Fatalf("ownership = %+v, want instance=%s repo=github|github.com|acme/demo branch=%s head=%s", ownership, sess.InstanceID, branch, head)
 	}
 }
 
@@ -94,24 +94,24 @@ func TestSessionPROwnershipRejectsMissingTipAndConflictingInstance(t *testing.T)
 	}
 	branch, head, prURL := "ao/shared", "sha1", "https://github.com/acme/demo/pull/2"
 	// Ownership row exists, but no tip: the PR must not be adoptable.
-	if ok, err := s.RecordSessionBranchTip(ctx, a.ID, branch, "", "/ws/a"); err != nil || !ok {
+	if ok, err := s.RecordSessionBranchTip(ctx, a.ID, "github|github.com|acme/demo", branch, "", "/ws/a"); err != nil || !ok {
 		t.Fatalf("record branch without tip: ok=%v err=%v", ok, err)
 	}
-	if ok, err := s.RegisterSessionPROwnership(ctx, a.InstanceID, prURL, branch, head, time.Now().UTC()); err != nil || ok {
+	if ok, err := s.RegisterSessionPROwnership(ctx, a.InstanceID, "github|github.com|acme/demo", prURL, branch, head, time.Now().UTC()); err != nil || ok {
 		t.Fatalf("ownership without tip = %v, %v; want false,nil", ok, err)
 	}
 	// Register the same tip for both instances; the first owner wins and the
 	// second must be rejected, not silently reassigned.
-	if ok, err := s.RecordSessionBranchTip(ctx, a.ID, branch, head, "/ws/a"); err != nil || !ok {
+	if ok, err := s.RecordSessionBranchTip(ctx, a.ID, "github|github.com|acme/demo", branch, head, "/ws/a"); err != nil || !ok {
 		t.Fatalf("record a tip: ok=%v err=%v", ok, err)
 	}
-	if ok, err := s.RecordSessionBranchTip(ctx, b.ID, branch, head, "/ws/b"); err != nil || !ok {
+	if ok, err := s.RecordSessionBranchTip(ctx, b.ID, "github|github.com|acme/demo", branch, head, "/ws/b"); err != nil || !ok {
 		t.Fatalf("record b tip: ok=%v err=%v", ok, err)
 	}
-	if ok, err := s.RegisterSessionPROwnership(ctx, a.InstanceID, prURL, branch, head, time.Now().UTC()); err != nil || !ok {
+	if ok, err := s.RegisterSessionPROwnership(ctx, a.InstanceID, "github|github.com|acme/demo", prURL, branch, head, time.Now().UTC()); err != nil || !ok {
 		t.Fatalf("first ownership: ok=%v err=%v", ok, err)
 	}
-	if ok, err := s.RegisterSessionPROwnership(ctx, b.InstanceID, prURL, branch, head, time.Now().UTC()); err != nil || ok {
+	if ok, err := s.RegisterSessionPROwnership(ctx, b.InstanceID, "github|github.com|acme/demo", prURL, branch, head, time.Now().UTC()); err != nil || ok {
 		t.Fatalf("conflicting ownership: ok=%v err=%v; want false,nil", ok, err)
 	}
 	got, ok, err := s.GetSessionPROwnership(ctx, prURL)

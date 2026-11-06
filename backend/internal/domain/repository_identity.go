@@ -19,6 +19,16 @@ type RepositoryIdentity struct {
 	Name      string
 }
 
+// Key returns the canonical, human-readable ownership key for this repository.
+// Provider and host are case-folded; namespace/name retain their provider
+// spelling. There is no provider repository ID in the SCM port today, so a
+// rename or transfer changes this key and deliberately fails closed.
+func (i RepositoryIdentity) Key() string {
+	return strings.ToLower(strings.TrimSpace(i.Provider)) + "|" +
+		strings.ToLower(strings.TrimSpace(i.Host)) + "|" +
+		strings.TrimSpace(i.Namespace) + "/" + strings.TrimSpace(i.Name)
+}
+
 // RepositoryProvider follows the SCM dispatcher: recognized GitHub hosts use
 // GitHub; other hosts use GitLab, including self-managed installations.
 func RepositoryProvider(host string) string {

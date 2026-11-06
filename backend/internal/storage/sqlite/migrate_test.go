@@ -1086,3 +1086,39 @@ INSERT INTO projects (id, path, registered_at) VALUES ('alpha', '/repos/alpha', 
 		t.Fatalf("OpenReadOnly migrated projects schema:\n%s", schema)
 	}
 }
+
+func TestMigrateRepoScopedOwnershipFromExisting203Database(t *testing.T) {
+	db := openMigratedDatabaseCopy(t, 203)
+	for _, statement := range []string{
+		`INSERT INTO projects (id, path, registered_at) VALUES ('p', '/repo/p', CURRENT_TIMESTAMP)`,
+		`INSERT INTO sessions (id, project_id, num, branch, instance_id, activity_last_at, created_at, updated_at)
+		 VALUES ('s', 'p', 1, 'ao/s/root', 'inst-s', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+		`INSERT INTO session_worktrees (session_id, repo_name, branch, base_sha, worktree_path, state)
+		 VALUES ('s', '__root__', 'ao/s/root', 'base', '/ws', 'active')`,
+		`INSERT INTO session_branch_ownerships (session_id, session_instance_id, branch, worktree_path, registered_at)
+		 VALUES ('s', 'inst-s', 'ao/s/root', '/ws', CURRENT_TIMESTAMP)`,
+		`INSERT INTO session_branch_tips (session_instance_id, branch, head_sha, observed_at)
+		 VALUES ('inst-s', 'ao/s/root', 'head', CURRENT_TIMESTAMP)`,
+		`INSERT INTO session_pr_ownerships (pr_url, session_instance_id, source_branch, head_sha, registered_at)
+		 VALUES ('https://github.com/o/r/pull/1', 'inst-s', 'ao/s/root', 'head', CURRENT_TIMESTAMP)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("seed pre-0204 ownership: %v", err)
+		}
+	}
+	if err := migrate(db); err != nil {
+		t.Fatalf("migrate repo-scoped ownership: %v", err)
+	}
+	var repoKey string
+	if err := db.QueryRow(`SELECT repo_key FROM session_worktrees WHERE session_id = 's'`).Scan(&repoKey); err != nil || repoKey != "" {
+		t.Fatalf("session_worktrees repo_key = %q, err=%v; want empty historical value", repoKey, err)
+	}
+	var branchRepoKey string
+	if err := db.QueryRow(`SELECT repo_key FROM session_branch_ownerships WHERE session_instance_id = 'inst-s'`).Scan(&branchRepoKey); err != nil || branchRepoKey != "" {
+		t.Fatalf("historical branch repo_key = %q, err=%v; want empty/inert", branchRepoKey, err)
+	}
+	var prCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM session_pr_ownerships`).Scan(&prCount); err != nil || prCount != 0 {
+		t.Fatalf("historical PR ownership count = %d, err=%v; want 0 (fail closed)", prCount, err)
+	}
+}

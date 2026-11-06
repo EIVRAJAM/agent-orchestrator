@@ -115,7 +115,7 @@ func TestPoll_RemoteAttributionMatrix(t *testing.T) {
 				}
 				store := remotePollStore(project)
 				if scenario.branch != "" && len(scenario.accepted) > 0 {
-					store.addBranchTip("inst-worker-7", scenario.branch, "revision")
+					store.addBranchTip("inst-worker-7", scmRepoKey(scenario.base), scenario.branch, "revision")
 				}
 				if layout.kind == domain.ProjectKindWorkspace {
 					store.workspaceRepos["kit"] = []domain.WorkspaceRepoRecord{{Name: "component", RelativePath: "component", RepoOriginURL: remoteAddress(scenario.base)}}
