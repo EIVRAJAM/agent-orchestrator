@@ -242,8 +242,13 @@ type SessionMetadata struct {
 // facts: identity, agent harness, activity_state, is_terminated, and operational
 // metadata. The user-facing Status is derived from these facts plus PR facts.
 type SessionRecord struct {
-	ID        SessionID `json:"id"`
-	ProjectID ProjectID `json:"projectId,omitempty"`
+	ID SessionID `json:"id"`
+	// InstanceID is the durable identity of this concrete session row. It is
+	// independent of the human-facing SessionID so a fresh AO_DATA_DIR can reuse
+	// project-1 without sharing branch/PR ownership with an earlier instance.
+	// Internal ownership fact, not part of the API read model.
+	InstanceID string    `json:"-"`
+	ProjectID  ProjectID `json:"projectId,omitempty"`
 	// AutomationRunID is the optional durable origin for an unattended spawn.
 	// It is internal lifecycle data, not part of the session API read model.
 	AutomationRunID *AutomationRunID `json:"-"`
@@ -505,4 +510,23 @@ func (s Session) LastEventAt() time.Time {
 		consider(pr.LastReviewAt)
 	}
 	return latest
+}
+
+// SessionPROwnership is the durable, instance-scoped relation between a
+// session-owned branch tip and one observed pull request. It is internal
+// ownership evidence, not a display model.
+type SessionPROwnership struct {
+	PRURL             string
+	SessionInstanceID string
+	SourceBranch      string
+	HeadSHA           string
+	RegisteredAt      time.Time
+}
+
+// SessionBranchTip is one observed commit tip of a session-owned branch.
+// Ownership matching requires an exact branch + HEAD SHA pair.
+type SessionBranchTip struct {
+	SessionInstanceID string
+	Branch            string
+	HeadSHA           string
 }

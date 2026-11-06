@@ -697,6 +697,7 @@ type Session struct {
 	HibernatedAt                     sql.NullTime
 	BranchState                      string
 	RequestedOutput                  string
+	InstanceID                       string
 }
 
 type SessionArtifactVersion struct {
@@ -708,6 +709,21 @@ type SessionArtifactVersion struct {
 	ContentType string
 	Mtime       int64
 	CreatedAt   time.Time
+}
+
+type SessionBranchOwnership struct {
+	SessionID         string
+	SessionInstanceID string
+	Branch            string
+	WorktreePath      string
+	RegisteredAt      time.Time
+}
+
+type SessionBranchTip struct {
+	SessionInstanceID string
+	Branch            string
+	HeadSha           string
+	ObservedAt        time.Time
 }
 
 type SessionCleanupFact struct {
@@ -747,6 +763,14 @@ type SessionInterfaceTransitionMessage struct {
 	ClientMessageID string
 	SenderSessionID string
 	AuthoredByUser  bool
+}
+
+type SessionPROwnership struct {
+	PRURL             string
+	SessionInstanceID string
+	SourceBranch      string
+	HeadSha           string
+	RegisteredAt      time.Time
 }
 
 type SessionWorktree struct {

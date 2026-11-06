@@ -72,8 +72,10 @@ Three write paths create or update `pr` rows. All of them converge on
 identity resolution and alias collapse:
 
 1. **Observer discovery** (`discoverNewPRs`): lists open PRs per scanned repo,
-   attributes them to sessions by author identity + branch-prefix match, and
-   persists a baseline row before the first detail fetch.
+   attributes them to a session instance only when the authenticated author and
+   the PR's exact source branch + head SHA are present in that instance's durable
+   branch-ownership records, then persists a baseline row before the first
+   detail fetch. Branch names alone (and timestamps) are not ownership.
 2. **Observer refresh** (the rest of `Poll`): batch GraphQL detail fetches,
    review-thread refreshes, and terminal reconciliation update existing rows.
 3. **Explicit claim** (`ao session claim-pr`, `spawn --claim-pr`, gh-wrapper
@@ -121,7 +123,8 @@ Stage notes:
   from its checkout, restricted to that base's provider and host. Workspace
   children sharing a base contribute to the same set regardless of child order;
   their other bases retain separate sets. Discovery still checks the authenticated
-  author and session branch ownership. Unknown or deleted heads are excluded.
+  author and instance-scoped exact branch/head ownership. Unknown or deleted
+  heads are excluded.
 - **Candidate selection** is incremental: once a repo has a sync cursor, only
   PRs in the updated listing, PRs with a changed commit-check ETag, or PRs
   older than `DefaultPRMaxAge` are re-fetched.

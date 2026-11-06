@@ -26,6 +26,7 @@ type Store interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	GetPR(ctx context.Context, url string) (domain.PullRequest, bool, error)
+	GetSessionPROwnership(ctx context.Context, prURL string) (domain.SessionPROwnership, bool, error)
 	EnqueueTrackerWriteback(ctx context.Context, w domain.TrackerWriteback) (bool, error)
 	ClaimTrackerWriteback(ctx context.Context, now time.Time) (domain.TrackerWriteback, bool, error)
 	FinishTrackerWriteback(ctx context.Context, id, status, commentURL, failureCode string, now time.Time) (bool, error)
@@ -103,8 +104,12 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 	if err != nil {
 		return fmt.Errorf("load PR for tracker writeback: %w", err)
 	}
-	if !ok || !exactPRForSession(pr, rec) {
-		s.logger.Warn("tracker writeback: rejected PR association", "session", rec.ID, "reason", "pr_session_mismatch")
+	ownership, owned, err := s.store.GetSessionPROwnership(ctx, prURL)
+	if err != nil {
+		return fmt.Errorf("load PR ownership for tracker writeback: %w", err)
+	}
+	if !ok || !owned || !exactPROwnership(pr, rec, ownership) {
+		s.logger.Warn("tracker writeback: rejected PR association", "session", rec.ID, "reason", "pr_ownership_missing_or_mismatched")
 		return nil
 	}
 	now := s.now()
@@ -212,7 +217,12 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 		settle(domain.TrackerWritebackFailed, "", "pr_read")
 		return err
 	}
-	if !ok || !exactPRForSession(pr, rec) {
+	ownership, owned, err := s.store.GetSessionPROwnership(ctx, row.PRURL)
+	if err != nil {
+		settle(domain.TrackerWritebackFailed, "", "pr_ownership_read")
+		return err
+	}
+	if !ok || !owned || !exactPROwnership(pr, rec, ownership) {
 		settle(domain.TrackerWritebackFailed, "", "pr_association_invalid")
 		return nil
 	}
@@ -278,14 +288,16 @@ func (s *Service) Start(ctx context.Context) <-chan struct{} {
 	return done
 }
 
-// exactPRForSession requires the PR row to name this exact session and to have
-// been created after that session. A reused AO session id can otherwise make an
-// old PR with the same branch prefix look current.
-func exactPRForSession(pr domain.PullRequest, rec domain.SessionRecord) bool {
-	if pr.SessionID != rec.ID || pr.CreatedAtProvider.IsZero() || rec.CreatedAt.IsZero() {
-		return false
-	}
-	return !pr.CreatedAtProvider.Before(rec.CreatedAt)
+// exactPROwnership requires the durable instance/branch/head chain recorded by
+// the observer or an explicit claim. Timestamps and branch prefixes are never
+// ownership evidence.
+func exactPROwnership(pr domain.PullRequest, rec domain.SessionRecord, ownership domain.SessionPROwnership) bool {
+	return rec.InstanceID != "" &&
+		pr.SessionID == rec.ID &&
+		ownership.PRURL == pr.URL &&
+		ownership.SessionInstanceID == rec.InstanceID &&
+		ownership.SourceBranch == pr.SourceBranch &&
+		ownership.HeadSHA == pr.HeadSHA
 }
 
 func (s *Service) now() time.Time {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
@@ -24,7 +25,7 @@ func (s *Store) UpsertSessionWorktree(ctx context.Context, row domain.SessionWor
 	if state == "" {
 		state = "active"
 	}
-	return s.qw.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{
+	if err := s.qw.UpsertSessionWorktree(ctx, gen.UpsertSessionWorktreeParams{
 		SessionID:    row.SessionID,
 		RepoName:     row.RepoName,
 		Branch:       row.Branch,
@@ -34,7 +35,15 @@ func (s *Store) UpsertSessionWorktree(ctx context.Context, row domain.SessionWor
 		WorktreePath: row.WorktreePath,
 		PreservedRef: row.PreservedRef,
 		State:        state,
-	})
+	}); err != nil {
+		return err
+	}
+	headSHA := row.CreationSHA
+	if headSHA == "" {
+		headSHA = row.BaseSHA
+	}
+	_, err := s.recordSessionBranchTipLocked(ctx, row.SessionID, row.Branch, headSHA, row.WorktreePath, time.Now().UTC())
+	return err
 }
 
 // GetSessionWorktree returns one session worktree row.
