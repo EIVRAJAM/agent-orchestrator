@@ -1,7 +1,9 @@
 // Package trackerwriteback owns the single outbound tracker mutation AO
 // permits: one deterministic issue comment when a session's PR is ready for
 // review and CI is green. The durable outbox is deliberately at-most-once; a
-// lost response is recorded as uncertain and is never retried blindly.
+// lost response is recorded as uncertain and is never retried blindly. The
+// provider is read fresh immediately before the POST; a moved head, changed
+// repository, closed/draft PR, or non-green CI fails closed.
 package trackerwriteback
 
 import (
@@ -21,6 +23,13 @@ import (
 
 const defaultTick = 30 * time.Second
 
+// PRRefresher is the narrow provider-neutral read path used immediately before
+// the one outbound comment. It must return a fresh observation; the durable PR
+// row is never treated as a fresh read.
+type PRRefresher interface {
+	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
+}
+
 // Store is the durable surface needed to enqueue and deliver a write-back.
 type Store interface {
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
@@ -38,6 +47,7 @@ type Store interface {
 // comment capability. A nil commenter is a permanent, conservative failure.
 type Service struct {
 	store     Store
+	refresher PRRefresher
 	commenter ports.TrackerCommenter
 	logger    *slog.Logger
 	clock     func() time.Time
@@ -49,6 +59,12 @@ type Service struct {
 // adapter already configured for tracker intake; no new credential path is
 // introduced.
 func New(store Store, commenter ports.TrackerCommenter, logger *slog.Logger, tick time.Duration) *Service {
+	return NewWithRefresher(store, nil, commenter, logger, tick)
+}
+
+// NewWithRefresher constructs a write-back service with a fresh PR read path.
+// A nil refresher is valid and makes every delivery fail closed.
+func NewWithRefresher(store Store, refresher PRRefresher, commenter ports.TrackerCommenter, logger *slog.Logger, tick time.Duration) *Service {
 	if tick <= 0 {
 		tick = defaultTick
 	}
@@ -57,6 +73,7 @@ func New(store Store, commenter ports.TrackerCommenter, logger *slog.Logger, tic
 	}
 	return &Service{
 		store:     store,
+		refresher: refresher,
 		commenter: commenter,
 		logger:    logger,
 		clock:     func() time.Time { return time.Now().UTC() },
@@ -231,6 +248,11 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 		settle(domain.TrackerWritebackFailed, "", "pr_head_changed")
 		return nil
 	}
+	freshCode := s.verifyFreshPR(ctx, pr, ownership, row)
+	if freshCode != "" {
+		settle(domain.TrackerWritebackFailed, "", freshCode)
+		return nil
+	}
 	issue, ok := domain.ParseCanonicalIssueID(string(row.IssueID))
 	if !ok {
 		settle(domain.TrackerWritebackFailed, "", "issue_invalid")
@@ -293,16 +315,94 @@ func (s *Service) Start(ctx context.Context) <-chan struct{} {
 	return done
 }
 
-// exactPROwnership requires the durable instance/branch/head chain recorded by
-// the observer or an explicit claim. Timestamps and branch prefixes are never
-// ownership evidence.
+// exactPROwnership requires the durable instance/repository/branch/head chain
+// recorded by the observer. Timestamps and branch prefixes are never ownership
+// evidence.
 func exactPROwnership(pr domain.PullRequest, rec domain.SessionRecord, ownership domain.SessionPROwnership) bool {
-	return rec.InstanceID != "" &&
+	repoKey, _, ok := repositoryForPR(pr)
+	return ok && rec.InstanceID != "" &&
 		pr.SessionID == rec.ID &&
 		ownership.PRURL == pr.URL &&
 		ownership.SessionInstanceID == rec.InstanceID &&
+		ownership.RepoKey == repoKey &&
 		ownership.SourceBranch == pr.SourceBranch &&
 		ownership.HeadSHA == pr.HeadSHA
+}
+
+// repositoryForPR reconstructs the canonical repository identity from the
+// durable PR row. A row without a complete provider/host/namespace/name is
+// deliberately not usable for ownership or provider I/O.
+func repositoryForPR(pr domain.PullRequest) (string, ports.SCMRepo, bool) {
+	provider := strings.ToLower(strings.TrimSpace(pr.Provider))
+	host := strings.ToLower(strings.TrimSpace(pr.Host))
+	parts := strings.Split(strings.TrimSpace(pr.Repo), "/")
+	if provider == "" || host == "" || len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[len(parts)-1]) == "" {
+		return "", ports.SCMRepo{}, false
+	}
+	owner := strings.Join(parts[:len(parts)-1], "/")
+	name := parts[len(parts)-1]
+	key := domain.RepositoryIdentity{Provider: provider, Host: host, Namespace: owner, Name: name}.Key()
+	return key, ports.SCMRepo{Provider: provider, Host: host, Owner: owner, Name: name, Repo: pr.Repo}, true
+}
+
+func scmRepoKey(repo ports.SCMRepo) (string, bool) {
+	owner, name := repo.Owner, repo.Name
+	if owner == "" || name == "" {
+		owner, name, _ = strings.Cut(repo.Repo, "/")
+	}
+	if strings.TrimSpace(repo.Provider) == "" || strings.TrimSpace(repo.Host) == "" || strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
+		return "", false
+	}
+	return domain.RepositoryIdentity{Provider: repo.Provider, Host: repo.Host, Namespace: owner, Name: name}.Key(), true
+}
+
+// verifyFreshPR performs the provider read immediately before the POST. It
+// returns a closed, safe failure code and never returns or logs the provider
+// error or URL. A successful return is intentionally empty.
+func (s *Service) verifyFreshPR(ctx context.Context, pr domain.PullRequest, ownership domain.SessionPROwnership, row domain.TrackerWriteback) string {
+	if s.refresher == nil {
+		return "fresh_pr_unavailable"
+	}
+	repoKey, repo, ok := repositoryForPR(pr)
+	if !ok || repoKey != ownership.RepoKey {
+		return "pr_repository_invalid"
+	}
+	if pr.Number <= 0 {
+		return "pr_identity_invalid"
+	}
+	ref := ports.SCMPRRef{Repo: repo, Number: pr.Number, URL: pr.URL}
+	observations, err := s.refresher.FetchPullRequests(ctx, []ports.SCMPRRef{ref})
+	if err != nil || len(observations) != 1 {
+		return "fresh_pr_unavailable"
+	}
+	fresh := observations[0]
+	if !fresh.Fetched || fresh.Error != nil {
+		return "fresh_pr_unavailable"
+	}
+	freshRepoKey, ok := scmRepoKey(ports.SCMRepo{Provider: fresh.Provider, Host: fresh.Host, Repo: fresh.Repo})
+	if !ok || freshRepoKey != repoKey || freshRepoKey != ownership.RepoKey {
+		return "pr_repository_changed"
+	}
+	freshURL := firstNonEmpty(fresh.PR.URL, fresh.PR.HTMLURL)
+	if freshURL == "" || freshURL != row.PRURL || fresh.PR.Number != pr.Number {
+		return "pr_identity_changed"
+	}
+	if fresh.PR.SourceBranch != ownership.SourceBranch || fresh.PR.HeadSHA == "" || fresh.PR.HeadSHA != row.HeadSHA {
+		return "pr_head_changed"
+	}
+	if fresh.PR.Draft || fresh.PR.Merged || fresh.PR.Closed || domain.CIState(fresh.CI.Summary) != domain.CIPassing {
+		return "pr_not_ready"
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (s *Service) now() time.Time {

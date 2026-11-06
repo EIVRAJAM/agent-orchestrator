@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +23,8 @@ type fakeStore struct {
 	projects      map[string]domain.ProjectRecord
 	prs           map[string]domain.PullRequest
 	ownership     map[string]domain.SessionPROwnership
+	fresh         ports.SCMObservation
+	freshErr      error
 	rows          map[string]domain.TrackerWriteback
 	key           map[string]string
 	finishErr     error
@@ -58,6 +62,15 @@ func (f *fakeStore) GetSessionPROwnership(_ context.Context, prURL string) (doma
 	defer f.mu.Unlock()
 	ownership, ok := f.ownership[prURL]
 	return ownership, ok, nil
+}
+
+func (f *fakeStore) FetchPullRequests(_ context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.freshErr != nil {
+		return nil, f.freshErr
+	}
+	return []ports.SCMObservation{f.fresh}, nil
 }
 
 func (f *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectRecord, bool, error) {
@@ -146,6 +159,27 @@ func (f *fakeStore) rowCount() int {
 	return len(f.rows)
 }
 
+type httpPRRefresher struct {
+	url         string
+	observation ports.SCMObservation
+}
+
+func (r *httpPRRefresher) FetchPullRequests(ctx context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return nil, errors.New("unexpected fake SCM status")
+	}
+	return []ports.SCMObservation{r.observation}, nil
+}
+
 type fakeCommenter struct {
 	mu       sync.Mutex
 	calls    int
@@ -183,15 +217,20 @@ func seedWriteback(t *testing.T, enabled bool) (*Service, *fakeStore, *fakeComme
 	}
 	prURL := "https://github.com/acme/demo/pull/1"
 	st.prs[prURL] = domain.PullRequest{
-		URL: prURL, SessionID: "proj-1", SourceBranch: "feat/x", HeadSHA: "sha1",
-		CreatedAtProvider: time.Unix(101, 0).UTC(),
+		URL: prURL, SessionID: "proj-1", Number: 1, Provider: "github", Host: "github.com", Repo: "acme/demo",
+		SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
 	}
 	st.ownership[prURL] = domain.SessionPROwnership{
-		PRURL: prURL, SessionInstanceID: "inst-proj-1", SourceBranch: "feat/x", HeadSHA: "sha1",
-		RegisteredAt: time.Unix(101, 0).UTC(),
+		PRURL: prURL, SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo",
+		SourceBranch: "feat/x", HeadSHA: "sha1", RegisteredAt: time.Unix(101, 0).UTC(),
+	}
+	st.fresh = ports.SCMObservation{
+		Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/demo",
+		PR: ports.SCMPRObservation{URL: prURL, Number: 1, State: "open", SourceBranch: "feat/x", HeadSHA: "sha1"},
+		CI: ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "sha1"},
 	}
 	commenter := &fakeCommenter{}
-	svc := New(st, commenter, nil, time.Minute)
+	svc := NewWithRefresher(st, st, commenter, nil, time.Minute)
 	svc.clock = func() time.Time { return time.Unix(100, 0).UTC() }
 	svc.newID = func() string { return "wb-1" }
 	return svc, st, commenter
@@ -347,11 +386,19 @@ func TestTerminalLoggingIsSanitized(t *testing.T) {
 	st.sessions["proj-1"] = domain.SessionRecord{ID: "proj-1", InstanceID: "inst-proj-1", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker, CreatedAt: time.Unix(100, 0).UTC()}
 	st.projects["proj"] = domain.ProjectRecord{ID: "proj", Config: domain.ProjectConfig{TrackerWriteback: domain.TrackerWritebackConfig{Enabled: true}}}
 	prURL := "https://github.com/acme/demo/pull/1"
-	st.prs[prURL] = domain.PullRequest{URL: prURL, SessionID: "proj-1", SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC()}
-	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", SourceBranch: "feat/x", HeadSHA: "sha1"}
+	st.prs[prURL] = domain.PullRequest{
+		URL: prURL, SessionID: "proj-1", Number: 1, Provider: "github", Host: "github.com", Repo: "acme/demo",
+		SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
+	}
+	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo", SourceBranch: "feat/x", HeadSHA: "sha1"}
+	st.fresh = ports.SCMObservation{
+		Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/demo",
+		PR: ports.SCMPRObservation{URL: prURL, Number: 1, State: "open", SourceBranch: "feat/x", HeadSHA: "sha1"},
+		CI: ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "sha1"},
+	}
 	commenter := &fakeCommenter{}
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	svc := New(st, commenter, logger, time.Minute)
+	svc := NewWithRefresher(st, st, commenter, logger, time.Minute)
 	svc.clock = func() time.Time { return time.Unix(100, 0).UTC() }
 	svc.newID = func() string { return "wb-log" }
 	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
@@ -451,14 +498,20 @@ func TestFailedTerminalLogIsVisibleWithoutIssueContent(t *testing.T) {
 	st.projects["proj"] = domain.ProjectRecord{ID: "proj", Config: domain.ProjectConfig{TrackerWriteback: domain.TrackerWritebackConfig{Enabled: true}}}
 	prURL := "https://github.com/acme/demo/pull/1"
 	st.prs[prURL] = domain.PullRequest{
-		URL: prURL, SessionID: "proj-1", SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
+		URL: prURL, SessionID: "proj-1", Number: 1, Provider: "github", Host: "github.com", Repo: "acme/demo",
+		SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
 	}
-	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", SourceBranch: "feat/x", HeadSHA: "sha1"}
+	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo", SourceBranch: "feat/x", HeadSHA: "sha1"}
+	st.fresh = ports.SCMObservation{
+		Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/demo",
+		PR: ports.SCMPRObservation{URL: prURL, Number: 1, State: "open", SourceBranch: "feat/x", HeadSHA: "sha1"},
+		CI: ports.SCMCIObservation{Summary: string(domain.CIPassing), HeadSHA: "sha1"},
+	}
 	st.rows["wb-failed"] = domain.TrackerWriteback{
 		ID: "wb-failed", ProjectID: "proj", SessionID: "proj-1", IssueID: "github:acme/demo#12",
 		PRURL: "https://github.com/acme/demo/pull/1", HeadSHA: "sha1", Status: domain.TrackerWritebackPending,
 	}
-	svc := New(st, nil, slog.New(slog.NewTextHandler(&buf, nil)), time.Minute)
+	svc := NewWithRefresher(st, st, nil, slog.New(slog.NewTextHandler(&buf, nil)), time.Minute)
 	svc.clock = func() time.Time { return time.Unix(100, 0).UTC() }
 	if err := svc.ProcessOnce(context.Background()); err != nil {
 		t.Fatal(err)
@@ -508,6 +561,9 @@ func TestEnqueueRequiresExactDurableOwnership(t *testing.T) {
 			own.SessionInstanceID = "inst-other"
 			st.ownership[pr.URL] = own
 		},
+		"wrong repository": func(_ *fakeStore, pr *domain.PullRequest) {
+			pr.Repo = "acme/other"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc, st, _ := seedWriteback(t, true)
@@ -544,6 +600,95 @@ func TestProcessOnceRejectsHeadMovedAfterEnqueue(t *testing.T) {
 	}
 	if got := st.row("wb-1"); got.Status != domain.TrackerWritebackFailed || got.FailureCode != "pr_head_changed" {
 		t.Fatalf("row = %+v, want failed pr_head_changed", got)
+	}
+}
+
+func TestProcessOnceUsesFreshHTTPReadBeforeComment(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	svc, st, commenter := seedWriteback(t, true)
+	prURL := "https://github.com/acme/demo/pull/1"
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+		t.Fatal(err)
+	}
+	svc.refresher = &httpPRRefresher{url: server.URL, observation: st.fresh}
+	if err := svc.ProcessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || commenter.calls != 1 {
+		t.Fatalf("fresh calls=%d comment calls=%d, want 1/1", calls, commenter.calls)
+	}
+	if got := st.row("wb-1"); got.Status != domain.TrackerWritebackSent {
+		t.Fatalf("row = %+v, want sent", got)
+	}
+}
+
+func TestProcessOnceFailsClosedOnFreshPRReadFailure(t *testing.T) {
+	svc, st, commenter := seedWriteback(t, true)
+	prURL := "https://github.com/acme/demo/pull/1"
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+		t.Fatal(err)
+	}
+	st.freshErr = errors.New("provider timeout; URL must not leak")
+	if err := svc.ProcessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if commenter.calls != 0 {
+		t.Fatalf("comment calls = %d, want 0", commenter.calls)
+	}
+	if got := st.row("wb-1"); got.Status != domain.TrackerWritebackFailed || got.FailureCode != "fresh_pr_unavailable" {
+		t.Fatalf("row = %+v, want failed fresh_pr_unavailable", got)
+	}
+}
+
+func TestProcessOnceFailsClosedWhenFreshPRIsNotReady(t *testing.T) {
+	for name, tc := range map[string]struct {
+		mutate func(*domain.PullRequest, *ports.SCMObservation)
+		code   string
+	}{
+		"closed": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Closed = true }, "pr_not_ready"},
+		"merged": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Merged = true }, "pr_not_ready"},
+		"draft":  {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Draft = true }, "pr_not_ready"},
+		"ci":     {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.CI.Summary = string(domain.CIFailing) }, "pr_not_ready"},
+		"head": {func(pr *domain.PullRequest, fresh *ports.SCMObservation) {
+			pr.HeadSHA = "sha2"
+			fresh.PR.HeadSHA = "sha2"
+		}, "pr_head_changed"},
+		"repository": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.Repo = "acme/other" }, "pr_repository_changed"},
+		"url": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) {
+			fresh.PR.URL = "https://github.com/acme/demo/pull/2"
+		}, "pr_identity_changed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, st, commenter := seedWriteback(t, true)
+			prURL := "https://github.com/acme/demo/pull/1"
+			if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+				t.Fatal(err)
+			}
+			pr := st.prs[prURL]
+			fresh := st.fresh
+			tc.mutate(&pr, &fresh)
+			st.prs[prURL] = pr
+			st.fresh = fresh
+			if name == "head" {
+				own := st.ownership[prURL]
+				own.HeadSHA = "sha2"
+				st.ownership[prURL] = own
+			}
+			if err := svc.ProcessOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if commenter.calls != 0 {
+				t.Fatalf("comment calls = %d, want 0", commenter.calls)
+			}
+			if got := st.row("wb-1"); got.Status != domain.TrackerWritebackFailed || got.FailureCode != tc.code {
+				t.Fatalf("row = %+v, want failed %s", got, tc.code)
+			}
+		})
 	}
 }
 
