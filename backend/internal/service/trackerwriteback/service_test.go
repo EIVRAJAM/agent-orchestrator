@@ -64,7 +64,7 @@ func (f *fakeStore) GetSessionPROwnership(_ context.Context, prURL string) (doma
 	return ownership, ok, nil
 }
 
-func (f *fakeStore) FetchPullRequests(_ context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+func (f *fakeStore) FetchPullRequestsFresh(_ context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.freshErr != nil {
@@ -164,7 +164,7 @@ type httpPRRefresher struct {
 	observation ports.SCMObservation
 }
 
-func (r *httpPRRefresher) FetchPullRequests(ctx context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+func (r *httpPRRefresher) FetchPullRequestsFresh(ctx context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.url, nil)
 	if err != nil {
 		return nil, err
@@ -178,6 +178,23 @@ func (r *httpPRRefresher) FetchPullRequests(ctx context.Context, _ []ports.SCMPR
 		return nil, errors.New("unexpected fake SCM status")
 	}
 	return []ports.SCMObservation{r.observation}, nil
+}
+
+type dualPRRefresher struct {
+	cached      ports.SCMObservation
+	fresh       ports.SCMObservation
+	cachedCalls int
+	freshCalls  int
+}
+
+func (r *dualPRRefresher) FetchPullRequests(_ context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	r.cachedCalls++
+	return []ports.SCMObservation{r.cached}, nil
+}
+
+func (r *dualPRRefresher) FetchPullRequestsFresh(_ context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	r.freshCalls++
+	return []ports.SCMObservation{r.fresh}, nil
 }
 
 type fakeCommenter struct {
@@ -603,6 +620,27 @@ func TestProcessOnceRejectsHeadMovedAfterEnqueue(t *testing.T) {
 	}
 }
 
+func TestProcessOnceUsesExplicitFreshProviderRead(t *testing.T) {
+	svc, st, commenter := seedWriteback(t, true)
+	prURL := "https://github.com/acme/demo/pull/1"
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+		t.Fatal(err)
+	}
+	cached := st.fresh
+	cached.PR.Closed = true
+	refresher := &dualPRRefresher{cached: cached, fresh: st.fresh}
+	svc.refresher = refresher
+	if err := svc.ProcessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if refresher.cachedCalls != 0 || refresher.freshCalls != 1 {
+		t.Fatalf("cached calls=%d fresh calls=%d, want 0/1", refresher.cachedCalls, refresher.freshCalls)
+	}
+	if commenter.calls != 1 {
+		t.Fatalf("comment calls = %d, want 1", commenter.calls)
+	}
+}
+
 func TestProcessOnceUsesFreshHTTPReadBeforeComment(t *testing.T) {
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -650,10 +688,11 @@ func TestProcessOnceFailsClosedWhenFreshPRIsNotReady(t *testing.T) {
 		mutate func(*domain.PullRequest, *ports.SCMObservation)
 		code   string
 	}{
-		"closed": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Closed = true }, "pr_not_ready"},
-		"merged": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Merged = true }, "pr_not_ready"},
-		"draft":  {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Draft = true }, "pr_not_ready"},
-		"ci":     {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.CI.Summary = string(domain.CIFailing) }, "pr_not_ready"},
+		"closed":  {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Closed = true }, "pr_not_ready"},
+		"merged":  {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Merged = true }, "pr_not_ready"},
+		"draft":   {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.PR.Draft = true }, "pr_not_ready"},
+		"ci":      {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.CI.Summary = string(domain.CIFailing) }, "pr_not_ready"},
+		"ci head": {func(_ *domain.PullRequest, fresh *ports.SCMObservation) { fresh.CI.HeadSHA = "other" }, "pr_head_changed"},
 		"head": {func(pr *domain.PullRequest, fresh *ports.SCMObservation) {
 			pr.HeadSHA = "sha2"
 			fresh.PR.HeadSHA = "sha2"

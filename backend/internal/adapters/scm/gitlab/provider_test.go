@@ -2590,6 +2590,90 @@ func TestFetchPullRequests_ReusesMRDetailFromListCache(t *testing.T) {
 // TestFetchPullRequests_ColdCache_FetchesMRDetailViaHTTP verifies the
 // fallback path: with no prior listing (cold MR-detail cache), FetchPullRequests
 // fetches the MR detail endpoint via HTTP and returns the correct result.
+func TestFetchPullRequestsFreshBypassesPipelineListCache(t *testing.T) {
+	var pipelineHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{mrDetailFixture(1, "base123")})
+	})
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/1", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(mrDetailFixture(1, "base123"))
+	})
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/1/approvals", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"approved": true, "approvals_required": 1, "approved_by": []any{}})
+	})
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/pipelines", func(w http.ResponseWriter, r *http.Request) {
+		pipelineHits.Add(1)
+		if r.Header.Get("If-None-Match") == "pipeline-etag" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", "pipeline-etag")
+		status := "success"
+		if pipelineHits.Load() > 1 {
+			status = "failed"
+		}
+		json.NewEncoder(w).Encode([]map[string]any{{"id": 100, "status": status, "sha": "abc123"}})
+	})
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/pipelines/100/jobs", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{{"id": 200, "name": "build", "status": "success", "web_url": "https://gitlab.com/jobs/200"}})
+	})
+	_, p := testServer(t, mux)
+	repo := ports.SCMRepo{Provider: "gitlab", Host: "gitlab.com", Owner: "myorg", Name: "myrepo", Repo: "myorg/myrepo"}
+	if _, err := p.ListPRsByRepo(context.Background(), repo, time.Time{}); err != nil {
+		t.Fatalf("ListPRsByRepo: %v", err)
+	}
+	ref := ports.SCMPRRef{Repo: repo, Number: 1, URL: "https://gitlab.com/myorg/myrepo/-/merge_requests/1"}
+	cached, err := p.FetchPullRequests(context.Background(), []ports.SCMPRRef{ref})
+	if err != nil || len(cached) != 1 || cached[0].CI.Summary != string(domain.CIPassing) {
+		t.Fatalf("cached FetchPullRequests = %+v err=%v, want passing", cached, err)
+	}
+	fresh, err := p.FetchPullRequestsFresh(context.Background(), []ports.SCMPRRef{ref})
+	if err != nil || len(fresh) != 1 || fresh[0].CI.Summary != string(domain.CIFailing) {
+		t.Fatalf("fresh FetchPullRequests = %+v err=%v, want failing", fresh, err)
+	}
+	if got := pipelineHits.Load(); got != 2 {
+		t.Fatalf("pipeline list hits = %d, want 2 (fresh path must bypass ETag replay)", got)
+	}
+}
+
+func TestFetchPullRequestsFreshBypassesMRDetailCache(t *testing.T) {
+	var mrDetailHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests", func(w http.ResponseWriter, r *http.Request) {
+		cached := mrDetailFixture(1, "base123")
+		cached["sha"] = "cachedsha"
+		json.NewEncoder(w).Encode([]map[string]any{cached})
+	})
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/merge_requests/1", func(w http.ResponseWriter, r *http.Request) {
+		mrDetailHits.Add(1)
+		fresh := mrDetailFixture(1, "base123")
+		fresh["sha"] = "freshsha"
+		json.NewEncoder(w).Encode(fresh)
+	})
+	registerMRSupportingEndpoints(mux)
+	_, p := testServer(t, mux)
+	repo := ports.SCMRepo{Provider: "gitlab", Host: "gitlab.com", Owner: "myorg", Name: "myrepo", Repo: "myorg/myrepo"}
+	if _, err := p.ListPRsByRepo(context.Background(), repo, time.Time{}); err != nil {
+		t.Fatalf("ListPRsByRepo: %v", err)
+	}
+	ref := ports.SCMPRRef{Repo: repo, Number: 1, URL: "https://gitlab.com/myorg/myrepo/-/merge_requests/1"}
+	cached, err := p.FetchPullRequests(context.Background(), []ports.SCMPRRef{ref})
+	if err != nil || len(cached) != 1 || cached[0].PR.HeadSHA != "cachedsha" {
+		t.Fatalf("cached FetchPullRequests = %+v err=%v, want cachedsha", cached, err)
+	}
+	if got := mrDetailHits.Load(); got != 0 {
+		t.Fatalf("cached detail hits = %d, want 0", got)
+	}
+	fresh, err := p.FetchPullRequestsFresh(context.Background(), []ports.SCMPRRef{ref})
+	if err != nil || len(fresh) != 1 || fresh[0].PR.HeadSHA != "freshsha" {
+		t.Fatalf("fresh FetchPullRequests = %+v err=%v, want freshsha", fresh, err)
+	}
+	if got := mrDetailHits.Load(); got != 1 {
+		t.Fatalf("fresh detail hits = %d, want 1", got)
+	}
+}
+
 func TestFetchPullRequests_ColdCache_FetchesMRDetailViaHTTP(t *testing.T) {
 	var mrDetailHits atomic.Int32
 	mux := http.NewServeMux()

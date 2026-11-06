@@ -264,6 +264,13 @@ func (p *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef)
 	return out, nil
 }
 
+// FetchPullRequestsFresh is the explicit pre-write-back read. GitHub's
+// GraphQL PR fetch is already uncached; this wrapper makes that guarantee part
+// of the provider surface instead of relying on the polling method.
+func (p *Provider) FetchPullRequestsFresh(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	return p.FetchPullRequests(ctx, refs)
+}
+
 // FetchFailedCheckLogTail fetches and tails a failed GitHub Actions job log.
 func (p *Provider) FetchFailedCheckLogTail(ctx context.Context, repo ports.SCMRepo, check ports.SCMCheckObservation) (string, error) {
 	if check.ProviderID == "" {

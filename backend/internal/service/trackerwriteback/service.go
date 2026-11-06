@@ -27,7 +27,9 @@ const defaultTick = 30 * time.Second
 // the one outbound comment. It must return a fresh observation; the durable PR
 // row is never treated as a fresh read.
 type PRRefresher interface {
-	FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
+	// FetchPullRequestsFresh must bypass provider polling caches. A provider
+	// without that capability must fail closed before the POST.
+	FetchPullRequestsFresh(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
 }
 
 // Store is the durable surface needed to enqueue and deliver a write-back.
@@ -371,7 +373,7 @@ func (s *Service) verifyFreshPR(ctx context.Context, pr domain.PullRequest, owne
 		return "pr_identity_invalid"
 	}
 	ref := ports.SCMPRRef{Repo: repo, Number: pr.Number, URL: pr.URL}
-	observations, err := s.refresher.FetchPullRequests(ctx, []ports.SCMPRRef{ref})
+	observations, err := s.refresher.FetchPullRequestsFresh(ctx, []ports.SCMPRRef{ref})
 	if err != nil || len(observations) != 1 {
 		return "fresh_pr_unavailable"
 	}
@@ -388,6 +390,9 @@ func (s *Service) verifyFreshPR(ctx context.Context, pr domain.PullRequest, owne
 		return "pr_identity_changed"
 	}
 	if fresh.PR.SourceBranch != ownership.SourceBranch || fresh.PR.HeadSHA == "" || fresh.PR.HeadSHA != row.HeadSHA {
+		return "pr_head_changed"
+	}
+	if fresh.CI.HeadSHA != "" && fresh.CI.HeadSHA != row.HeadSHA {
 		return "pr_head_changed"
 	}
 	if fresh.PR.Draft || fresh.PR.Merged || fresh.PR.Closed || domain.CIState(fresh.CI.Summary) != domain.CIPassing {

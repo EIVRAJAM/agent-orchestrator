@@ -97,7 +97,24 @@ func (m *Provider) CommitChecksGuard(ctx context.Context, repo ports.SCMRepo, he
 // per-observation routing classifies rate-limit vs non-rate-limit per
 // provider. Returning a top-level error would cause the observer to apply
 // one error classification to ALL refs across ALL providers.
+type freshPRProvider interface {
+	FetchPullRequestsFresh(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error)
+}
+
+// FetchPullRequests delegates the existing cached polling read to each
+// sub-provider.
 func (m *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	return m.fetchPullRequests(ctx, refs, false)
+}
+
+// FetchPullRequestsFresh requires each selected sub-provider to implement an
+// explicit uncached read. A provider without that capability fails closed
+// rather than silently serving a polling cache.
+func (m *Provider) FetchPullRequestsFresh(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	return m.fetchPullRequests(ctx, refs, true)
+}
+
+func (m *Provider) fetchPullRequests(ctx context.Context, refs []ports.SCMPRRef, fresh bool) ([]ports.SCMObservation, error) {
 	// Partition refs by provider key.
 	groups := make(map[string][]indexedRef)
 	for i, r := range refs {
@@ -126,7 +143,17 @@ func (m *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef)
 		for j, ir := range irefs {
 			batch[j] = ir.ref
 		}
-		obs, err := p.FetchPullRequests(ctx, batch)
+		var obs []ports.SCMObservation
+		if fresh {
+			fp, ok := p.(freshPRProvider)
+			if !ok {
+				err = fmt.Errorf("scm multi: provider %q lacks fresh PR read", key)
+			} else {
+				obs, err = fp.FetchPullRequestsFresh(ctx, batch)
+			}
+		} else {
+			obs, err = p.FetchPullRequests(ctx, batch)
+		}
 		if err != nil {
 			groupErrs[key] = err
 		}
