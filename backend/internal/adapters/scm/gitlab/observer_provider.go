@@ -390,6 +390,17 @@ func (p *Provider) CommitChecksGuard(ctx context.Context, repo ports.SCMRepo, he
 // last durable state is preserved and ETags/cursors are not advanced (review
 // finding #1).
 func (p *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	return p.fetchPullRequests(ctx, refs, false)
+}
+
+// FetchPullRequestsFresh performs the same provider reads while bypassing the
+// MR-detail TTL cache. It is used by the pre-write-back freshness check; the
+// cached FetchPullRequests path remains the polling optimization.
+func (p *Provider) FetchPullRequestsFresh(ctx context.Context, refs []ports.SCMPRRef) ([]ports.SCMObservation, error) {
+	return p.fetchPullRequests(ctx, refs, true)
+}
+
+func (p *Provider) fetchPullRequests(ctx context.Context, refs []ports.SCMPRRef, fresh bool) ([]ports.SCMObservation, error) {
 	if len(refs) > 25 {
 		return nil, fmt.Errorf("gitlab scm: batch size %d exceeds limit 25", len(refs))
 	}
@@ -406,7 +417,7 @@ func (p *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef)
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			obs, err := p.fetchSingleMR(ctx, r)
+			obs, err := p.fetchSingleMR(ctx, r, fresh)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -434,7 +445,7 @@ func (p *Provider) FetchPullRequests(ctx context.Context, refs []ports.SCMPRRef)
 	return results, firstErr
 }
 
-func (p *Provider) fetchSingleMR(ctx context.Context, ref ports.SCMPRRef) (ports.SCMObservation, error) {
+func (p *Provider) fetchSingleMR(ctx context.Context, ref ports.SCMPRRef, fresh bool) (ports.SCMObservation, error) {
 	repo := ref.Repo
 	now := time.Now()
 
@@ -457,11 +468,22 @@ func (p *Provider) fetchSingleMR(ctx context.Context, ref ports.SCMPRRef) (ports
 	// documents it. If the cached entry lacks diff_refs.base_sha, fall through
 	// to the HTTP GET rather than emitting an empty BaseSHA.
 	var mr restMR
-	if cached, ok := p.cache.getMRDetail(repo.Host, repo.Repo, ref.Number); ok && cached.DiffRefs.BaseSHA != "" {
-		mr = *cached
+	if !fresh {
+		if cached, ok := p.cache.getMRDetail(repo.Host, repo.Repo, ref.Number); ok && cached.DiffRefs.BaseSHA != "" {
+			mr = *cached
+		} else {
+			mrPath := fmt.Sprintf("/projects/%s/merge_requests/%d", projectPath(repo.Owner, repo.Name), ref.Number)
+			mrResp, err := hc.doGET(ctx, mrPath, nil)
+			if err != nil {
+				return ports.SCMObservation{}, err
+			}
+			if err := json.Unmarshal(mrResp.Body, &mr); err != nil {
+				return ports.SCMObservation{}, fmt.Errorf("gitlab scm: unmarshal MR detail: %w", err)
+			}
+		}
 	} else {
 		mrPath := fmt.Sprintf("/projects/%s/merge_requests/%d", projectPath(repo.Owner, repo.Name), ref.Number)
-		mrResp, err := hc.doGET(ctx, mrPath, nil)
+		mrResp, err := hc.doGETFresh(ctx, mrPath, nil)
 		if err != nil {
 			return ports.SCMObservation{}, err
 		}
@@ -469,7 +491,6 @@ func (p *Provider) fetchSingleMR(ctx context.Context, ref ports.SCMPRRef) (ports
 			return ports.SCMObservation{}, fmt.Errorf("gitlab scm: unmarshal MR detail: %w", err)
 		}
 	}
-
 	prObs := mrToSCMPRObservation(repo, &mr)
 	canonicalRepo := canonicalRepoFromMRURL(repo.Host, prObs.URL, repo.Repo)
 	if mr.SourceProjectID == 0 || mr.SourceProjectID == mr.TargetProjectID {
@@ -510,7 +531,7 @@ func (p *Provider) fetchSingleMR(ctx context.Context, ref ports.SCMPRRef) (ports
 	// 2. Fetch CI (pipelines + jobs). A transient failure here must propagate
 	// as an error so the observer preserves the last durable CI state rather
 	// than overwriting it with "unknown"
-	ciObs, err := p.fetchCI(ctx, repo, mr.SHA)
+	ciObs, err := p.fetchCI(ctx, repo, mr.SHA, fresh)
 	if err != nil {
 		return ports.SCMObservation{}, fmt.Errorf("gitlab scm: fetch CI: %w", err)
 	}
@@ -590,7 +611,7 @@ func (p *Provider) fetchSourceProjectCached(ctx context.Context, hc *Client, hos
 	return srcProj.PathWithNamespace, nil
 }
 
-func (p *Provider) fetchCI(ctx context.Context, repo ports.SCMRepo, headSHA string) (ports.SCMCIObservation, error) {
+func (p *Provider) fetchCI(ctx context.Context, repo ports.SCMRepo, headSHA string, fresh bool) (ports.SCMCIObservation, error) {
 	if headSHA == "" {
 		return ports.SCMCIObservation{Summary: string(domain.CIUnknown)}, nil
 	}
@@ -613,7 +634,12 @@ func (p *Provider) fetchCI(ctx context.Context, repo ports.SCMRepo, headSHA stri
 		return ports.SCMCIObservation{}, err
 	}
 
-	resp, err := hc.doGET(ctx, path, q)
+	var resp RESTResponse
+	if fresh {
+		resp, err = hc.doGETFresh(ctx, path, q)
+	} else {
+		resp, err = hc.doGET(ctx, path, q)
+	}
 	if err != nil {
 		return ports.SCMCIObservation{}, fmt.Errorf("fetch pipelines: %w", err)
 	}

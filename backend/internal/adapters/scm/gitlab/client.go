@@ -282,6 +282,33 @@ func (c *Client) doGET(ctx context.Context, path string, q url.Values) (RESTResp
 	}, nil
 }
 
+// doGETFresh performs one uncached GET. It is used by the pre-write-back
+// freshness path so a cached ETag body cannot stand in for current CI.
+func (c *Client) doGETFresh(ctx context.Context, path string, q url.Values) (RESTResponse, error) {
+	u := c.restURL(path, q)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, http.NoBody)
+	if err != nil {
+		return RESTResponse{}, err
+	}
+	if err := c.authorize(ctx, req); err != nil {
+		return RESTResponse{}, err
+	}
+	req.Header.Set("User-Agent", c.userAgent)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return RESTResponse{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := readResponseBody(resp, path)
+	if err != nil {
+		return RESTResponse{StatusCode: resp.StatusCode}, err
+	}
+	if resp.StatusCode >= 400 {
+		return RESTResponse{StatusCode: resp.StatusCode, Body: body}, classifyError(resp, body)
+	}
+	return RESTResponse{StatusCode: resp.StatusCode, ETag: resp.Header.Get("ETag"), Body: body}, nil
+}
+
 // doGETRaw performs a GET and returns the raw body bytes (e.g. job trace).
 //
 // The response body is streamed through a fixed-size rolling tail of

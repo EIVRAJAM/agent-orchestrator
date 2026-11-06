@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
@@ -125,6 +127,10 @@ func (s *Store) createSessionLocked(ctx context.Context, rec domain.SessionRecor
 		}
 		num++
 	}
+	// A new row always gets a fresh instance identity. Callers cannot supply one:
+	// copying a SessionRecord (as tests and some clone paths do) must never merge
+	// ownership namespaces.
+	rec.InstanceID = uuid.NewString()
 	if err := s.qw.InsertSession(ctx, recordToInsert(rec, num)); err != nil {
 		if rec.ClientRequestID != "" {
 			existing, found, reloadErr := s.getSessionByClientRequestID(ctx, s.qw, rec.ClientRequestID)
@@ -835,6 +841,7 @@ func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 	return domain.SessionRecord{
 		Revision:                  row.Revision,
 		ID:                        row.ID,
+		InstanceID:                row.InstanceID,
 		ProjectID:                 projectIDValue(row.ProjectID),
 		AutomationRunID:           row.AutomationRunID,
 		AutomationLaunchCompleted: row.AutomationLaunchCompleted,
@@ -950,6 +957,7 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 	activity := normalActivity(rec.Activity, rec.CreatedAt)
 	return gen.InsertSessionParams{
 		ID:                               rec.ID,
+		InstanceID:                       rec.InstanceID,
 		ProjectID:                        optionalProjectID(rec.ProjectID),
 		Num:                              num,
 		IssueID:                          rec.IssueID,

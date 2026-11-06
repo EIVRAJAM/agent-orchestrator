@@ -15,15 +15,24 @@ type branchStateWriter interface {
 	SetSessionBranchState(ctx context.Context, id domain.SessionID, state domain.SessionBranchState) (bool, error)
 }
 
+// branchOwnershipWriter records the exact local branch tip the workspace is
+// linked to. It is optional so older embedders that only persist branch state
+// keep working; the SCM observer simply fails closed without ownership.
+type branchOwnershipWriter interface {
+	RecordSessionBranchTip(ctx context.Context, id domain.SessionID, repoKey, branch, headSHA, worktreePath string) (bool, error)
+}
+
 // branchStateRemote is the remote AO pushes session branches to.
 const branchStateRemote = "origin"
 
 type branchTarget struct {
-	rec      domain.SessionRecord
-	branch   string // empty on a detached HEAD
-	head     string // detached HEAD commit
-	baseRefs []string
-	baseSHA  string
+	rec        domain.SessionRecord
+	repoKey    string
+	branch     string // current HEAD branch; empty on detached HEAD
+	rootBranch string // AO's original session branch
+	head       string // detached HEAD commit
+	baseRefs   []string
+	baseSHA    string
 }
 
 // ReconcileBranchStates refreshes every live session's persisted branch facts.
@@ -87,18 +96,27 @@ func (s *Service) reconcileBranchStates(ctx context.Context, writer branchStateW
 			projects[rec.ProjectID] = project
 		}
 		if project.ok && project.rec.Kind.WithDefault() == domain.ProjectKindWorkspace {
+			if err := s.reconcileWorkspaceOwnership(ctx, writer, rec); err != nil {
+				return err
+			}
 			continue
 		}
 		commonDir, branch, head, ok := readGitHead(rec.Metadata.WorkspacePath)
 		if !ok {
 			continue
 		}
+		repoKey := ""
+		if identity, err := domain.ParseRepositoryIdentity(project.rec.RepoOriginURL); err == nil && identity.Provider != "" && identity.Host != "" {
+			repoKey = identity.Key()
+		}
 		repos[commonDir] = append(repos[commonDir], branchTarget{
-			rec:      rec,
-			branch:   branch,
-			head:     head,
-			baseRefs: branchBaseRefs(rec.Metadata.DiffBaseRef, defaultBranchForProject(project.rec, project.ok)),
-			baseSHA:  strings.TrimSpace(rec.Metadata.DiffBaseSHA),
+			rec:        rec,
+			repoKey:    repoKey,
+			branch:     branch,
+			rootBranch: strings.TrimSpace(rec.Metadata.Branch),
+			head:       head,
+			baseRefs:   branchBaseRefs(rec.Metadata.DiffBaseRef, defaultBranchForProject(project.rec, project.ok)),
+			baseSHA:    strings.TrimSpace(rec.Metadata.DiffBaseSHA),
 		})
 	}
 	if full {
@@ -123,6 +141,81 @@ func (s *Service) reconcileBranchStates(ctx context.Context, writer branchStateW
 	return nil
 }
 
+func (s *Service) workspaceRepoKey(ctx context.Context, rec domain.SessionRecord, repoName string) string {
+	project, ok, err := s.sessionProject(ctx, rec)
+	if err != nil || !ok {
+		return ""
+	}
+	origin := project.RepoOriginURL
+	if repoName != domain.RootWorkspaceRepoName {
+		repos, err := s.store.ListWorkspaceRepos(ctx, string(rec.ProjectID))
+		if err != nil {
+			return ""
+		}
+		for _, repo := range repos {
+			if repo.Name == repoName {
+				origin = repo.RepoOriginURL
+				break
+			}
+		}
+	}
+	identity, err := domain.ParseRepositoryIdentity(origin)
+	if err != nil || identity.Provider == "" || identity.Host == "" {
+		return ""
+	}
+	return identity.Key()
+}
+
+// reconcileWorkspaceOwnership records exact branch tips for each materialized
+// child worktree in a workspace project. Workspace projects skip the
+// single-repo branch-state path because their root may not be a Git checkout,
+// but their PRs still need durable instance ownership.
+func (s *Service) reconcileWorkspaceOwnership(ctx context.Context, writer branchStateWriter, rec domain.SessionRecord) error {
+	owner, ok := writer.(branchOwnershipWriter)
+	if !ok {
+		return nil
+	}
+	rows, err := s.store.ListSessionWorktrees(ctx, rec.ID)
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.Branch == "" || row.WorktreePath == "" {
+			continue
+		}
+		repoKey := row.RepoKey
+		if repoKey == "" {
+			repoKey = s.workspaceRepoKey(ctx, rec, row.RepoName)
+		}
+		if repoKey == "" {
+			continue
+		}
+		_, branch, _, ok := readGitHead(row.WorktreePath)
+		if !ok {
+			continue
+		}
+		if row.RepoKey != "" && branch != "" {
+			if raw, err := gitWorkspaceOutput(ctx, row.WorktreePath, "rev-parse", "refs/heads/"+branch); err == nil {
+				if headSHA := strings.TrimSpace(raw); headSHA != "" {
+					if _, err := owner.RecordSessionBranchTip(ctx, rec.ID, row.RepoKey, branch, headSHA, row.WorktreePath); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if row.Branch != branch {
+			if raw, err := gitWorkspaceOutput(ctx, row.WorktreePath, "rev-parse", "refs/heads/"+row.Branch); err == nil {
+				if headSHA := strings.TrimSpace(raw); headSHA != "" {
+					if _, err := owner.RecordSessionBranchTip(ctx, rec.ID, repoKey, row.Branch, headSHA, row.WorktreePath); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Service) reconcileBranchTarget(ctx context.Context, writer branchStateWriter, target branchTarget, tips map[string]string) error {
 	local := target.head
 	remote := ""
@@ -138,6 +231,25 @@ func (s *Service) reconcileBranchTarget(ctx context.Context, writer branchStateW
 		if sha := tips[ref]; sha != "" {
 			base = sha
 			break
+		}
+	}
+	if owner, ok := writer.(branchOwnershipWriter); ok {
+		// Only local branch refs are evidence that this workspace owns a tip.
+		// origin/<branch> may be a stale remote left by another session/data dir;
+		// it is useful for BranchState, not for ownership.
+		if target.repoKey != "" && target.branch != "" {
+			if local := tips["refs/heads/"+target.branch]; local != "" {
+				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.repoKey, target.branch, local, target.rec.Metadata.WorkspacePath); err != nil {
+					return err
+				}
+			}
+		}
+		if target.repoKey != "" && target.rootBranch != "" {
+			if rootLocal := tips["refs/heads/"+target.rootBranch]; rootLocal != "" {
+				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.repoKey, target.rootBranch, rootLocal, target.rec.Metadata.WorkspacePath); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	rec := target.rec
@@ -193,6 +305,10 @@ func readRefTips(ctx context.Context, targets []branchTarget) (map[string]string
 		if target.branch != "" {
 			add("refs/heads/" + target.branch)
 			add("refs/remotes/" + branchStateRemote + "/" + target.branch)
+		}
+		if target.rootBranch != "" && target.rootBranch != target.branch {
+			add("refs/heads/" + target.rootBranch)
+			add("refs/remotes/" + branchStateRemote + "/" + target.rootBranch)
 		}
 		for _, ref := range target.baseRefs {
 			add(ref)

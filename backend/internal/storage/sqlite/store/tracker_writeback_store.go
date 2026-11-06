@@ -60,7 +60,7 @@ func (s *Store) ClaimTrackerWriteback(ctx context.Context, now time.Time) (domai
 	if err != nil {
 		return domain.TrackerWriteback{}, false, fmt.Errorf("claim tracker writeback: %w", err)
 	}
-	return trackerWritebackFromRow(row), true, nil
+	return trackerWritebackFromClaimRow(row), true, nil
 }
 
 // FinishTrackerWriteback settles a claimed row. The status guard makes a
@@ -107,27 +107,25 @@ func (s *Store) ListTrackerWritebacks(ctx context.Context, status string, limit,
 	}
 	out := make([]domain.TrackerWriteback, len(rows))
 	for i, row := range rows {
-		out[i] = trackerWritebackFromRow(row)
+		out[i] = trackerWritebackFromListRow(row)
 	}
 	return out, nil
 }
 
-func trackerWritebackFromRow(row gen.TrackerWriteback) domain.TrackerWriteback {
-	out := domain.TrackerWriteback{
-		ID:          row.ID,
-		ProjectID:   domain.ProjectID(row.ProjectID),
-		SessionID:   domain.SessionID(row.SessionID),
-		IssueID:     domain.IssueID(row.IssueID),
-		PRURL:       row.PRURL,
-		Status:      row.Status,
-		Attempts:    int(row.Attempts),
-		CommentURL:  row.CommentURL,
-		FailureCode: row.FailureCode,
-		CreatedAt:   row.CreatedAt,
-		UpdatedAt:   row.UpdatedAt,
+func trackerWritebackFromClaimRow(row gen.ClaimTrackerWritebackRow) domain.TrackerWriteback {
+	return domain.TrackerWriteback{
+		ID: row.ID, ProjectID: domain.ProjectID(row.ProjectID), SessionID: domain.SessionID(row.SessionID),
+		IssueID: domain.IssueID(row.IssueID), PRURL: row.PRURL, HeadSHA: row.HeadSha, Status: row.Status,
+		Attempts: int(row.Attempts), CommentURL: row.CommentURL, FailureCode: row.FailureCode,
+		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ClaimedAt: nullTimePtr(row.ClaimedAt),
 	}
-	if row.ClaimedAt.Valid {
-		out.ClaimedAt = &row.ClaimedAt.Time
+}
+
+func trackerWritebackFromListRow(row gen.ListTrackerWritebacksRow) domain.TrackerWriteback {
+	return domain.TrackerWriteback{
+		ID: row.ID, ProjectID: domain.ProjectID(row.ProjectID), SessionID: domain.SessionID(row.SessionID),
+		IssueID: domain.IssueID(row.IssueID), PRURL: row.PRURL, HeadSHA: row.HeadSha, Status: row.Status,
+		Attempts: int(row.Attempts), CommentURL: row.CommentURL, FailureCode: row.FailureCode,
+		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, ClaimedAt: nullTimePtr(row.ClaimedAt),
 	}
-	return out
 }

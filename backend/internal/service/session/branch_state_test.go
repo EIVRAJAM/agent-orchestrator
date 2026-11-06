@@ -14,7 +14,13 @@ import (
 
 type branchStateStore struct {
 	*fakeStore
-	writes int
+	writes   int
+	recorded []string
+}
+
+func (s *branchStateStore) RecordSessionBranchTip(_ context.Context, _ domain.SessionID, repoKey, branch, headSHA, _ string) (bool, error) {
+	s.recorded = append(s.recorded, repoKey+"|"+branch+"@"+headSHA)
+	return true, nil
 }
 
 func (s *branchStateStore) SetSessionBranchState(_ context.Context, id domain.SessionID, state domain.SessionBranchState) (bool, error) {
@@ -79,6 +85,81 @@ func TestReconcileSessionBranchStateTracksCommitsAndPushes(t *testing.T) {
 	reconcile(domain.SessionBranchState{Commits: 3, RemoteBranch: "origin/feat/x", Unpushed: 1})
 	if st.writes != writes {
 		t.Fatalf("unchanged facts were rewritten (%d writes, want %d)", st.writes, writes)
+	}
+}
+
+func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
+	repo := newPushableRepo(t)
+	runGit(t, repo, "checkout", "-b", "feature/owned")
+	commitFile(t, repo, "owned.go")
+	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["p"] = domain.ProjectRecord{ID: "p", RepoOriginURL: "https://github.com/o/r.git"}
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", ProjectID: "p", Metadata: domain.SessionMetadata{
+		Branch: "feature/owned", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
+	}}
+	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "ao-1"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range st.recorded {
+		if record == "github|github.com|o/r|feature/owned@"+head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recorded exact branch tips = %v, want feature/owned@%s", st.recorded, head)
+	}
+}
+
+func TestReconcileBranchStatesDoesNotAdoptRemoteOnlyBranchTip(t *testing.T) {
+	repo := newPushableRepo(t)
+	// Simulate a remote branch left behind by another session/data dir. It is
+	// visible as origin/ao/s1/root but is not the local branch this session owns.
+	runGit(t, repo, "checkout", "-b", "old-tip", "main")
+	commitFile(t, repo, "old.go")
+	oldSHA := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	runGit(t, repo, "push", "origin", "old-tip:refs/heads/ao/s1/root")
+	runGit(t, repo, "checkout", "main")
+	runGit(t, repo, "branch", "ao/s1/root", "main")
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["p"] = domain.ProjectRecord{ID: "p", RepoOriginURL: "https://github.com/o/r.git"}
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", ProjectID: "p", Metadata: domain.SessionMetadata{
+		Branch: "ao/s1/root", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
+	}}
+	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "s1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range st.recorded {
+		if strings.HasSuffix(record, "@"+oldSHA) {
+			t.Fatalf("remote-only old branch tip was claimed as ownership: %v (old=%s)", st.recorded, oldSHA)
+		}
+	}
+}
+
+func TestReconcileWorkspaceOwnershipRecordsChildWorktreeTip(t *testing.T) {
+	repo := newPushableRepo(t)
+	child := filepath.Join(t.TempDir(), "api")
+	runGit(t, repo, "worktree", "add", "-b", "ao/ws-1/api", child)
+	commitFile(t, child, "api.go")
+	head := strings.TrimSpace(runGit(t, child, "rev-parse", "HEAD"))
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["ws"] = domain.ProjectRecord{ID: "ws", Kind: domain.ProjectKindWorkspace, RepoOriginURL: "https://github.com/o/api.git"}
+	st.sessions["ws-1"] = domain.SessionRecord{ID: "ws-1", ProjectID: "ws", Metadata: domain.SessionMetadata{
+		Branch: "ao/ws-1", WorkspacePath: child,
+	}}
+	st.worktrees["ws-1"] = []domain.SessionWorktreeRecord{{RepoName: "api", RepoKey: "github|github.com|o/api", Branch: "ao/ws-1/api", WorktreePath: child}}
+	if err := (&Service{store: st}).reconcileWorkspaceOwnership(context.Background(), st, st.sessions["ws-1"]); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range st.recorded {
+		if record == "github|github.com|o/api|ao/ws-1/api@"+head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recorded workspace tips = %v, want ao/ws-1/api@%s", st.recorded, head)
 	}
 }
 

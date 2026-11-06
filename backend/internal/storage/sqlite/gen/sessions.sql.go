@@ -235,7 +235,7 @@ func (q *Queries) GetClientRequestSession(ctx context.Context, clientRequestID s
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id, project_id, num, issue_id, kind, harness,
+SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
     created_at, updated_at, revision, display_name, first_signal_at, preview_url,
@@ -257,6 +257,7 @@ FROM sessions WHERE id = ?
 
 type GetSessionRow struct {
 	ID                               domain.SessionID
+	InstanceID                       string
 	ProjectID                        *domain.ProjectID
 	Num                              int64
 	IssueID                          domain.IssueID
@@ -331,6 +332,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 	var i GetSessionRow
 	err := row.Scan(
 		&i.ID,
+		&i.InstanceID,
 		&i.ProjectID,
 		&i.Num,
 		&i.IssueID,
@@ -403,7 +405,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 }
 
 const getSessionByAutomationRunID = `-- name: GetSessionByAutomationRunID :one
-SELECT id, project_id, num, issue_id, kind, harness,
+SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
     created_at, updated_at, revision, display_name, first_signal_at, preview_url,
@@ -425,6 +427,7 @@ FROM sessions WHERE automation_run_id = ?
 
 type GetSessionByAutomationRunIDRow struct {
 	ID                               domain.SessionID
+	InstanceID                       string
 	ProjectID                        *domain.ProjectID
 	Num                              int64
 	IssueID                          domain.IssueID
@@ -499,6 +502,7 @@ func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRun
 	var i GetSessionByAutomationRunIDRow
 	err := row.Scan(
 		&i.ID,
+		&i.InstanceID,
 		&i.ProjectID,
 		&i.Num,
 		&i.IssueID,
@@ -572,7 +576,7 @@ func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRun
 
 const insertSession = `-- name: InsertSession :exec
 INSERT INTO sessions (
-    id, project_id, num, issue_id, kind, harness, reviewer_harness, reviewer_agent_config, auto_review_enabled, display_name,
+    id, instance_id, project_id, num, issue_id, kind, harness, reviewer_harness, reviewer_agent_config, auto_review_enabled, display_name,
     activity_state, activity_last_at, first_signal_at, is_terminated,
     branch, workspace_path, workspace_repo_path, diff_base_sha, diff_base_ref, runtime_handle_id,
     runtime_launch_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
@@ -588,7 +592,7 @@ INSERT INTO sessions (
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed,
     client_request_id, client_request_hash
 ) VALUES (
-    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -600,6 +604,7 @@ INSERT INTO sessions (
 
 type InsertSessionParams struct {
 	ID                               domain.SessionID
+	InstanceID                       string
 	ProjectID                        *domain.ProjectID
 	Num                              int64
 	IssueID                          domain.IssueID
@@ -667,6 +672,7 @@ type InsertSessionParams struct {
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
 	_, err := q.db.ExecContext(ctx, insertSession,
 		arg.ID,
+		arg.InstanceID,
 		arg.ProjectID,
 		arg.Num,
 		arg.IssueID,
@@ -734,7 +740,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 }
 
 const listAllSessions = `-- name: ListAllSessions :many
-SELECT id, project_id, num, issue_id, kind, harness,
+SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
     created_at, updated_at, revision, display_name, first_signal_at, preview_url,
@@ -756,6 +762,7 @@ FROM sessions ORDER BY project_id, num
 
 type ListAllSessionsRow struct {
 	ID                               domain.SessionID
+	InstanceID                       string
 	ProjectID                        *domain.ProjectID
 	Num                              int64
 	IssueID                          domain.IssueID
@@ -836,6 +843,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 		var i ListAllSessionsRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.InstanceID,
 			&i.ProjectID,
 			&i.Num,
 			&i.IssueID,
@@ -951,7 +959,7 @@ func (q *Queries) ListChatHibernationCandidates(ctx context.Context) ([]domain.S
 }
 
 const listSessionsByProject = `-- name: ListSessionsByProject :many
-SELECT id, project_id, num, issue_id, kind, harness,
+SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     activity_state, activity_last_at, is_terminated, branch, workspace_path,
     runtime_handle_id, agent_session_id, agent_session_id_launch_id, native_identity_observed_at, prompt,
     created_at, updated_at, revision, display_name, first_signal_at, preview_url,
@@ -973,6 +981,7 @@ FROM sessions WHERE project_id IS ? ORDER BY num
 
 type ListSessionsByProjectRow struct {
 	ID                               domain.SessionID
+	InstanceID                       string
 	ProjectID                        *domain.ProjectID
 	Num                              int64
 	IssueID                          domain.IssueID
@@ -1053,6 +1062,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 		var i ListSessionsByProjectRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.InstanceID,
 			&i.ProjectID,
 			&i.Num,
 			&i.IssueID,

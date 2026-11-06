@@ -114,6 +114,9 @@ func TestPoll_RemoteAttributionMatrix(t *testing.T) {
 					mustGit(t, "-C", checkout, "config", "--add", "remote."+remote+".pushurl", address)
 				}
 				store := remotePollStore(project)
+				if scenario.branch != "" && len(scenario.accepted) > 0 {
+					store.addBranchTip("inst-worker-7", scmRepoKey(scenario.base), scenario.branch, "revision")
+				}
 				if layout.kind == domain.ProjectKindWorkspace {
 					store.workspaceRepos["kit"] = []domain.WorkspaceRepoRecord{{Name: "component", RelativePath: "component", RepoOriginURL: remoteAddress(scenario.base)}}
 				}
@@ -161,7 +164,7 @@ func TestPoll_SharedBaseCheckoutOrder(t *testing.T) {
 func remotePollStore(project domain.ProjectRecord) *fakeStore {
 	return &fakeStore{
 		projects:       map[string]domain.ProjectRecord{"kit": project},
-		sessions:       []domain.SessionRecord{{ID: "worker-7", ProjectID: "kit", Metadata: domain.SessionMetadata{Branch: "delivery"}}},
+		sessions:       []domain.SessionRecord{{ID: "worker-7", ProjectID: "kit", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "delivery"}}},
 		workspaceRepos: make(map[string][]domain.WorkspaceRepoRecord),
 	}
 }
@@ -184,7 +187,7 @@ func remotePollProvider(base ports.SCMRepo, heads []string, author, branch strin
 	for index, repositoryName := range heads {
 		number := 71 + index
 		address := fmt.Sprintf("https://%s/%s/pull/%d", base.Host, base.Repo, number)
-		listing := ports.SCMPRObservation{URL: address, Number: number, HeadRepo: repositoryName, SourceBranch: branch, TargetBranch: "trunk", Author: author, HeadSHA: "revision", State: "open"}
+		listing := ports.SCMPRObservation{URL: address, Number: number, HeadRepo: repositoryName, SourceBranch: branch, TargetBranch: "trunk", Author: author, HeadSHA: "revision", State: "open", CreatedAtProvider: time.Unix(2, 0).UTC()}
 		provider.openPRs[prKey(base, 0)] = append(provider.openPRs[prKey(base, 0)], listing)
 		provider.observations[prKey(base, number)] = ports.SCMObservation{
 			Fetched: true, Provider: base.Provider, Host: base.Host, Repo: base.Repo, PR: listing,
@@ -197,6 +200,7 @@ func remotePollProvider(base ports.SCMRepo, heads []string, author, branch strin
 func verifyRemotePoll(t *testing.T, store *fakeStore, provider *remoteCatalogProvider, base ports.SCMRepo, expected []int) {
 	t.Helper()
 	lifecycle := &fakeLifecycle{}
+	store.seedDiscovery(provider.fakeProvider)
 	observer := New(provider, store, lifecycle, Config{
 		Clock: func() time.Time { return time.Unix(500, 0) }, Logger: quietSlog(), ScopedIdentityResolver: provider,
 	})

@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +79,9 @@ type Store interface {
 	UpsertProject(ctx context.Context, row domain.ProjectRecord) error
 	ListWorkspaceRepos(ctx context.Context, projectID string) ([]domain.WorkspaceRepoRecord, error)
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
+	ListSessionBranchTips(ctx context.Context, instanceID string) ([]domain.SessionBranchTip, error)
+	RegisterSessionPROwnership(ctx context.Context, instanceID, repoKey, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
+	RefreshSessionPROwnership(ctx context.Context, instanceID, repoKey, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
 	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
 	WriteSCMObservation(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode) error
 }
@@ -303,6 +305,7 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 type subject struct {
 	session domain.SessionRecord
 	repo    ports.SCMRepo
+	repoKey string
 	branch  string
 	known   domain.PullRequest
 	hasPR   bool
@@ -311,11 +314,54 @@ type subject struct {
 // Head names are scoped to repo's provider and host. Each base has a separate
 // set because overlapping workspace checkouts can have different push targets.
 type sessionRepo struct {
-	session   domain.SessionRecord
-	repo      ports.SCMRepo
-	headNames map[string]struct{}
-	branch    string
-	workspace bool
+	session    domain.SessionRecord
+	repo       ports.SCMRepo
+	headNames  map[string]struct{}
+	branch     string
+	workspace  bool
+	instanceID string
+	repoKey    string
+	branchTips map[string]map[string]struct{}
+}
+
+func branchTipKey(repoKey, branch string) string {
+	return repoKey + "\x00" + branch
+}
+
+func (sr sessionRepo) ownsBranchHead(branch, headSHA string) bool {
+	if strings.TrimSpace(sr.instanceID) == "" || sr.repoKey == "" || branch == "" || headSHA == "" {
+		return false
+	}
+	tips, ok := sr.branchTips[branchTipKey(sr.repoKey, branch)]
+	if !ok {
+		return false
+	}
+	_, ok = tips[headSHA]
+	return ok
+}
+
+func branchTipIndex(tips []domain.SessionBranchTip) map[string]map[string]struct{} {
+	out := make(map[string]map[string]struct{}, len(tips))
+	for _, tip := range tips {
+		if tip.Branch == "" || tip.HeadSHA == "" {
+			continue
+		}
+		key := branchTipKey(tip.RepoKey, tip.Branch)
+		if out[key] == nil {
+			out[key] = map[string]struct{}{}
+		}
+		out[key][tip.HeadSHA] = struct{}{}
+	}
+	return out
+}
+
+func attachSessionOwnership(repos []sessionRepo, instanceID string, tips []domain.SessionBranchTip) []sessionRepo {
+	index := branchTipIndex(tips)
+	for i := range repos {
+		repos[i].instanceID = instanceID
+		repos[i].branchTips = index
+	}
+	return repos
 }
 
 type repoGuardState struct {
@@ -606,6 +652,24 @@ func (o *Observer) Poll(ctx context.Context) error {
 			markRepoRefreshFailed(subj.repo)
 			continue
 		}
+		// The branch may advance after discovery. Rotate only the existing,
+		// instance-scoped ownership to a head that branch-state reconciliation
+		// has already recorded as an exact tip. This must happen before lifecycle
+		// can enqueue a tracker write-back for the refreshed PR.
+		if subj.session.InstanceID != "" {
+			prURL := firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL)
+			if prURL != "" && prepared.PR.SourceBranch != "" && prepared.PR.HeadSHA != "" {
+				refreshed, refreshErr := o.store.RefreshSessionPROwnership(ctx, subj.session.InstanceID, subj.repoKey, prURL, prepared.PR.SourceBranch, prepared.PR.HeadSHA, now)
+				if refreshErr != nil {
+					o.logger.Error("scm observer: refresh PR ownership failed", "session", subj.session.ID, "pr", prURL, "err", refreshErr)
+					markRepoRefreshFailed(subj.repo)
+					continue
+				}
+				if !refreshed {
+					o.logger.Debug("scm observer: PR ownership did not advance", "session", subj.session.ID, "branch", prepared.PR.SourceBranch, "head", prepared.PR.HeadSHA)
+				}
+			}
+		}
 		if o.lifecycle != nil {
 			if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
 				o.logger.Error("scm observer: lifecycle notification failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
@@ -720,7 +784,7 @@ func (o *Observer) checkCredentials(ctx context.Context) (bool, error) {
 
 // discoverSubjects builds the per-PR refresh subjects (normally one per open
 // tracked PR)
-// and the per-session repo list used for branch-prefix discovery of new PRs. A
+// and the per-session repo list used for instance-owned branch discovery. A
 // session may own several PRs, so each open tracked PR becomes its own subject.
 // Terminal PRs stay eligible only for an opted-in live session, allowing an
 // unacknowledged teardown failure to be delivered again on a later poll.
@@ -765,11 +829,17 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 			}
 		}
 		repos := append([]ports.SCMRepo(nil), scanRepos[sess.ProjectID]...)
-		sessionRepos = append(sessionRepos, checkoutSessionRepos(sess, branch, proj.Kind.WithDefault() == domain.ProjectKindWorkspace, repos)...)
+		tips, err := o.store.ListSessionBranchTips(ctx, sess.InstanceID)
+		if err != nil {
+			return nil, nil, err
+		}
+		owned := checkoutSessionRepos(sess, branch, proj.Kind.WithDefault() == domain.ProjectKindWorkspace, repos)
+		sessionRepos = append(sessionRepos, attachSessionOwnership(owned, sess.InstanceID, tips)...)
 		childRepos, err := o.workspaceSCMSessionRepos(ctx, proj, sess, branch)
 		if err != nil {
 			return nil, nil, err
 		}
+		childRepos = attachSessionOwnership(childRepos, sess.InstanceID, tips)
 		for _, child := range childRepos {
 			sessionRepos = append(sessionRepos, child)
 			repos = append(repos, child.repo)
@@ -796,7 +866,7 @@ func (o *Observer) discoverSubjects(ctx context.Context) (map[string]*subject, [
 				o.logger.Warn("scm observer: duplicate tracked PR subject skipped", "pr", key, "kept_session", existing.session.ID, "skipped_session", sess.ID)
 				continue
 			}
-			out[key] = &subject{session: sess, repo: prRepo, branch: branch, known: pr, hasPR: true}
+			out[key] = &subject{session: sess, repo: prRepo, repoKey: scmRepoKey(prRepo), branch: branch, known: pr, hasPR: true}
 		}
 	}
 	return out, sessionRepos, nil
@@ -835,7 +905,7 @@ func checkoutSessionRepos(sess domain.SessionRecord, branch string, workspace bo
 				position = len(result)
 				byBase[key] = position
 				result = append(result, sessionRepo{
-					session: sess, repo: base, branch: branch, workspace: workspace,
+					session: sess, repo: base, repoKey: scmRepoKey(base), branch: branch, workspace: workspace,
 					headNames: make(map[string]struct{}),
 				})
 			}
@@ -876,10 +946,11 @@ func (o *Observer) workspaceSCMSessionRepos(ctx context.Context, proj domain.Pro
 
 func repoForTrackedPR(pr domain.PullRequest, repos []ports.SCMRepo) (ports.SCMRepo, bool) {
 	if pr.Provider != "" && pr.Host != "" && pr.Repo != "" {
-		owner, name, ok := strings.Cut(pr.Repo, "/")
-		if !ok || owner == "" || name == "" {
+		slash := strings.LastIndex(pr.Repo, "/")
+		if slash <= 0 || slash >= len(pr.Repo)-1 {
 			return ports.SCMRepo{}, false
 		}
+		owner, name := pr.Repo[:slash], pr.Repo[slash+1:]
 		return ports.SCMRepo{Provider: pr.Provider, Host: pr.Host, Owner: owner, Name: name, Repo: pr.Repo}, true
 	}
 	if pr.Repo != "" {
@@ -970,10 +1041,10 @@ func pendingRepoRefreshes(guards map[string]repoGuardState) map[string]bool {
 }
 
 // discoverNewPRs lists each repo's open PRs once and attaches any not-yet-tracked
-// PR to the session that owns its source branch. A session owns a PR when the
-// PR's source branch equals the session branch or descends from it (the
-// "branch/..." stacking convention). One session may therefore pick up several
-// PRs (its root plus stacked children). Repos whose PR-list guard reports
+// PR to the session instance that registered the PR's exact source branch and
+// head commit. A session may own several PRs (its root plus stacked children),
+// but every branch/tip must have been recorded from that instance's workspace
+// or an explicit link. Repos whose PR-list guard reports
 // NotModified against a known ETag are skipped, since nothing new can have
 // appeared since the last poll.
 func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRepo, subjects map[string]*subject, guards map[string]repoGuardState, now time.Time, markRepoFailed func(ports.SCMRepo)) (listedPRs, listedRepos map[string]bool) {
@@ -1101,12 +1172,29 @@ func (o *Observer) discoverNewPRs(ctx context.Context, sessionRepos []sessionRep
 				headRepo = repoFullName(repo)
 			}
 			eligible := candidatesForHeadRepo(byRepo[repoKey], headRepo)
-			sr, ok := matchSession(eligible, pr.SourceBranch)
+			sr, ok := matchSession(eligible, pr.SourceBranch, pr.HeadSHA)
 			if !ok {
 				continue
 			}
+			url := firstNonEmpty(pr.URL, pr.HTMLURL)
+			if url == "" {
+				continue
+			}
+			owned, err := o.store.RegisterSessionPROwnership(ctx, sr.instanceID, sr.repoKey, url, pr.SourceBranch, pr.HeadSHA, now)
+			if err != nil {
+				o.logger.Error("scm observer: register PR ownership failed", "session", sr.session.ID, "branch", pr.SourceBranch, "err", err)
+				if markRepoFailed != nil {
+					markRepoFailed(repo)
+				}
+				continue
+			}
+			if !owned {
+				o.logger.Warn("scm observer: rejected PR without durable branch ownership",
+					"session", sr.session.ID, "instance", sr.instanceID, "branch", pr.SourceBranch, "reason", "no_registered_branch_tip")
+				continue
+			}
 			known := domain.PullRequest{
-				URL:          firstNonEmpty(pr.URL, pr.HTMLURL),
+				URL:          url,
 				SessionID:    sr.session.ID,
 				Number:       pr.Number,
 				Draft:        pr.Draft,
@@ -1187,66 +1275,55 @@ func candidatesForHeadRepo(candidates []sessionRepo, headRepo string) []sessionR
 	return out
 }
 
-// matchSession prefers exact branches, then the longest owned prefix. Root
-// leaves own slash siblings. Legacy workspace branches are bare refs, so they
-// also own hyphen siblings, but only under the validated AO session branch.
-// Equal specificity across different sessions is ambiguous: leave the PR for
-// explicit claiming rather than assigning it according to store iteration order.
-func matchSession(candidates []sessionRepo, sourceBranch string) (sessionRepo, bool) {
-	var best sessionRepo
-	bestLen := -1
-	ambiguous := false
-	consider := func(sr sessionRepo, length int) {
-		if length > bestLen {
-			best, bestLen, ambiguous = sr, length, false
-		} else if length == bestLen && best.session.ID != sr.session.ID {
-			ambiguous = true
+// scmRepoKey returns the canonical provider|host|namespace/name identity for
+// a normalized SCM repository. A missing provider/host/namespace/name fails
+// closed by returning an empty key.
+func scmRepoKey(repo ports.SCMRepo) string {
+	owner, name := repo.Owner, repo.Name
+	if owner == "" || name == "" {
+		if slash := strings.LastIndex(repo.Repo, "/"); slash > 0 && slash < len(repo.Repo)-1 {
+			owner, name = repo.Repo[:slash], repo.Repo[slash+1:]
 		}
 	}
+	if strings.TrimSpace(repo.Provider) == "" || strings.TrimSpace(repo.Host) == "" || strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
+		return ""
+	}
+	return domain.RepositoryIdentity{
+		Provider: repo.Provider, Host: repo.Host, Namespace: owner, Name: name,
+	}.Key()
+}
+
+// matchSession requires an exact, instance-owned branch tip. The branch name
+// alone is not ownership: a fresh AO_DATA_DIR can reuse it. HeadSHA ties the
+// PR to a commit actually observed from the registered workspace branch.
+func matchSession(candidates []sessionRepo, sourceBranch, headSHA string) (sessionRepo, bool) {
+	if sourceBranch == "" || headSHA == "" {
+		return sessionRepo{}, false
+	}
+	var best sessionRepo
+	found := false
+	ambiguous := false
+	seen := map[string]bool{}
 	for _, sr := range candidates {
-		if sr.branch == "" {
+		if !sr.ownsBranchHead(sourceBranch, headSHA) {
 			continue
 		}
-		if sr.branch == sourceBranch {
-			consider(sr, len(sourceBranch)+1)
+		key := sr.instanceID
+		if key == "" {
+			key = string(sr.session.ID)
 		}
-		for _, prefix := range sessionBranchPrefixes(sr.branch) {
-			if prefix == sourceBranch || strings.HasPrefix(sourceBranch, prefix+"/") {
-				consider(sr, len(prefix))
-			}
+		if seen[key] {
+			continue
 		}
-		if workspaceHyphenBranch(sr) && strings.HasPrefix(sourceBranch, sr.branch+"-") && len(sourceBranch) > len(sr.branch)+1 {
-			consider(sr, len(sr.branch))
+		seen[key] = true
+		if found {
+			ambiguous = true
+			continue
 		}
+		best = sr
+		found = true
 	}
-	return best, bestLen >= 0 && !ambiguous
-}
-
-func workspaceHyphenBranch(sr sessionRepo) bool {
-	if !sr.workspace || sr.session.ID == "" {
-		return false
-	}
-	base := "ao/" + string(sr.session.ID)
-	if sr.branch == base {
-		return true
-	}
-	suffix, ok := strings.CutPrefix(sr.branch, base+"-")
-	if !ok {
-		return false
-	}
-	// workspaceProjectBranch appends -2, -3, ... when a ref already exists.
-	// Do not treat arbitrary topics, another session ID, or padded numbers as
-	// a generated branch and broaden their ownership.
-	n, err := strconv.Atoi(suffix)
-	return err == nil && n >= 2 && strconv.Itoa(n) == suffix
-}
-
-func sessionBranchPrefixes(branch string) []string {
-	prefixes := []string{branch}
-	if namespace, ok := strings.CutSuffix(branch, "/root"); ok && namespace != "" {
-		prefixes = append(prefixes, namespace)
-	}
-	return prefixes
+	return best, found && !ambiguous
 }
 
 func (o *Observer) selectRefreshCandidates(ctx context.Context, subjects map[string]*subject, guards map[string]repoGuardState, listedPRs map[string]bool, markRepoFailed func(ports.SCMRepo), now time.Time) refreshSelection {

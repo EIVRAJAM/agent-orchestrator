@@ -573,7 +573,10 @@ func Run() error {
 	// nil-guard and the intake resolver's backoff both tolerate that
 	// (issue #2685).
 	tracker := newMultiTracker(cfg.GitLab, log)
-	trackerWriteback := trackerwriteback.New(store, trackerCommenter(tracker), log, 30*time.Second)
+	// The write-back delivery path needs a fresh provider read immediately
+	// before the POST; reuse the same fail-gracefully SCM provider as PR reads.
+	scmProvider := newMultiSCMProvider(cfg.GitLab, log)
+	trackerWriteback := trackerwriteback.NewWithRefresher(store, scmProvider, trackerCommenter(tracker), log, 30*time.Second)
 	codexPlugin := codexagent.New()
 	codexHome, err := codexPlugin.NativeSessionConfigDir(ctx, nil)
 	if err != nil {
@@ -836,7 +839,7 @@ func Run() error {
 	}
 	lcStack.scmDone = startSCMObserver(ctx, store, lcStack.LCM, sessionSvc, cfg.GitLab, log)
 	var prActions prsvc.ActionManager
-	prReader := newMultiSCMProvider(cfg.GitLab, log)
+	prReader := scmProvider
 	prMerger := newMultiSCMMerger(cfg.GitLab, log)
 	if prReader != nil && prMerger != nil {
 		prActions = prsvc.NewActionService(prsvc.ActionDeps{

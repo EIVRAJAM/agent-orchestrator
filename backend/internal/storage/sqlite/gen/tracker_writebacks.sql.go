@@ -21,7 +21,7 @@ WHERE id = (
     LIMIT 1
 )
 AND status = 'pending'
-RETURNING id, project_id, session_id, issue_id, pr_url, status, attempts,
+RETURNING id, project_id, session_id, issue_id, pr_url, head_sha, status, attempts,
     comment_url, failure_code, created_at, updated_at, claimed_at
 `
 
@@ -30,15 +30,32 @@ type ClaimTrackerWritebackParams struct {
 	UpdatedAt time.Time
 }
 
-func (q *Queries) ClaimTrackerWriteback(ctx context.Context, arg ClaimTrackerWritebackParams) (TrackerWriteback, error) {
+type ClaimTrackerWritebackRow struct {
+	ID          string
+	ProjectID   string
+	SessionID   string
+	IssueID     string
+	PRURL       string
+	HeadSha     string
+	Status      string
+	Attempts    int64
+	CommentURL  string
+	FailureCode string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	ClaimedAt   sql.NullTime
+}
+
+func (q *Queries) ClaimTrackerWriteback(ctx context.Context, arg ClaimTrackerWritebackParams) (ClaimTrackerWritebackRow, error) {
 	row := q.db.QueryRowContext(ctx, claimTrackerWriteback, arg.ClaimedAt, arg.UpdatedAt)
-	var i TrackerWriteback
+	var i ClaimTrackerWritebackRow
 	err := row.Scan(
 		&i.ID,
 		&i.ProjectID,
 		&i.SessionID,
 		&i.IssueID,
 		&i.PRURL,
+		&i.HeadSha,
 		&i.Status,
 		&i.Attempts,
 		&i.CommentURL,
@@ -52,9 +69,9 @@ func (q *Queries) ClaimTrackerWriteback(ctx context.Context, arg ClaimTrackerWri
 
 const enqueueTrackerWriteback = `-- name: EnqueueTrackerWriteback :execrows
 INSERT INTO tracker_writebacks (
-    id, project_id, session_id, issue_id, pr_url, status, attempts,
+    id, project_id, session_id, issue_id, pr_url, head_sha, status, attempts,
     comment_url, failure_code, created_at, updated_at, claimed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (project_id, issue_id, pr_url) DO NOTHING
 `
 
@@ -64,6 +81,7 @@ type EnqueueTrackerWritebackParams struct {
 	SessionID   string
 	IssueID     string
 	PRURL       string
+	HeadSha     string
 	Status      string
 	Attempts    int64
 	CommentURL  string
@@ -80,6 +98,7 @@ func (q *Queries) EnqueueTrackerWriteback(ctx context.Context, arg EnqueueTracke
 		arg.SessionID,
 		arg.IssueID,
 		arg.PRURL,
+		arg.HeadSha,
 		arg.Status,
 		arg.Attempts,
 		arg.CommentURL,
@@ -123,7 +142,7 @@ func (q *Queries) FinishTrackerWriteback(ctx context.Context, arg FinishTrackerW
 }
 
 const listTrackerWritebacks = `-- name: ListTrackerWritebacks :many
-SELECT id, project_id, session_id, issue_id, pr_url, status, attempts,
+SELECT id, project_id, session_id, issue_id, pr_url, head_sha, status, attempts,
     comment_url, failure_code, created_at, updated_at, claimed_at
 FROM tracker_writebacks
 WHERE (?1 = '' OR status = ?1)
@@ -137,21 +156,38 @@ type ListTrackerWritebacksParams struct {
 	RowLimit  int64
 }
 
-func (q *Queries) ListTrackerWritebacks(ctx context.Context, arg ListTrackerWritebacksParams) ([]TrackerWriteback, error) {
+type ListTrackerWritebacksRow struct {
+	ID          string
+	ProjectID   string
+	SessionID   string
+	IssueID     string
+	PRURL       string
+	HeadSha     string
+	Status      string
+	Attempts    int64
+	CommentURL  string
+	FailureCode string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	ClaimedAt   sql.NullTime
+}
+
+func (q *Queries) ListTrackerWritebacks(ctx context.Context, arg ListTrackerWritebacksParams) ([]ListTrackerWritebacksRow, error) {
 	rows, err := q.db.QueryContext(ctx, listTrackerWritebacks, arg.Status, arg.RowOffset, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []TrackerWriteback{}
+	items := []ListTrackerWritebacksRow{}
 	for rows.Next() {
-		var i TrackerWriteback
+		var i ListTrackerWritebacksRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.ProjectID,
 			&i.SessionID,
 			&i.IssueID,
 			&i.PRURL,
+			&i.HeadSha,
 			&i.Status,
 			&i.Attempts,
 			&i.CommentURL,

@@ -124,6 +124,7 @@ func TestPoll_TwoGitLabHostsIdentityResolution(t *testing.T) {
 			identityKey("gitlab", "gitlab.internal"): {Login: "internaluser", Human: true},
 		},
 	}
+	store.seedDiscovery(provider.fakeProvider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:                  func() time.Time { return time.Unix(1, 0).UTC() },
 		Tick:                   time.Hour,
@@ -186,6 +187,7 @@ func TestPoll_PerProviderIdentityResolution(t *testing.T) {
 			identityKey("gitlab", "gitlab.com"): {Login: "gitlabuser", Human: true},
 		},
 	}
+	store.seedDiscovery(provider.fakeProvider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:                  func() time.Time { return time.Unix(1, 0).UTC() },
 		Tick:                   time.Hour,
@@ -253,6 +255,7 @@ func TestPoll_ScopedIdentityPartialFailure(t *testing.T) {
 			identityKey("gitlab", "gitlab.com"): errors.New("gitlab token expired"),
 		},
 	}
+	store.seedDiscovery(provider.fakeProvider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:                  func() time.Time { return time.Unix(1, 0).UTC() },
 		Tick:                   time.Hour,

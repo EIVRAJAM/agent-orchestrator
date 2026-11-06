@@ -38,6 +38,10 @@ var scmTestRepo = ports.SCMRepo{
 
 const scmTestOriginURL = "https://github.com/octocat/hello.git"
 
+func integrationRepoKey() string {
+	return domain.RepositoryIdentity{Provider: "github", Host: "github.com", Namespace: "octocat", Name: "hello"}.Key()
+}
+
 // scmMessengerSpy is a minimal lifecycle.messenger that records every nudge so
 // tests can assert exactly which lifecycle reactions fired and what they sent.
 type scmMessengerSpy struct {
@@ -109,6 +113,9 @@ func (p *cannedSCMProvider) ListPRsByRepo(_ context.Context, _ ports.SCMRepo, _ 
 	defer p.mu.Unlock()
 	out := make([]ports.SCMPRObservation, 0, len(p.detected))
 	for _, pr := range p.detected {
+		if pr.CreatedAtProvider.IsZero() {
+			pr.CreatedAtProvider = time.Now().UTC()
+		}
 		out = append(out, pr)
 	}
 	return out, nil
@@ -240,6 +247,18 @@ func newSCMFixture(t *testing.T, branch string) *scmFixture {
 	}
 }
 
+func (f *scmFixture) poll(ctx context.Context) error {
+	for _, pr := range f.provider.detected {
+		if pr.SourceBranch == "" || pr.HeadSHA == "" {
+			continue
+		}
+		if _, err := f.store.RecordSessionBranchTip(ctx, f.session.ID, integrationRepoKey(), pr.SourceBranch, pr.HeadSHA, "/ws/octo"); err != nil {
+			return err
+		}
+	}
+	return f.observer.Poll(ctx)
+}
+
 func (f *scmFixture) enableTerminateOnPRMerge(t *testing.T) {
 	t.Helper()
 	ok, err := f.store.SetSessionTerminateOnPRMerge(context.Background(), f.session.ID, true, f.now)
@@ -324,7 +343,7 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		}
 		f.provider.observations[42] = failingSCMObservation(prURL, 42, headSHA, logTail)
 
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll: %v", err)
 		}
 
@@ -397,7 +416,7 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		// ETag guard misses. The ETag-driven 304 short-circuit on the same
 		// SHA is covered by the unit tests in observe/scm/observer_test.go
 		// (Poll_RepoETag304SkipsListPRs, Poll_CIETagChangeRefreshesWhenRepoUnchanged).
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("second Poll: %v", err)
 		}
 		if got := f.spy.count(); got != 1 {
@@ -425,7 +444,7 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		}
 		f.provider.observations[77] = mergedSCMObservation(prURL, 77, headSHA)
 
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll: %v", err)
 		}
 
@@ -453,13 +472,13 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		}
 		f.provider.observations[78] = mergedSCMObservation(prURL, 78, "deadbeef")
 
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("first Poll: %v", err)
 		}
 		if rec, _, _ := f.store.GetSession(ctx, f.session.ID); rec.IsTerminated {
 			t.Fatalf("failed teardown hid a live session: %+v", rec)
 		}
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("second Poll: %v", err)
 		}
 		if terminator.calls != 2 {
@@ -476,7 +495,7 @@ func TestSCMObserverEndToEnd(t *testing.T) {
 		// No entry in provider.detected — ListOpenPRsByRepo returns an empty list,
 		// the production "no PR yet" signal.
 
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll: %v", err)
 		}
 
@@ -565,7 +584,7 @@ func TestSCMObserverMultiPREndToEnd(t *testing.T) {
 		f.provider.observations[101] = openSCMObservation(rootURL, 101, "sha-root", "feat/x", "main", domain.MergeMergeable)
 		f.provider.observations[102] = openSCMObservation(childURL, 102, "sha-child", "feat/x/auth", "feat/x", domain.MergeBlocked)
 
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll: %v", err)
 		}
 
@@ -610,7 +629,7 @@ func TestSCMObserverMultiPREndToEnd(t *testing.T) {
 		f.provider.observations[202] = openSCMObservation(childURL, 202, "sha-child", "feat/x/auth", "feat/x", domain.MergeBlocked)
 
 		// Poll 1: both PRs open and tracked. The session is live.
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll 1: %v", err)
 		}
 		if rec, _, _ := f.store.GetSession(ctx, f.session.ID); rec.IsTerminated {
@@ -620,7 +639,7 @@ func TestSCMObserverMultiPREndToEnd(t *testing.T) {
 		// Poll 2: the root merges while the child stays open. One merged PR does
 		// not satisfy the completion bar while another PR is still open.
 		f.provider.observations[201] = mergedSCMObservationBranches(rootURL, 201, "sha-root", "feat/x", "main")
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll 2: %v", err)
 		}
 		rootPR, ok, err := f.store.GetPR(ctx, rootURL)
@@ -637,7 +656,7 @@ func TestSCMObserverMultiPREndToEnd(t *testing.T) {
 		// Poll 3: the child merges too. Now every PR is merged/closed and at least
 		// one merged, so the session completes and terminates.
 		f.provider.observations[202] = mergedSCMObservationBranches(childURL, 202, "sha-child", "feat/x/auth", "feat/x")
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll 3: %v", err)
 		}
 		rec, ok, err := f.store.GetSession(ctx, f.session.ID)
@@ -666,7 +685,7 @@ func TestSCMObserverMultiPREndToEnd(t *testing.T) {
 		// independent of map iteration.
 		f.provider.observations[301] = openSCMObservation(rootURL, 301, "sha-root", "feat/x", "main", domain.MergeMergeable)
 		f.provider.observations[302] = openSCMObservation(childURL, 302, "sha-child", "feat/x/auth", "feat/x", domain.MergeMergeable)
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll 1: %v", err)
 		}
 		if got := f.spy.count(); got != 0 {
@@ -680,7 +699,7 @@ func TestSCMObserverMultiPREndToEnd(t *testing.T) {
 		// suppressed.
 		f.provider.observations[301] = openSCMObservation(rootURL, 301, "sha-root", "feat/x", "main", domain.MergeConflicting)
 		f.provider.observations[302] = openSCMObservation(childURL, 302, "sha-child", "feat/x/auth", "feat/x", domain.MergeConflicting)
-		if err := f.observer.Poll(ctx); err != nil {
+		if err := f.poll(ctx); err != nil {
 			t.Fatalf("Poll 2: %v", err)
 		}
 
