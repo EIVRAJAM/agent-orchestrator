@@ -20,7 +20,8 @@ func TestTrackerWritebackOutboxIsUniqueClaimedAndAtMostOnce(t *testing.T) {
 	row := domain.TrackerWriteback{
 		ID: "wb-1", ProjectID: "mer", SessionID: session.ID,
 		IssueID: "github:acme/demo#12", PRURL: "https://github.com/acme/demo/pull/1",
-		Status: domain.TrackerWritebackPending, CreatedAt: now, UpdatedAt: now,
+		HeadSHA: "sha-one",
+		Status:  domain.TrackerWritebackPending, CreatedAt: now, UpdatedAt: now,
 	}
 	inserted, err := s.EnqueueTrackerWriteback(ctx, row)
 	if err != nil || !inserted {
