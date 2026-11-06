@@ -119,6 +119,7 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 		SessionID: rec.ID,
 		IssueID:   rec.IssueID,
 		PRURL:     prURL,
+		HeadSHA:   pr.HeadSHA,
 		Status:    domain.TrackerWritebackPending,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -224,6 +225,10 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 	}
 	if !ok || !owned || !exactPROwnership(pr, rec, ownership) {
 		settle(domain.TrackerWritebackFailed, "", "pr_association_invalid")
+		return nil
+	}
+	if row.HeadSHA == "" || row.HeadSHA != pr.HeadSHA {
+		settle(domain.TrackerWritebackFailed, "", "pr_head_changed")
 		return nil
 	}
 	issue, ok := domain.ParseCanonicalIssueID(string(row.IssueID))

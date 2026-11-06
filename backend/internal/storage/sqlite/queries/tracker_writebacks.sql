@@ -1,8 +1,8 @@
 -- name: EnqueueTrackerWriteback :execrows
 INSERT INTO tracker_writebacks (
-    id, project_id, session_id, issue_id, pr_url, status, attempts,
+    id, project_id, session_id, issue_id, pr_url, head_sha, status, attempts,
     comment_url, failure_code, created_at, updated_at, claimed_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (project_id, issue_id, pr_url) DO NOTHING;
 
 -- name: ClaimTrackerWriteback :one
@@ -15,7 +15,7 @@ WHERE id = (
     LIMIT 1
 )
 AND status = 'pending'
-RETURNING id, project_id, session_id, issue_id, pr_url, status, attempts,
+RETURNING id, project_id, session_id, issue_id, pr_url, head_sha, status, attempts,
     comment_url, failure_code, created_at, updated_at, claimed_at;
 
 -- name: FinishTrackerWriteback :execrows
@@ -29,7 +29,7 @@ SET status = 'uncertain', failure_code = 'restart', updated_at = ?
 WHERE status = 'claimed';
 
 -- name: ListTrackerWritebacks :many
-SELECT id, project_id, session_id, issue_id, pr_url, status, attempts,
+SELECT id, project_id, session_id, issue_id, pr_url, head_sha, status, attempts,
     comment_url, failure_code, created_at, updated_at, claimed_at
 FROM tracker_writebacks
 WHERE (sqlc.arg(status) = '' OR status = sqlc.arg(status))

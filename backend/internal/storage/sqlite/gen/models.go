@@ -822,6 +822,7 @@ type TrackerWriteback struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 	ClaimedAt   sql.NullTime
+	HeadSha     string
 }
 
 type UsageBinding struct {

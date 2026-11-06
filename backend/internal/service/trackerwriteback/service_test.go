@@ -456,7 +456,7 @@ func TestFailedTerminalLogIsVisibleWithoutIssueContent(t *testing.T) {
 	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", SourceBranch: "feat/x", HeadSHA: "sha1"}
 	st.rows["wb-failed"] = domain.TrackerWriteback{
 		ID: "wb-failed", ProjectID: "proj", SessionID: "proj-1", IssueID: "github:acme/demo#12",
-		PRURL: "https://github.com/acme/demo/pull/1", Status: domain.TrackerWritebackPending,
+		PRURL: "https://github.com/acme/demo/pull/1", HeadSHA: "sha1", Status: domain.TrackerWritebackPending,
 	}
 	svc := New(st, nil, slog.New(slog.NewTextHandler(&buf, nil)), time.Minute)
 	svc.clock = func() time.Time { return time.Unix(100, 0).UTC() }
@@ -524,6 +524,29 @@ func TestEnqueueRequiresExactDurableOwnership(t *testing.T) {
 	}
 }
 
+func TestProcessOnceRejectsHeadMovedAfterEnqueue(t *testing.T) {
+	svc, st, commenter := seedWriteback(t, true)
+	prURL := "https://github.com/acme/demo/pull/1"
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+		t.Fatal(err)
+	}
+	pr := st.prs[prURL]
+	pr.HeadSHA = "sha2"
+	st.prs[prURL] = pr
+	own := st.ownership[prURL]
+	own.HeadSHA = "sha2"
+	st.ownership[prURL] = own
+	if err := svc.ProcessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if commenter.calls != 0 {
+		t.Fatalf("comment calls = %d, want 0", commenter.calls)
+	}
+	if got := st.row("wb-1"); got.Status != domain.TrackerWritebackFailed || got.FailureCode != "pr_head_changed" {
+		t.Fatalf("row = %+v, want failed pr_head_changed", got)
+	}
+}
+
 func TestProcessOnceRevalidatesOwnershipImmediatelyBeforePost(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
@@ -550,7 +573,7 @@ func TestProcessOnceRejectsAmbiguousPRAssociationBeforeComment(t *testing.T) {
 	st.prs[prURL] = pr
 	st.rows["wb-1"] = domain.TrackerWriteback{
 		ID: "wb-1", ProjectID: "proj", SessionID: "proj-1", IssueID: "github:acme/demo#12",
-		PRURL: prURL, Status: domain.TrackerWritebackPending,
+		PRURL: prURL, HeadSHA: "sha1", Status: domain.TrackerWritebackPending,
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
 		t.Fatal(err)
