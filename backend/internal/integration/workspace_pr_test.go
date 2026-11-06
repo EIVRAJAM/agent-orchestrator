@@ -25,7 +25,7 @@ func TestWorkspacePRDiscoveryAndClaimPersist(t *testing.T) {
 	observed.PR.HeadRepo = "octocat/hello"
 	f.provider.detected[observed.PR.SourceBranch] = observed.PR
 	f.provider.observations[1] = observed
-	if err := f.observer.Poll(ctx); err != nil {
+	if err := f.poll(ctx); err != nil {
 		t.Fatal(err)
 	}
 	prs, err := f.store.ListPRsBySession(ctx, f.session.ID)

@@ -114,6 +114,9 @@ func TestPoll_RemoteAttributionMatrix(t *testing.T) {
 					mustGit(t, "-C", checkout, "config", "--add", "remote."+remote+".pushurl", address)
 				}
 				store := remotePollStore(project)
+				if scenario.branch != "" && len(scenario.accepted) > 0 {
+					store.addBranchTip("inst-worker-7", scenario.branch, "revision")
+				}
 				if layout.kind == domain.ProjectKindWorkspace {
 					store.workspaceRepos["kit"] = []domain.WorkspaceRepoRecord{{Name: "component", RelativePath: "component", RepoOriginURL: remoteAddress(scenario.base)}}
 				}
@@ -197,6 +200,7 @@ func remotePollProvider(base ports.SCMRepo, heads []string, author, branch strin
 func verifyRemotePoll(t *testing.T, store *fakeStore, provider *remoteCatalogProvider, base ports.SCMRepo, expected []int) {
 	t.Helper()
 	lifecycle := &fakeLifecycle{}
+	store.seedDiscovery(provider.fakeProvider)
 	observer := New(provider, store, lifecycle, Config{
 		Clock: func() time.Time { return time.Unix(500, 0) }, Logger: quietSlog(), ScopedIdentityResolver: provider,
 	})

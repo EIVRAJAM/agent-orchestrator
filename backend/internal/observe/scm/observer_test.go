@@ -35,6 +35,8 @@ type fakeStore struct {
 	workspaceRepos map[string][]domain.WorkspaceRepoRecord
 	prs            map[domain.SessionID][]domain.PullRequest
 	checks         map[string][]domain.PullRequestCheck
+	branchTips     map[string]map[string]map[string]struct{}
+	prOwnerships   map[string]domain.SessionPROwnership
 	writeErr       error
 
 	writes []fakeWrite
@@ -99,6 +101,101 @@ func (s *fakeStore) ListPRsBySession(_ context.Context, id domain.SessionID) ([]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]domain.PullRequest(nil), s.prs[id]...), nil
+}
+
+func (s *fakeStore) addBranchTip(instanceID, branch, headSHA string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if instanceID == "" || branch == "" || headSHA == "" {
+		return
+	}
+	if s.branchTips == nil {
+		s.branchTips = map[string]map[string]map[string]struct{}{}
+	}
+	if s.branchTips[instanceID] == nil {
+		s.branchTips[instanceID] = map[string]map[string]struct{}{}
+	}
+	if s.branchTips[instanceID][branch] == nil {
+		s.branchTips[instanceID][branch] = map[string]struct{}{}
+	}
+	s.branchTips[instanceID][branch][headSHA] = struct{}{}
+}
+
+func (s *fakeStore) ListSessionBranchTips(_ context.Context, instanceID string) ([]domain.SessionBranchTip, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.SessionBranchTip
+	for branch, tips := range s.branchTips[instanceID] {
+		for sha := range tips {
+			out = append(out, domain.SessionBranchTip{SessionInstanceID: instanceID, Branch: branch, HeadSHA: sha})
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) RegisterSessionPROwnership(_ context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prOwnerships == nil {
+		s.prOwnerships = map[string]domain.SessionPROwnership{}
+	}
+	if !s.hasBranchTipLocked(instanceID, sourceBranch, headSHA) {
+		return false, nil
+	}
+	if existing, ok := s.prOwnerships[prURL]; ok {
+		return existing.SessionInstanceID == instanceID &&
+			existing.SourceBranch == sourceBranch &&
+			existing.HeadSHA == headSHA, nil
+	}
+	s.prOwnerships[prURL] = domain.SessionPROwnership{
+		PRURL: prURL, SessionInstanceID: instanceID, SourceBranch: sourceBranch,
+		HeadSHA: headSHA, RegisteredAt: now,
+	}
+	return true, nil
+}
+
+func (s *fakeStore) hasBranchTipLocked(instanceID, branch, headSHA string) bool {
+	if s.branchTips == nil {
+		return false
+	}
+	tips, ok := s.branchTips[instanceID][branch]
+	if !ok {
+		return false
+	}
+	_, ok = tips[headSHA]
+	return ok
+}
+
+func (s *fakeStore) seedDiscovery(provider *fakeProvider) {
+	if provider == nil {
+		return
+	}
+	s.mu.Lock()
+	for i := range s.sessions {
+		if s.sessions[i].InstanceID == "" {
+			s.sessions[i].InstanceID = "inst-" + string(s.sessions[i].ID)
+		}
+	}
+	s.mu.Unlock()
+	for repo, prs := range provider.openPRs {
+		for i := range prs {
+			if prs[i].HeadSHA == "" {
+				prs[i].HeadSHA = fmt.Sprintf("sha%d", prs[i].Number)
+			}
+		}
+		provider.openPRs[repo] = prs
+	}
+	for i := range s.sessions {
+		instanceID := s.sessions[i].InstanceID
+		branch := s.sessions[i].Metadata.Branch
+		for _, prs := range provider.openPRs {
+			for _, pr := range prs {
+				if pr.SourceBranch == branch {
+					s.addBranchTip(instanceID, branch, pr.HeadSHA)
+				}
+			}
+		}
+	}
 }
 
 func (s *fakeStore) ListChecks(_ context.Context, prURL string) ([]domain.PullRequestCheck, error) {
@@ -279,6 +376,7 @@ func (l *fakeLifecycle) ApplySCMObservation(_ context.Context, _ domain.SessionI
 }
 
 func newTestObserver(store *fakeStore, provider *fakeProvider, lc Lifecycle, now time.Time) *Observer {
+	store.seedDiscovery(provider)
 	if provider.identity.Login == "" && provider.identityErr == nil {
 		provider.identity = ports.SCMIdentity{Login: "alice", Human: true}
 	}
@@ -335,10 +433,12 @@ func quietSlog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, 
 
 func testStoreWithSession() *fakeStore {
 	return &fakeStore{
-		sessions: []domain.SessionRecord{{ID: "p-1", ProjectID: "p", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "feat"}}},
-		projects: map[string]domain.ProjectRecord{"p": {ID: "p", RepoOriginURL: "https://github.com/o/r.git"}},
-		prs:      map[domain.SessionID][]domain.PullRequest{},
-		checks:   map[string][]domain.PullRequestCheck{},
+		sessions:     []domain.SessionRecord{{ID: "p-1", InstanceID: "inst-p-1", ProjectID: "p", CreatedAt: time.Unix(1, 0).UTC(), Metadata: domain.SessionMetadata{Branch: "feat"}}},
+		projects:     map[string]domain.ProjectRecord{"p": {ID: "p", RepoOriginURL: "https://github.com/o/r.git"}},
+		prs:          map[domain.SessionID][]domain.PullRequest{},
+		checks:       map[string][]domain.PullRequestCheck{},
+		branchTips:   map[string]map[string]map[string]struct{}{},
+		prOwnerships: map[string]domain.SessionPROwnership{},
 	}
 }
 
@@ -616,6 +716,7 @@ func TestStart_LogsDisabledWarningWhenNoTokenAndNoSubjects(t *testing.T) {
 
 	buf := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	store.seedDiscovery(provider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:    func() time.Time { return time.Unix(1, 0).UTC() },
 		Tick:     time.Hour,
@@ -736,6 +837,7 @@ func TestPoll_DiscoversOnlyPRsFromAuthenticatedHuman(t *testing.T) {
 		observations: map[string]ports.SCMObservation{prKey(testRepo, 2): testObs(2)},
 	}
 	identity := &fakeIdentityResolver{identity: ports.SCMIdentity{Login: " alice ", Human: true}}
+	store.seedDiscovery(provider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:                  func() time.Time { return time.Unix(1, 0).UTC() },
 		Tick:                   time.Hour,
@@ -813,6 +915,7 @@ func TestPoll_DiscoversStackedChildByBranchPrefix(t *testing.T) {
 	}
 	lc := &fakeLifecycle{}
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+	store.addBranchTip("inst-p-1", "feat/child", "sha2")
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -842,6 +945,7 @@ func TestPoll_DiscoversSiblingUnderRootSessionNamespace(t *testing.T) {
 	}
 	lc := &fakeLifecycle{}
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
+	store.addBranchTip("inst-p-1", "ao/p-1/fix", "sha1")
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -856,18 +960,6 @@ func TestPoll_DiscoversSiblingUnderRootSessionNamespace(t *testing.T) {
 	}
 	if len(lc.observed) != 1 {
 		t.Fatalf("lifecycle observations = %d, want 1", len(lc.observed))
-	}
-}
-
-func TestMatchSession_PrefersExactBranchOverNamespaceMatch(t *testing.T) {
-	exact := sessionRepo{session: domain.SessionRecord{ID: "exact"}, branch: "ao/p-1"}
-	namespace := sessionRepo{session: domain.SessionRecord{ID: "namespace"}, branch: "ao/p-1/root"}
-	got, ok := matchSession([]sessionRepo{namespace, exact}, "ao/p-1")
-	if !ok {
-		t.Fatal("expected a matching session")
-	}
-	if got.session.ID != exact.session.ID {
-		t.Fatalf("matched session = %q, want exact branch owner %q", got.session.ID, exact.session.ID)
 	}
 }
 
@@ -904,6 +996,7 @@ func TestPoll_DiscoversWorkspaceChildRepoPR(t *testing.T) {
 		observations: map[string]ports.SCMObservation{prKey(testAPIRepo, 12): prObs},
 	}
 	lc := &fakeLifecycle{}
+	store.addBranchTip("inst-p-1", "ao/p-1/api-billing", "api-sha")
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1066,6 +1159,7 @@ func TestPoll_DiscoversCrossForkPRFromUpstreamRemote(t *testing.T) {
 		observations: map[string]ports.SCMObservation{prKey(upstream, 1): crossObs},
 	}
 	lc := &fakeLifecycle{}
+	store.addBranchTip("inst-p-1", "ao/p-1/feat", "sha1")
 	obs := newTestObserver(store, provider, lc, time.Unix(1, 0).UTC())
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -2993,6 +3087,7 @@ func TestPoll_AllFail_ScopedPerProviderError(t *testing.T) {
 	}}
 
 	now := time.Unix(2000, 0).UTC()
+	store.seedDiscovery(provider.fakeProvider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:                  func() time.Time { return now },
 		Tick:                   time.Hour,
@@ -3335,6 +3430,7 @@ func TestPoll_NotFoundObservationLogsDebugAndPinsRepo(t *testing.T) {
 		identity:       ports.SCMIdentity{Login: "alice", Human: true},
 	}
 	var logs bytes.Buffer
+	store.seedDiscovery(provider)
 	obs := New(provider, store, &fakeLifecycle{}, Config{
 		Clock:                  func() time.Time { return time.Unix(1, 0).UTC() },
 		Tick:                   time.Hour,

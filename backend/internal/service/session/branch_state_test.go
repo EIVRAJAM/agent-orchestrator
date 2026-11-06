@@ -14,7 +14,13 @@ import (
 
 type branchStateStore struct {
 	*fakeStore
-	writes int
+	writes   int
+	recorded []string
+}
+
+func (s *branchStateStore) RecordSessionBranchTip(_ context.Context, _ domain.SessionID, branch, headSHA, _ string) (bool, error) {
+	s.recorded = append(s.recorded, branch+"@"+headSHA)
+	return true, nil
 }
 
 func (s *branchStateStore) SetSessionBranchState(_ context.Context, id domain.SessionID, state domain.SessionBranchState) (bool, error) {
@@ -79,6 +85,55 @@ func TestReconcileSessionBranchStateTracksCommitsAndPushes(t *testing.T) {
 	reconcile(domain.SessionBranchState{Commits: 3, RemoteBranch: "origin/feat/x", Unpushed: 1})
 	if st.writes != writes {
 		t.Fatalf("unchanged facts were rewritten (%d writes, want %d)", st.writes, writes)
+	}
+}
+
+func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
+	repo := newPushableRepo(t)
+	runGit(t, repo, "checkout", "-b", "feature/owned")
+	commitFile(t, repo, "owned.go")
+	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", Metadata: domain.SessionMetadata{
+		Branch: "feature/owned", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
+	}}
+	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "ao-1"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range st.recorded {
+		if record == "feature/owned@"+head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recorded exact branch tips = %v, want feature/owned@%s", st.recorded, head)
+	}
+}
+
+func TestReconcileWorkspaceOwnershipRecordsChildWorktreeTip(t *testing.T) {
+	repo := newPushableRepo(t)
+	child := filepath.Join(t.TempDir(), "api")
+	runGit(t, repo, "worktree", "add", "-b", "ao/ws-1/api", child)
+	commitFile(t, child, "api.go")
+	head := strings.TrimSpace(runGit(t, child, "rev-parse", "HEAD"))
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["ws"] = domain.ProjectRecord{ID: "ws", Kind: domain.ProjectKindWorkspace}
+	st.sessions["ws-1"] = domain.SessionRecord{ID: "ws-1", ProjectID: "ws", Metadata: domain.SessionMetadata{
+		Branch: "ao/ws-1", WorkspacePath: child,
+	}}
+	st.worktrees["ws-1"] = []domain.SessionWorktreeRecord{{RepoName: "api", Branch: "ao/ws-1/api", WorktreePath: child}}
+	if err := (&Service{store: st}).reconcileWorkspaceOwnership(context.Background(), st, st.sessions["ws-1"]); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range st.recorded {
+		if record == "ao/ws-1/api@"+head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recorded workspace tips = %v, want ao/ws-1/api@%s", st.recorded, head)
 	}
 }
 

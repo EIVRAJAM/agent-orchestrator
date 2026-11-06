@@ -52,6 +52,7 @@ func TestPoll_IdentityRecoveryRetriesMissedDiscoveries(t *testing.T) {
 				openPRs:      map[string][]ports.SCMPRObservation{prKey(testRepo, 0): {missed.PR}},
 				observations: map[string]ports.SCMObservation{prKey(testRepo, 1): existing, prKey(testRepo, 2): missed},
 			}}
+			store.seedDiscovery(provider.fakeProvider)
 			obs := New(provider, store, &fakeLifecycle{}, Config{Logger: quietSlog(), Clock: func() time.Time { return now }, ScopedIdentityResolver: provider})
 			key := prKey(testRepo, 0)
 			if initialETag != "" {
