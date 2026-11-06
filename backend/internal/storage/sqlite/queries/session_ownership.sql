@@ -49,3 +49,21 @@ WHERE p.pr_url = ?;
 
 -- name: GetSessionInstanceID :one
 SELECT instance_id FROM sessions WHERE id = ?;
+
+-- name: RefreshSessionPROwnership :execrows
+-- Advance an existing PR ownership row only when the new head is already a
+-- registered tip of the same instance-scoped source branch. This is the
+-- branch-move path; a foreign head cannot replace the ownership row.
+UPDATE session_pr_ownerships
+SET head_sha = sqlc.arg(new_head_sha),
+    registered_at = sqlc.arg(new_registered_at)
+WHERE session_pr_ownerships.pr_url = sqlc.arg(target_pr_url)
+  AND session_pr_ownerships.session_instance_id = sqlc.arg(expected_instance_id)
+  AND session_pr_ownerships.source_branch = sqlc.arg(expected_source_branch)
+  AND EXISTS (
+      SELECT 1
+      FROM session_branch_tips AS t
+      WHERE t.session_instance_id = sqlc.arg(expected_instance_id)
+        AND t.branch = sqlc.arg(expected_source_branch)
+        AND t.head_sha = sqlc.arg(new_head_sha)
+  );

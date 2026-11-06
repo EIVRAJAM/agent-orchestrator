@@ -196,19 +196,20 @@ func (s *Service) reconcileBranchTarget(ctx context.Context, writer branchStateW
 		}
 	}
 	if owner, ok := writer.(branchOwnershipWriter); ok {
-		for _, sha := range []string{local, remote, tips["refs/heads/"+target.branch], tips["refs/remotes/"+branchStateRemote+"/"+target.branch]} {
-			if sha != "" {
-				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.branch, sha, target.rec.Metadata.WorkspacePath); err != nil {
+		// Only local branch refs are evidence that this workspace owns a tip.
+		// origin/<branch> may be a stale remote left by another session/data dir;
+		// it is useful for BranchState, not for ownership.
+		if target.branch != "" {
+			if local := tips["refs/heads/"+target.branch]; local != "" {
+				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.branch, local, target.rec.Metadata.WorkspacePath); err != nil {
 					return err
 				}
 			}
 		}
 		if target.rootBranch != "" {
-			for _, sha := range []string{tips["refs/heads/"+target.rootBranch], tips["refs/remotes/"+branchStateRemote+"/"+target.rootBranch]} {
-				if sha != "" {
-					if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.rootBranch, sha, target.rec.Metadata.WorkspacePath); err != nil {
-						return err
-					}
+			if rootLocal := tips["refs/heads/"+target.rootBranch]; rootLocal != "" {
+				if _, err := owner.RecordSessionBranchTip(ctx, target.rec.ID, target.rootBranch, rootLocal, target.rec.Metadata.WorkspacePath); err != nil {
+					return err
 				}
 			}
 		}

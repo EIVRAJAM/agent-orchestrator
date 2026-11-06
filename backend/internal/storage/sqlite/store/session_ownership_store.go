@@ -128,6 +128,33 @@ func (s *Store) RegisterSessionPROwnership(
 		existing.HeadSha == headSHA, nil
 }
 
+// RefreshSessionPROwnership advances an already-owned PR to a new head only
+// when that head is a registered tip of the same instance/branch. It returns
+// false for missing ownership, a different branch, or an unregistered head.
+func (s *Store) RefreshSessionPROwnership(
+	ctx context.Context,
+	instanceID, prURL, sourceBranch, headSHA string,
+	now time.Time,
+) (bool, error) {
+	if strings.TrimSpace(instanceID) == "" || strings.TrimSpace(prURL) == "" ||
+		strings.TrimSpace(sourceBranch) == "" || strings.TrimSpace(headSHA) == "" {
+		return false, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.RefreshSessionPROwnership(ctx, gen.RefreshSessionPROwnershipParams{
+		NewHeadSha:           headSHA,
+		NewRegisteredAt:      now,
+		TargetPRURL:          prURL,
+		ExpectedInstanceID:   instanceID,
+		ExpectedSourceBranch: sourceBranch,
+	})
+	if err != nil {
+		return false, fmt.Errorf("refresh PR ownership %s: %w", prURL, err)
+	}
+	return rows > 0, nil
+}
+
 // GetSessionPROwnership reads the live ownership chain for a PR. A missing
 // branch ownership row or tip makes the record unavailable (fail closed).
 func (s *Store) GetSessionPROwnership(ctx context.Context, prURL string) (domain.SessionPROwnership, bool, error) {

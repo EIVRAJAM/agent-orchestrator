@@ -154,6 +154,25 @@ func (s *fakeStore) RegisterSessionPROwnership(_ context.Context, instanceID, pr
 	return true, nil
 }
 
+func (s *fakeStore) RefreshSessionPROwnership(_ context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.prOwnerships == nil {
+		return false, nil
+	}
+	existing, ok := s.prOwnerships[prURL]
+	if !ok || existing.SessionInstanceID != instanceID || existing.SourceBranch != sourceBranch {
+		return false, nil
+	}
+	if !s.hasBranchTipLocked(instanceID, sourceBranch, headSHA) {
+		return false, nil
+	}
+	existing.HeadSHA = headSHA
+	existing.RegisteredAt = now
+	s.prOwnerships[prURL] = existing
+	return true, nil
+}
+
 func (s *fakeStore) hasBranchTipLocked(instanceID, branch, headSHA string) bool {
 	if s.branchTips == nil {
 		return false

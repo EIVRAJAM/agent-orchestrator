@@ -111,6 +111,30 @@ func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
 	}
 }
 
+func TestReconcileBranchStatesDoesNotAdoptRemoteOnlyBranchTip(t *testing.T) {
+	repo := newPushableRepo(t)
+	// Simulate a remote branch left behind by another session/data dir. It is
+	// visible as origin/ao/s1/root but is not the local branch this session owns.
+	runGit(t, repo, "checkout", "-b", "old-tip", "main")
+	commitFile(t, repo, "old.go")
+	oldSHA := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	runGit(t, repo, "push", "origin", "old-tip:refs/heads/ao/s1/root")
+	runGit(t, repo, "checkout", "main")
+	runGit(t, repo, "branch", "ao/s1/root", "main")
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Metadata: domain.SessionMetadata{
+		Branch: "ao/s1/root", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
+	}}
+	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "s1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range st.recorded {
+		if strings.HasSuffix(record, "@"+oldSHA) {
+			t.Fatalf("remote-only old branch tip was claimed as ownership: %v (old=%s)", st.recorded, oldSHA)
+		}
+	}
+}
+
 func TestReconcileWorkspaceOwnershipRecordsChildWorktreeTip(t *testing.T) {
 	repo := newPushableRepo(t)
 	child := filepath.Join(t.TempDir(), "api")

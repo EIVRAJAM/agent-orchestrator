@@ -84,6 +84,47 @@ func (q *Queries) ListSessionBranchTips(ctx context.Context, sessionInstanceID s
 	return items, nil
 }
 
+const refreshSessionPROwnership = `-- name: RefreshSessionPROwnership :execrows
+UPDATE session_pr_ownerships
+SET head_sha = ?1,
+    registered_at = ?2
+WHERE session_pr_ownerships.pr_url = ?3
+  AND session_pr_ownerships.session_instance_id = ?4
+  AND session_pr_ownerships.source_branch = ?5
+  AND EXISTS (
+      SELECT 1
+      FROM session_branch_tips AS t
+      WHERE t.session_instance_id = ?4
+        AND t.branch = ?5
+        AND t.head_sha = ?1
+  )
+`
+
+type RefreshSessionPROwnershipParams struct {
+	NewHeadSha           string
+	NewRegisteredAt      time.Time
+	TargetPRURL          string
+	ExpectedInstanceID   string
+	ExpectedSourceBranch string
+}
+
+// Advance an existing PR ownership row only when the new head is already a
+// registered tip of the same instance-scoped source branch. This is the
+// branch-move path; a foreign head cannot replace the ownership row.
+func (q *Queries) RefreshSessionPROwnership(ctx context.Context, arg RefreshSessionPROwnershipParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, refreshSessionPROwnership,
+		arg.NewHeadSha,
+		arg.NewRegisteredAt,
+		arg.TargetPRURL,
+		arg.ExpectedInstanceID,
+		arg.ExpectedSourceBranch,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const registerSessionBranch = `-- name: RegisterSessionBranch :execrows
 INSERT INTO session_branch_ownerships (session_id, session_instance_id, branch, worktree_path, registered_at)
 SELECT s.id, s.instance_id, ?1, ?2, ?3

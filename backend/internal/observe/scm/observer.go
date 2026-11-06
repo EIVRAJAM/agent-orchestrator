@@ -81,6 +81,7 @@ type Store interface {
 	ListPRsBySession(ctx context.Context, sessionID domain.SessionID) ([]domain.PullRequest, error)
 	ListSessionBranchTips(ctx context.Context, instanceID string) ([]domain.SessionBranchTip, error)
 	RegisterSessionPROwnership(ctx context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
+	RefreshSessionPROwnership(ctx context.Context, instanceID, prURL, sourceBranch, headSHA string, now time.Time) (bool, error)
 	ListChecks(ctx context.Context, prURL string) ([]domain.PullRequestCheck, error)
 	WriteSCMObservation(ctx context.Context, pr domain.PullRequest, checks []domain.PullRequestCheck, reviews []domain.PullRequestReview, threads []domain.PullRequestReviewThread, comments []domain.PullRequestComment, reviewMode ports.ReviewWriteMode) error
 }
@@ -643,6 +644,24 @@ func (o *Observer) Poll(ctx context.Context) error {
 			o.logger.Error("scm observer: DB write failed", "session", subj.session.ID, "pr", pr.URL, "err", err)
 			markRepoRefreshFailed(subj.repo)
 			continue
+		}
+		// The branch may advance after discovery. Rotate only the existing,
+		// instance-scoped ownership to a head that branch-state reconciliation
+		// has already recorded as an exact tip. This must happen before lifecycle
+		// can enqueue a tracker write-back for the refreshed PR.
+		if subj.session.InstanceID != "" {
+			prURL := firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL)
+			if prURL != "" && prepared.PR.SourceBranch != "" && prepared.PR.HeadSHA != "" {
+				refreshed, refreshErr := o.store.RefreshSessionPROwnership(ctx, subj.session.InstanceID, prURL, prepared.PR.SourceBranch, prepared.PR.HeadSHA, now)
+				if refreshErr != nil {
+					o.logger.Error("scm observer: refresh PR ownership failed", "session", subj.session.ID, "pr", prURL, "err", refreshErr)
+					markRepoRefreshFailed(subj.repo)
+					continue
+				}
+				if !refreshed {
+					o.logger.Debug("scm observer: PR ownership did not advance", "session", subj.session.ID, "branch", prepared.PR.SourceBranch, "head", prepared.PR.HeadSHA)
+				}
+			}
 		}
 		if o.lifecycle != nil {
 			if err := o.lifecycle.ApplySCMObservation(ctx, subj.session.ID, prepared); err != nil {
