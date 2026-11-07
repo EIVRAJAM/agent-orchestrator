@@ -134,8 +134,9 @@ type notificationSink interface {
 
 // trackerWritebackSink is the optional lifecycle-to-tracker write-back boundary.
 // Enqueue must stay local/durable; it must never post to a provider inline.
+// headSHA is the exact PR head from the SCM observation that made the PR ready.
 type trackerWritebackSink interface {
-	Enqueue(ctx context.Context, sessionID domain.SessionID, prURL string) error
+	Enqueue(ctx context.Context, sessionID domain.SessionID, prURL, headSHA string) error
 }
 
 // projectConfigLoader resolves a project's config so MarkTerminated can check

@@ -52,6 +52,67 @@ func TestTrackerWritebackOutboxIsUniqueClaimedAndAtMostOnce(t *testing.T) {
 	}
 }
 
+func TestTrackerWritebackPersistsExactHeadAndRejectsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedProject(t, s, "mer")
+	session, err := s.CreateSession(ctx, sampleRecord("mer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	row := domain.TrackerWriteback{
+		ID: "wb-head", ProjectID: "mer", SessionID: session.ID,
+		IssueID: "github:acme/demo#12", PRURL: "https://github.com/acme/demo/pull/1",
+		HeadSHA: "sha-expected", Status: domain.TrackerWritebackPending, CreatedAt: now, UpdatedAt: now,
+	}
+	inserted, err := s.EnqueueTrackerWriteback(ctx, row)
+	if err != nil || !inserted {
+		t.Fatalf("enqueue = inserted=%v err=%v", inserted, err)
+	}
+
+	rows, err := s.ListTrackerWritebacks(ctx, "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].HeadSHA != "sha-expected" {
+		t.Fatalf("rows = %+v, want one row with head sha-expected", rows)
+	}
+
+	// The idempotency key preserves the original head even if a later
+	// observation supplies a different one.
+	duplicate := row
+	duplicate.ID = "wb-head-2"
+	duplicate.HeadSHA = "sha-other"
+	inserted, err = s.EnqueueTrackerWriteback(ctx, duplicate)
+	if err != nil || inserted {
+		t.Fatalf("duplicate enqueue = inserted=%v err=%v", inserted, err)
+	}
+	rows, err = s.ListTrackerWritebacks(ctx, "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].HeadSHA != "sha-expected" {
+		t.Fatalf("after duplicate rows = %+v, want original head", rows)
+	}
+
+	invalid := row
+	invalid.ID = "wb-empty"
+	invalid.PRURL = "https://github.com/acme/demo/pull/2"
+	invalid.HeadSHA = ""
+	inserted, err = s.EnqueueTrackerWriteback(ctx, invalid)
+	if err == nil || inserted {
+		t.Fatalf("empty head enqueue = inserted=%v err=%v, want explicit rejection", inserted, err)
+	}
+	rows, err = s.ListTrackerWritebacks(ctx, "", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("after empty-head rejection rows = %d, want 1", len(rows))
+	}
+}
+
 func TestTrackerWritebackRecoveryMarksClaimedRowsUncertain(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -64,7 +125,7 @@ func TestTrackerWritebackRecoveryMarksClaimedRowsUncertain(t *testing.T) {
 	if _, err := s.EnqueueTrackerWriteback(ctx, domain.TrackerWriteback{
 		ID: "wb-1", ProjectID: "mer", SessionID: session.ID,
 		IssueID: "github:acme/demo#12", PRURL: "https://github.com/acme/demo/pull/1",
-		Status: domain.TrackerWritebackPending, CreatedAt: now, UpdatedAt: now,
+		HeadSHA: "sha-one", Status: domain.TrackerWritebackPending, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}

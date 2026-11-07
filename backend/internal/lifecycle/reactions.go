@@ -452,7 +452,11 @@ func (m *Manager) ApplySCMObservation(ctx context.Context, id domain.SessionID, 
 		if sink := m.trackerWritebackSink(); sink != nil {
 			prURL := firstSCMNonEmpty(o.PR.URL, o.PR.HTMLURL)
 			if prURL != "" {
-				if err := sink.Enqueue(ctx, id, prURL); err != nil {
+				headSHA := strings.TrimSpace(o.PR.HeadSHA)
+				if headSHA == "" {
+					return fmt.Errorf("tracker writeback enqueue: PR head SHA is missing")
+				}
+				if err := sink.Enqueue(ctx, id, prURL, headSHA); err != nil {
 					// The SCM observer uses this return value as its acknowledgement
 					// barrier. Returning the persistence failure keeps the semantic
 					// hashes stale so the observation is delivered again.
