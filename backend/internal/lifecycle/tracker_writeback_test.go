@@ -12,21 +12,23 @@ import (
 type fakeTrackerWriteback struct {
 	ids   []domain.SessionID
 	prs   []string
+	heads []string
 	calls int
 	err   error
 }
 
-func (f *fakeTrackerWriteback) Enqueue(_ context.Context, id domain.SessionID, prURL string) error {
+func (f *fakeTrackerWriteback) Enqueue(_ context.Context, id domain.SessionID, prURL, headSHA string) error {
 	f.calls++
 	f.ids = append(f.ids, id)
 	f.prs = append(f.prs, prURL)
+	f.heads = append(f.heads, headSHA)
 	return f.err
 }
 
 func writebackObservation() ports.SCMObservation {
 	return ports.SCMObservation{
 		Fetched:      true,
-		PR:           ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1},
+		PR:           ports.SCMPRObservation{URL: "https://github.com/o/r/pull/1", Number: 1, HeadSHA: "sha-expected"},
 		CI:           ports.SCMCIObservation{Summary: string(domain.CIPassing)},
 		Review:       ports.SCMReviewObservation{Decision: string(domain.ReviewApproved)},
 		Mergeability: ports.SCMMergeabilityObservation{State: string(domain.MergeMergeable)},
@@ -104,7 +106,26 @@ func TestTrackerWritebackUsesIndependentReadinessContract(t *testing.T) {
 			if got := sink.calls > 0; got != tt.wantEnqueue {
 				t.Fatalf("enqueue = %v, want %v (calls=%d)", got, tt.wantEnqueue, sink.calls)
 			}
+			if tt.wantEnqueue && (len(sink.heads) != 1 || sink.heads[0] != "sha-expected") {
+				t.Fatalf("enqueued heads = %v, want [sha-expected]", sink.heads)
+			}
 		})
+	}
+}
+
+func TestTrackerWritebackMissingHeadDoesNotEnqueue(t *testing.T) {
+	m, st, _ := newManager()
+	sink := &fakeTrackerWriteback{}
+	m.SetTrackerWritebackSink(sink)
+	st.sessions["mer-1"] = working("mer-1")
+	o := writebackObservation()
+	o.PR.HeadSHA = ""
+
+	if err := m.ApplySCMObservation(context.Background(), "mer-1", o); err == nil {
+		t.Fatal("ApplySCMObservation returned nil for a ready observation without a head")
+	}
+	if sink.calls != 0 {
+		t.Fatalf("enqueue calls = %d, want 0 without a head", sink.calls)
 	}
 }
 

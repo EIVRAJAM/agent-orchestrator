@@ -255,7 +255,7 @@ func seedWriteback(t *testing.T, enabled bool) (*Service, *fakeStore, *fakeComme
 
 func TestEnqueueIsOptInAndDeduplicated(t *testing.T) {
 	svc, st, _ := seedWriteback(t, false)
-	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1"); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if st.rowCount() != 0 {
@@ -264,14 +264,17 @@ func TestEnqueueIsOptInAndDeduplicated(t *testing.T) {
 
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if st.rowCount() != 1 {
 		t.Fatalf("rows = %d, want 1 after duplicate enqueue", st.rowCount())
+	}
+	if got := st.row("wb-1").HeadSHA; got != "sha1" {
+		t.Fatalf("persisted head = %q, want sha1", got)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
 		t.Fatal(err)
@@ -287,10 +290,30 @@ func TestEnqueueIsOptInAndDeduplicated(t *testing.T) {
 	}
 }
 
+func TestEnqueueRequiresObservedHeadSHA(t *testing.T) {
+	svc, st, _ := seedWriteback(t, true)
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", ""); err == nil {
+		t.Fatal("Enqueue accepted a missing observed head")
+	}
+	if st.rowCount() != 0 {
+		t.Fatalf("rows = %d, want none without an observed head", st.rowCount())
+	}
+}
+
+func TestEnqueueRejectsObservedHeadMismatch(t *testing.T) {
+	svc, st, _ := seedWriteback(t, true)
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha-other"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rowCount() != 0 {
+		t.Fatalf("rows = %d, want none for a mismatched observed head", st.rowCount())
+	}
+}
+
 func TestRemoteErrorBecomesUncertainAndIsNeverRetried(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	commenter.err = errors.New("response lost")
-	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1"); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
@@ -329,7 +352,7 @@ func TestEnqueueSkipsNonIssueOrTerminatedSessions(t *testing.T) {
 	st.sessions["proj-2"] = domain.SessionRecord{ID: "proj-2", ProjectID: "proj", Kind: domain.KindWorker}
 	st.sessions["proj-3"] = domain.SessionRecord{ID: "proj-3", ProjectID: "proj", IssueID: "github:acme/demo#12", Kind: domain.KindWorker, IsTerminated: true}
 	for _, id := range []domain.SessionID{"proj-2", "proj-3"} {
-		if err := svc.Enqueue(context.Background(), id, "https://github.com/acme/demo/pull/1"); err != nil {
+		if err := svc.Enqueue(context.Background(), id, "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -341,7 +364,7 @@ func TestEnqueueSkipsNonIssueOrTerminatedSessions(t *testing.T) {
 func TestMissingCommentReceiptBecomesUncertainWithoutRetry(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	commenter.emptyURL = true
-	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1"); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
@@ -361,7 +384,7 @@ func TestMissingCommentReceiptBecomesUncertainWithoutRetry(t *testing.T) {
 func TestAdapterReceiptErrorMapsToMissingReceipt(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	commenter.err = ports.ErrTrackerCommentReceipt
-	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1"); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
@@ -376,7 +399,7 @@ func TestSettlementFailureAfterPostDoesNotResend(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	updated := false
 	st.finishUpdated = &updated
-	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1"); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
@@ -418,7 +441,7 @@ func TestTerminalLoggingIsSanitized(t *testing.T) {
 	svc := NewWithRefresher(st, st, commenter, logger, time.Minute)
 	svc.clock = func() time.Time { return time.Unix(100, 0).UTC() }
 	svc.newID = func() string { return "wb-log" }
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
@@ -488,7 +511,7 @@ func TestListReturnsBoundedSanitizedPage(t *testing.T) {
 func TestSettlementErrorAfterPostDoesNotResend(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	st.finishErr = errors.New("db unavailable")
-	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1"); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", "https://github.com/acme/demo/pull/1", "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ProcessOnce(context.Background()); err != nil {
@@ -587,7 +610,7 @@ func TestEnqueueRequiresExactDurableOwnership(t *testing.T) {
 			pr := st.prs["https://github.com/acme/demo/pull/1"]
 			mutate(st, &pr)
 			st.prs[pr.URL] = pr
-			if err := svc.Enqueue(context.Background(), "proj-1", pr.URL); err != nil {
+			if err := svc.Enqueue(context.Background(), "proj-1", pr.URL, "sha1"); err != nil {
 				t.Fatal(err)
 			}
 			if st.rowCount() != 0 {
@@ -600,7 +623,7 @@ func TestEnqueueRequiresExactDurableOwnership(t *testing.T) {
 func TestProcessOnceRejectsHeadMovedAfterEnqueue(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	pr := st.prs[prURL]
@@ -623,7 +646,7 @@ func TestProcessOnceRejectsHeadMovedAfterEnqueue(t *testing.T) {
 func TestProcessOnceUsesExplicitFreshProviderRead(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	cached := st.fresh
@@ -650,7 +673,7 @@ func TestProcessOnceUsesFreshHTTPReadBeforeComment(t *testing.T) {
 	defer server.Close()
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	svc.refresher = &httpPRRefresher{url: server.URL, observation: st.fresh}
@@ -668,7 +691,7 @@ func TestProcessOnceUsesFreshHTTPReadBeforeComment(t *testing.T) {
 func TestProcessOnceFailsClosedOnFreshPRReadFailure(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	st.freshErr = errors.New("provider timeout; URL must not leak")
@@ -705,7 +728,7 @@ func TestProcessOnceFailsClosedWhenFreshPRIsNotReady(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			svc, st, commenter := seedWriteback(t, true)
 			prURL := "https://github.com/acme/demo/pull/1"
-			if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+			if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 				t.Fatal(err)
 			}
 			pr := st.prs[prURL]
@@ -734,7 +757,7 @@ func TestProcessOnceFailsClosedWhenFreshPRIsNotReady(t *testing.T) {
 func TestProcessOnceRevalidatesOwnershipImmediatelyBeforePost(t *testing.T) {
 	svc, st, commenter := seedWriteback(t, true)
 	prURL := "https://github.com/acme/demo/pull/1"
-	if err := svc.Enqueue(context.Background(), "proj-1", prURL); err != nil {
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
 		t.Fatal(err)
 	}
 	delete(st.ownership, prURL)

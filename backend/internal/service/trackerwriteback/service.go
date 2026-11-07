@@ -87,10 +87,15 @@ func NewWithRefresher(store Store, refresher PRRefresher, commenter ports.Tracke
 // Enqueue records one deduplicated intent. It is intentionally cheap and is
 // called from the lifecycle reducer; it never performs provider I/O. Missing
 // sessions, non-worker sessions, missing issue identities, disabled projects,
-// and malformed PR URLs are ignored conservatively.
-func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL string) error {
+// and malformed PR URLs are ignored conservatively. The exact head SHA from the
+// SCM observation is mandatory and must still match the durable PR row.
+func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL, headSHA string) error {
 	if s == nil || s.store == nil || s.commenter == nil || sessionID == "" {
 		return nil
+	}
+	headSHA = strings.TrimSpace(headSHA)
+	if headSHA == "" {
+		return fmt.Errorf("tracker writeback: PR head SHA is required")
 	}
 	prURL = strings.TrimSpace(prURL)
 	if !validPRURL(prURL) {
@@ -123,6 +128,10 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 	if err != nil {
 		return fmt.Errorf("load PR for tracker writeback: %w", err)
 	}
+	if !ok || pr.HeadSHA == "" || pr.HeadSHA != headSHA {
+		s.logger.Warn("tracker writeback: rejected PR head", "session", rec.ID, "reason", "pr_head_changed")
+		return nil
+	}
 	ownership, owned, err := s.store.GetSessionPROwnership(ctx, prURL)
 	if err != nil {
 		return fmt.Errorf("load PR ownership for tracker writeback: %w", err)
@@ -138,7 +147,7 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 		SessionID: rec.ID,
 		IssueID:   rec.IssueID,
 		PRURL:     prURL,
-		HeadSHA:   pr.HeadSHA,
+		HeadSHA:   headSHA,
 		Status:    domain.TrackerWritebackPending,
 		CreatedAt: now,
 		UpdatedAt: now,

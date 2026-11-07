@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -15,6 +16,10 @@ import (
 // (project, issue, PR) key makes repeated lifecycle observations harmless.
 // It returns inserted=false when an identical intent already exists.
 func (s *Store) EnqueueTrackerWriteback(ctx context.Context, w domain.TrackerWriteback) (bool, error) {
+	w.HeadSHA = strings.TrimSpace(w.HeadSHA)
+	if w.HeadSHA == "" {
+		return false, fmt.Errorf("enqueue tracker writeback: head SHA is required")
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if w.Status == "" {
@@ -30,6 +35,7 @@ func (s *Store) EnqueueTrackerWriteback(ctx context.Context, w domain.TrackerWri
 		SessionID:   string(w.SessionID),
 		IssueID:     string(w.IssueID),
 		PRURL:       w.PRURL,
+		HeadSha:     w.HeadSHA,
 		Status:      w.Status,
 		Attempts:    int64(w.Attempts),
 		CommentURL:  w.CommentURL,
