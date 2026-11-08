@@ -156,6 +156,7 @@ ao project set-config <id> [flags]
 | `--symlink stringArray` | Repo-relative path to symlink into workspaces (repeatable) | - |
 | `--tracker-assignee string` | Issue assignee required for tracker intake eligibility | - |
 | `--tracker-intake` | Opt this project into GitHub or GitLab issue intake; inert unless the daemon also has `AO_TRACKER_INTAKE=on` | Disabled |
+| `--tracker-label stringArray` | Label allowlist for issue intake (repeatable); when set, an issue must carry at least one exact configured label | - |
 | `--tracker-repo string` | Provider-native issue repository (`owner/repo` or `group/subgroup/repo`); defaults to the Git origin | - |
 | `--reviewer stringArray` | Reviewer harness for worker PRs (repeatable) | - |
 | `--worker-agent string` | Harness override for worker sessions | - |
@@ -165,6 +166,13 @@ Use `--config-json` for fields without a dedicated flag, including
 `agentConfig.mode`, `worker.agentConfig.mode`, and
 `orchestrator.agentConfig.mode`. The full-config replacement warning above
 still applies.
+
+`--tracker-label` is an optional allowlist. Repeating it lets an issue match
+any one of the configured labels; it never broadens intake. An empty allowlist
+preserves the historical assignee-only behavior. GitHub matches label names
+case-insensitively, while GitLab matches them case-sensitively; matching is
+whole-label equality, never a substring. Intake still requires the configured
+assignee rule.
 
 **Examples:**
 
@@ -198,4 +206,11 @@ ao project set-config agent-orchestrator --agent-rules-file docs/ao-worker-rules
 # Enable assignee-scoped issue intake (requires AO_TRACKER_INTAKE=on)
 ao project set-config agent-orchestrator --tracker-intake \
   --tracker-repo owner/repo --tracker-assignee alice
+```
+
+```bash
+# Narrow intake to issues carrying at least one exact allowlisted label
+ao project set-config agent-orchestrator --tracker-intake \
+  --tracker-repo owner/repo --tracker-assignee alice \
+  --tracker-label ao-autonomy-pilot-2
 ```
