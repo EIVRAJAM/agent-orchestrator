@@ -6390,6 +6390,7 @@ export interface components {
         TrackerIntakeConfig: {
             assignee?: string;
             enabled?: boolean;
+            labels?: string[];
             /** @enum {string} */
             provider?: "github" | "gitlab";
             repo?: string;

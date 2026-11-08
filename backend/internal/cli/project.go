@@ -88,10 +88,11 @@ type roleOverride struct {
 
 // trackerIntakeConfig mirrors domain.TrackerIntakeConfig.
 type trackerIntakeConfig struct {
-	Enabled  bool   `json:"enabled,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Repo     string `json:"repo,omitempty"`
-	Assignee string `json:"assignee,omitempty"`
+	Enabled  bool     `json:"enabled,omitempty"`
+	Provider string   `json:"provider,omitempty"`
+	Repo     string   `json:"repo,omitempty"`
+	Assignee string   `json:"assignee,omitempty"`
+	Labels   []string `json:"labels,omitempty"`
 }
 
 // trackerWritebackConfig mirrors domain.TrackerWritebackConfig.
@@ -158,6 +159,7 @@ type projectSetConfigOptions struct {
 	trackerIntake     bool
 	trackerRepo       string
 	trackerAssignee   string
+	trackerLabels     []string
 	trackerWriteback  bool
 	reviewers         []string
 	configJSON        string
@@ -352,6 +354,7 @@ func newProjectSetConfigCommand(ctx *commandContext) *cobra.Command {
 	f.BoolVar(&opts.trackerIntake, "tracker-intake", false, "Opt this project into issue intake (GitHub or GitLab; provider inferred from git origin). Inert unless the daemon also has AO_TRACKER_INTAKE=on")
 	f.StringVar(&opts.trackerRepo, "tracker-repo", "", "Provider-native repo for issue intake (owner/repo or group/subgroup/repo; default: derive from git origin)")
 	f.StringVar(&opts.trackerAssignee, "tracker-assignee", "", "Issue assignee required for intake eligibility")
+	f.StringArrayVar(&opts.trackerLabels, "tracker-label", nil, "Issue label allowed for intake eligibility (repeatable; at least one configured label must match)")
 	f.BoolVar(&opts.trackerWriteback, "tracker-writeback", false, "Opt this project into the single tracker write-back: a PR-ready comment when CI is green (default off)")
 	f.StringArrayVar(&opts.reviewers, "reviewer", nil, "Reviewer harness that reviews worker PRs (repeatable; e.g. claude-code)")
 	f.StringVar(&opts.configJSON, "config-json", "", "Full config as a JSON object (overrides field flags)")
@@ -397,6 +400,7 @@ func buildProjectConfig(opts projectSetConfigOptions) (projectConfig, error) {
 			Enabled:  opts.trackerIntake,
 			Repo:     opts.trackerRepo,
 			Assignee: opts.trackerAssignee,
+			Labels:   opts.trackerLabels,
 		},
 		TrackerWriteback: trackerWritebackConfig{Enabled: opts.trackerWriteback},
 		Reviewers:        reviewersForFlags(opts.reviewers),

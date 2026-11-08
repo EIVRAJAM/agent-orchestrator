@@ -184,6 +184,10 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 		o.logger.Warn("tracker intake: no adapter for provider", "project", project.ID, "provider", cfg.Provider, "err", err)
 		return true
 	}
+	// Do not send the allowlist to the provider query: provider label matching
+	// rules differ (GitHub is case-insensitive, GitLab is case-sensitive), and
+	// a provider-side narrowing could hide an issue before the local exact
+	// comparison runs. Assignee/state still narrow the fetch.
 	issues, err := tracker.List(ctx, repo, domain.ListFilter{
 		State:    domain.ListOpen,
 		Assignee: cfg.Assignee,
@@ -223,6 +227,13 @@ func (o *Observer) pollProject(ctx context.Context, project domain.ProjectRecord
 }
 
 func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
+	if !issueMatchesAssignee(issue, cfg) {
+		return false
+	}
+	return issueMatchesLabels(issue, cfg)
+}
+
+func issueMatchesAssignee(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
 	assignee := strings.TrimSpace(cfg.Assignee)
 	switch {
 	case assignee == "":
@@ -234,6 +245,43 @@ func issueMatchesConfig(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool
 	default:
 		return containsFold(issue.Assignees, assignee)
 	}
+}
+
+// issueMatchesLabels applies the configured allowlist after the provider's
+// list query. GitHub label names are case-insensitive; GitLab label names are
+// case-sensitive. Matching is always whole-label equality, never a prefix or
+// substring. An issue with no exposed labels, or an issue from an unknown
+// provider, cannot satisfy a configured allowlist.
+func issueMatchesLabels(issue domain.Issue, cfg domain.TrackerIntakeConfig) bool {
+	if len(cfg.Labels) == 0 {
+		return true
+	}
+	provider := issue.ID.Provider
+	if provider == "" {
+		provider = cfg.Provider
+	}
+	if provider == "" || (cfg.Provider != "" && provider != cfg.Provider) {
+		return false
+	}
+	for _, configured := range cfg.Labels {
+		configured = strings.TrimSpace(configured)
+		if configured == "" {
+			continue
+		}
+		for _, actual := range issue.Labels {
+			switch provider {
+			case domain.TrackerProviderGitHub:
+				if strings.EqualFold(strings.TrimSpace(actual), configured) {
+					return true
+				}
+			case domain.TrackerProviderGitLab:
+				if actual == configured {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func containsFold(values []string, needle string) bool {

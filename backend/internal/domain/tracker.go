@@ -162,6 +162,10 @@ type TrackerIntakeConfig struct {
 	// Assignee narrows eligible issues to one assignee. Provider-specific values
 	// such as "*" are passed through unchanged.
 	Assignee string `json:"assignee,omitempty"`
+	// Labels is an optional allowlist. When non-empty, an issue must carry at
+	// least one configured label before intake may create or reuse a session.
+	// Empty preserves the historical assignee-only intake behavior.
+	Labels []string `json:"labels,omitempty"`
 }
 
 // WithDefaults leaves the provider empty when not explicitly set so the
@@ -214,6 +218,14 @@ func (c TrackerIntakeConfig) Validate() error {
 	}
 	if err := validateNoWhitespaceField("trackerIntake.assignee", c.Assignee); err != nil {
 		return err
+	}
+	for i, label := range c.Labels {
+		if strings.TrimSpace(label) == "" {
+			return fmt.Errorf("trackerIntake.labels[%d]: label must not be empty", i)
+		}
+		if strings.TrimSpace(label) != label {
+			return fmt.Errorf("trackerIntake.labels[%d]: must not have leading or trailing whitespace", i)
+		}
 	}
 	if strings.TrimSpace(c.Assignee) == "" {
 		return fmt.Errorf("trackerIntake: assignee is required when enabled")

@@ -21,6 +21,7 @@ func TestPollSpawnsWorkerForEligibleIssue(t *testing.T) {
 			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
 				Enabled:  true,
 				Assignee: "alice",
+				Labels:   []string{"agent-ready"},
 			}},
 		}},
 	}
@@ -55,7 +56,7 @@ func TestPollSpawnsWorkerForEligibleIssue(t *testing.T) {
 		t.Fatalf("tracker filters = %d, want 1", len(tracker.filters))
 	}
 	if got := tracker.filters[0]; got.State != domain.ListOpen || got.Assignee != "alice" || len(got.Labels) != 0 {
-		t.Fatalf("tracker filter = %+v", got)
+		t.Fatalf("tracker filter = %+v, want state/assignee only", got)
 	}
 }
 
@@ -272,6 +273,96 @@ func TestPollAppliesLocalEligibilityFilter(t *testing.T) {
 	}
 	if len(spawner.calls) != 1 || spawner.calls[0].IssueID != "github:acme/demo#3" {
 		t.Fatalf("spawn calls = %+v, want only eligible issue #3", spawner.calls)
+	}
+}
+
+func TestPollRequiresConfiguredLabelExactly(t *testing.T) {
+	store := &fakeStore{projects: []domain.ProjectRecord{{
+		ID:            "demo",
+		RepoOriginURL: "https://github.com/acme/demo.git",
+		Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+			Enabled:  true,
+			Assignee: "alice",
+			Labels:   []string{"ao-autonomy-pilot-2"},
+		}},
+	}}}
+	tracker := &fakeTracker{issues: []domain.Issue{
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#1"}, Title: "no labels", State: domain.IssueOpen, Assignees: []string{"alice"}},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#2"}, Title: "other label", State: domain.IssueOpen, Labels: []string{"other"}, Assignees: []string{"alice"}},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#3"}, Title: "partial label", State: domain.IssueOpen, Labels: []string{"ao-autonomy-pilot-2-extra"}, Assignees: []string{"alice"}},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#4"}, Title: "case-insensitive exact", State: domain.IssueOpen, Labels: []string{"AO-AUTONOMY-PILOT-2"}, Assignees: []string{"alice"}},
+		{ID: domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#5"}, Title: "exact", State: domain.IssueOpen, Labels: []string{"ao-autonomy-pilot-2"}, Assignees: []string{"alice"}},
+	}}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(spawner.calls) != 2 || spawner.calls[0].IssueID != "github:acme/demo#4" || spawner.calls[1].IssueID != "github:acme/demo#5" {
+		t.Fatalf("spawn calls = %+v, want only exact GitHub label matches #4 and #5", spawner.calls)
+	}
+	if got := tracker.filters[0]; len(got.Labels) != 0 {
+		t.Fatalf("tracker filter labels = %v, want local allowlist evaluation only", got.Labels)
+	}
+}
+
+func TestIssueMatchesConfigLabelProviderRules(t *testing.T) {
+	githubReady := domain.Issue{
+		ID:     domain.TrackerID{Provider: domain.TrackerProviderGitHub},
+		Labels: []string{"Agent-Ready"},
+	}
+	gitlabReady := domain.Issue{
+		ID:     domain.TrackerID{Provider: domain.TrackerProviderGitLab},
+		Labels: []string{"Agent-Ready"},
+	}
+	cfg := domain.TrackerIntakeConfig{Labels: []string{"agent-ready"}}
+
+	if !issueMatchesConfig(githubReady, cfg) {
+		t.Fatal("GitHub labels should match case-insensitively")
+	}
+	if issueMatchesConfig(gitlabReady, cfg) {
+		t.Fatal("GitLab labels should be case-sensitive")
+	}
+	if !issueMatchesConfig(gitlabReady, domain.TrackerIntakeConfig{Labels: []string{"Agent-Ready"}}) {
+		t.Fatal("GitLab exact label should match")
+	}
+	if issueMatchesConfig(domain.Issue{ID: githubReady.ID, Labels: []string{"agent-ready-extra"}}, cfg) {
+		t.Fatal("partial label must not match")
+	}
+	if issueMatchesConfig(domain.Issue{ID: githubReady.ID}, cfg) {
+		t.Fatal("an issue with no labels must not match an allowlist")
+	}
+	if issueMatchesConfig(domain.Issue{ID: domain.TrackerID{Provider: "unknown"}, Labels: []string{"agent-ready"}}, cfg) {
+		t.Fatal("an unknown provider must fail closed")
+	}
+	if !issueMatchesConfig(domain.Issue{}, domain.TrackerIntakeConfig{}) {
+		t.Fatal("empty allowlist must preserve existing intake behavior")
+	}
+}
+
+func TestPollSkipsAlreadyProcessedLabeledIssue(t *testing.T) {
+	store := &fakeStore{
+		projects: []domain.ProjectRecord{{
+			ID:            "demo",
+			RepoOriginURL: "https://github.com/acme/demo.git",
+			Config: domain.ProjectConfig{TrackerIntake: domain.TrackerIntakeConfig{
+				Enabled: true, Assignee: "alice", Labels: []string{"ao-autonomy-pilot-2"},
+			}},
+		}},
+		sessions: []domain.SessionRecord{{ID: "demo-1", ProjectID: "demo", IssueID: "github:acme/demo#12"}},
+	}
+	tracker := &fakeTracker{issues: []domain.Issue{{
+		ID:    domain.TrackerID{Provider: domain.TrackerProviderGitHub, Native: "acme/demo#12"},
+		Title: "already processed", State: domain.IssueOpen,
+		Labels: []string{"ao-autonomy-pilot-2"}, Assignees: []string{"alice"},
+	}}}
+	spawner := &fakeSpawner{}
+
+	if err := New(singleResolver(tracker), store, spawner, Config{Logger: discardLogger()}).Poll(context.Background()); err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if len(spawner.calls) != 0 {
+		t.Fatalf("spawn calls = %+v, want no duplicate session", spawner.calls)
 	}
 }
 
