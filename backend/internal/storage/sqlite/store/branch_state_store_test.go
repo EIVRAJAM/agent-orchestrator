@@ -20,7 +20,7 @@ func TestSessionBranchStateRoundTripsAndStreamsOnChange(t *testing.T) {
 	}
 
 	baseSeq, _ := s.LatestSeq(ctx)
-	want := domain.SessionBranchState{Branch: "feat/x", HeadSHA: "abc123", Commits: 2, RemoteBranch: "origin/feat/x", Unpushed: 1}
+	want := domain.SessionBranchState{Branch: "feat/x", HeadSHA: "abc123", Commits: 2, RemoteBranch: "origin/feat/x", RemoteHeadSHA: "def456", Unpushed: 1}
 	if ok, err := s.SetSessionBranchState(ctx, session.ID, want); err != nil || !ok {
 		t.Fatalf("set branch state: ok=%v err=%v", ok, err)
 	}

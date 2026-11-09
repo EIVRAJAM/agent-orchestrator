@@ -77,14 +77,14 @@ func TestReconcileSessionBranchStateTracksCommitsAndPushes(t *testing.T) {
 	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head2, Commits: 2, Unpushed: 2})
 
 	runGit(t, repo, "push", "-u", "origin", "feat/x")
-	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head2, Commits: 2, RemoteBranch: "origin/feat/x", Unpushed: 0})
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head2, Commits: 2, RemoteBranch: "origin/feat/x", RemoteHeadSHA: head2, Unpushed: 0})
 
 	commitFile(t, repo, "c.go")
 	head3 := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
-	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head3, Commits: 3, RemoteBranch: "origin/feat/x", Unpushed: 1})
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head3, Commits: 3, RemoteBranch: "origin/feat/x", RemoteHeadSHA: head2, Unpushed: 1})
 
 	writes := st.writes
-	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head3, Commits: 3, RemoteBranch: "origin/feat/x", Unpushed: 1})
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head3, Commits: 3, RemoteBranch: "origin/feat/x", RemoteHeadSHA: head2, Unpushed: 1})
 	if st.writes != writes {
 		t.Fatalf("unchanged facts were rewritten (%d writes, want %d)", st.writes, writes)
 	}

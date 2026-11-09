@@ -6131,7 +6131,21 @@ func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id do
 		// A worker performs its own push; AO only observes the attempt through
 		// the worktree-local pre-push hook. Missing instrumentation degrades to
 		// an unknown push result, never to a false failure.
-		if err := pushobservation.Install(ctx, workspacePath, m.dataDir, id); err != nil {
+		instanceID := ""
+		if m.store != nil {
+			if rec, found, err := m.store.GetSession(ctx, id); err != nil {
+				if m.logger != nil {
+					m.logger.Warn("read session instance for push observation", "session", id, "error", err)
+				}
+			} else if found {
+				instanceID = strings.TrimSpace(rec.InstanceID)
+			}
+		}
+		if instanceID == "" {
+			if m.logger != nil {
+				m.logger.Warn("push observation skipped: session instance unavailable", "session", id)
+			}
+		} else if err := pushobservation.Install(ctx, workspacePath, m.dataDir, id, instanceID); err != nil {
 			if m.logger != nil {
 				m.logger.Warn("install push observation hook", "session", id, "error", err)
 			}

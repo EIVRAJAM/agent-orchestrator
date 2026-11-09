@@ -346,6 +346,10 @@ type SessionBranchState struct {
 	// RemoteBranch is the remote-tracking branch, such as "origin/feat/x".
 	// Empty means the branch has never been pushed.
 	RemoteBranch string `json:"remoteBranch,omitempty"`
+	// RemoteHeadSHA is the exact tip observed for RemoteBranch. Push success
+	// requires it to equal HeadSHA; a remote that merely contains HeadSHA (for
+	// example, has moved ahead) is not an exact confirmation.
+	RemoteHeadSHA string `json:"remoteHeadSHA,omitempty"`
 	// Unpushed is how many branch commits are not on RemoteBranch. It equals
 	// Commits while RemoteBranch is empty.
 	Unpushed int `json:"unpushed"`
@@ -385,8 +389,9 @@ const (
 	// IssuePublicationReasonPRNotReady means the matching PR is draft, closed,
 	// or merged and therefore not ready for review.
 	IssuePublicationReasonPRNotReady IssuePublicationReason = "pr_not_ready"
-	// IssuePublicationReasonPushFailed means a durable push attempt for this
-	// exact branch head did not reach the remote.
+	// IssuePublicationReasonPushFailed is reserved for a direct, durable push
+	// failure result. The current pre-push-only flow cannot produce it and
+	// therefore reports an attempted-but-unconfirmed push as incomplete.
 	IssuePublicationReasonPushFailed IssuePublicationReason = "push_failed"
 )
 
@@ -408,14 +413,26 @@ const (
 )
 
 // IssuePublicationPush is the durable push result for the issue worker's exact
-// branch head. Unknown means there is no proof either that a push was attempted
-// or that it failed; it is never presented as a failure.
+// branch head. Unknown means there is no proof that a push was attempted.
+// AttemptedUnconfirmed means a current-generation pre-push attempt exists for
+// the exact head, but no direct result or remote confirmation is available yet;
+// it is never presented as a failure.
 type IssuePublicationPush string
 
 // Issue publication push results.
 const (
-	IssuePublicationPushUnknown   IssuePublicationPush = "unknown"
-	IssuePublicationPushFailed    IssuePublicationPush = "failed"
+	// IssuePublicationPushUnknown means no current-generation attempt marker
+	// proves that a push was attempted.
+	IssuePublicationPushUnknown IssuePublicationPush = "unknown"
+	// IssuePublicationPushAttemptedUnconfirmed means a current-generation
+	// pre-push attempt exists for the exact head, but the remote result has not
+	// been confirmed. It is not a failure.
+	IssuePublicationPushAttemptedUnconfirmed IssuePublicationPush = "attempted_unconfirmed"
+	// IssuePublicationPushFailed is reserved for a direct durable push-failure
+	// result. The pre-push-only flow never produces it.
+	IssuePublicationPushFailed IssuePublicationPush = "failed"
+	// IssuePublicationPushSucceeded means branch observation confirmed the
+	// exact branch head on the remote.
 	IssuePublicationPushSucceeded IssuePublicationPush = "succeeded"
 )
 
@@ -427,7 +444,7 @@ type IssuePublication struct {
 	State             IssuePublicationState  `json:"state" enum:"pr_ready,incomplete"`
 	Reason            IssuePublicationReason `json:"reason,omitempty" enum:"branch_not_pushed,issue_pr_missing,pr_association_invalid,ownership_unavailable,pr_not_ready,push_failed"`
 	Turn              IssuePublicationTurn   `json:"turn" enum:"completed,interrupted,unknown"`
-	Push              IssuePublicationPush   `json:"push" enum:"unknown,failed,succeeded"`
+	Push              IssuePublicationPush   `json:"push" enum:"unknown,attempted_unconfirmed,failed,succeeded"`
 	LocalCommits      int                    `json:"localCommits"`
 	BranchPushed      bool                   `json:"branchPushed"`
 	OwnershipVerified bool                   `json:"ownershipVerified"`

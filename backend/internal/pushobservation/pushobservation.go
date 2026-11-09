@@ -49,12 +49,15 @@ func Dir(dataDir string, id domain.SessionID) string {
 	return filepath.Join(dataDir, dirName, string(id))
 }
 
-// Attempted reports whether the exact branch head was recorded by a pre-push
-// hook. A missing file is a normal "no evidence", not an error.
-func Attempted(dataDir string, id domain.SessionID, branch, headSHA string) (bool, error) {
+// Attempted reports whether a current-generation pre-push hook recorded the
+// exact instance, branch and head. A missing file or a stale generation is a
+// normal "no evidence", not an error.
+func Attempted(dataDir string, id domain.SessionID, instanceID, generation, branch, headSHA string) (bool, error) {
+	instanceID = strings.TrimSpace(instanceID)
+	generation = strings.TrimSpace(generation)
 	branch = strings.TrimSpace(branch)
 	headSHA = strings.TrimSpace(headSHA)
-	if branch == "" || headSHA == "" {
+	if instanceID == "" || generation == "" || branch == "" || headSHA == "" {
 		return false, nil
 	}
 	dir := Dir(dataDir, id)
@@ -73,8 +76,9 @@ func Attempted(dataDir string, id domain.SessionID, branch, headSHA string) (boo
 	wantRef := "refs/heads/" + branch
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		sha, ref, ok := strings.Cut(scanner.Text(), attemptLineSep)
-		if ok && sha == headSHA && ref == wantRef {
+		parts := strings.Split(scanner.Text(), attemptLineSep)
+		if len(parts) == 4 && parts[0] == instanceID && parts[1] == generation &&
+			parts[2] == headSHA && parts[3] == wantRef {
 			return true, nil
 		}
 	}
@@ -88,10 +92,14 @@ func Attempted(dataDir string, id domain.SessionID, branch, headSHA string) (boo
 // local ref and head passed to the hook, then chains the repository's previous
 // pre-push hook, if any. Failures are returned for the caller to log; a failed
 // installation makes push evidence unknown and must not fail the session.
-func Install(ctx context.Context, workspacePath, dataDir string, id domain.SessionID) error {
+func Install(ctx context.Context, workspacePath, dataDir string, id domain.SessionID, instanceID string) error {
 	workspacePath = strings.TrimSpace(workspacePath)
+	instanceID = strings.TrimSpace(instanceID)
 	if workspacePath == "" {
 		return errors.New("push observation: workspace path is required")
+	}
+	if instanceID == "" {
+		return errors.New("push observation: session instance id is required")
 	}
 	dir := Dir(dataDir, id)
 	if dir == "" {
@@ -108,7 +116,7 @@ func Install(ctx context.Context, workspacePath, dataDir string, id domain.Sessi
 	if err := writeOriginalHookPath(hooksDir, originalPath); err != nil {
 		return err
 	}
-	if err := writeHookScript(filepath.Join(hooksDir, prePushName), filepath.Join(dir, attemptsFile), originalPath); err != nil {
+	if err := writeHookScript(filepath.Join(hooksDir, prePushName), filepath.Join(dir, attemptsFile), instanceID, originalPath); err != nil {
 		return err
 	}
 	// Worktree-scoped configuration keeps this hook out of the human checkout
@@ -172,7 +180,7 @@ func writeOriginalHookPath(hooksDir, originalPath string) error {
 	return nil
 }
 
-func writeHookScript(path, attemptsPath, originalPath string) error {
+func writeHookScript(path, attemptsPath, instanceID, originalPath string) error {
 	original := ""
 	if originalPath != "" && filepath.Clean(originalPath) != filepath.Clean(path) {
 		if info, err := os.Stat(originalPath); err == nil && info.Mode().IsRegular() {
@@ -185,6 +193,7 @@ func writeHookScript(path, attemptsPath, originalPath string) error {
 set +e
 umask 077
 attempts=` + shellQuote(attemptsPath) + `
+instance=` + shellQuote(instanceID) + `
 tmp="$attempts.$$"
 mkdir -p "$(dirname "$attempts")" 2>/dev/null
 if ! cat > "$tmp"; then
@@ -195,7 +204,7 @@ if [ -s "$tmp" ]; then
   while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
     case "$local_ref" in
       refs/heads/*)
-        printf '%s\t%s\n' "$local_sha" "$local_ref" >> "$attempts" 2>/dev/null
+        printf '%s\t%s\t%s\t%s\n' "$instance" "${AO_RUNTIME_LAUNCH_ID-}" "$local_sha" "$local_ref" >> "$attempts" 2>/dev/null
         ;;
     esac
   done < "$tmp"

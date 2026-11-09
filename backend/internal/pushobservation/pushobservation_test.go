@@ -21,18 +21,24 @@ func TestAttemptedRequiresExactBranchAndHead(t *testing.T) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, attemptsFile), []byte("sha-1\trefs/heads/ao/ao-1\nsha-2\trefs/heads/ao/ao-1\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, attemptsFile), []byte("inst-1\tgen-1\tsha-1\trefs/heads/ao/ao-1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	if ok, err := Attempted(dir, sessionID, "ao/ao-1", "sha-1"); err != nil || !ok {
+	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-1", "ao/ao-1", "sha-1"); err != nil || !ok {
 		t.Fatalf("exact attempt = %v, %v; want true", ok, err)
 	}
-	if ok, err := Attempted(dir, sessionID, "ao/ao-1", "sha-3"); err != nil || ok {
+	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-1", "ao/ao-1", "sha-3"); err != nil || ok {
 		t.Fatalf("other head = %v, %v; want false", ok, err)
 	}
-	if ok, err := Attempted(dir, sessionID, "ao/other", "sha-1"); err != nil || ok {
+	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-1", "ao/other", "sha-1"); err != nil || ok {
 		t.Fatalf("other branch = %v, %v; want false", ok, err)
+	}
+	if ok, err := Attempted(dir, sessionID, "inst-2", "gen-1", "ao/ao-1", "sha-1"); err != nil || ok {
+		t.Fatalf("other instance = %v, %v; want false", ok, err)
+	}
+	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-2", "ao/ao-1", "sha-1"); err != nil || ok {
+		t.Fatalf("other generation = %v, %v; want false", ok, err)
 	}
 }
 
@@ -46,13 +52,13 @@ func TestInstallRecordsAttemptAndChainsExistingHook(t *testing.T) {
 
 	dataDir := t.TempDir()
 	sessionID := domain.SessionID("ao-1")
-	if err := Install(context.Background(), repo, dataDir, sessionID); err != nil {
+	if err := Install(context.Background(), repo, dataDir, sessionID, "inst-1"); err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, repo, "push", "-u", "origin", "feature")
 
 	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
-	if ok, err := Attempted(dataDir, sessionID, "feature", head); err != nil || !ok {
+	if ok, err := Attempted(dataDir, sessionID, "inst-1", "gen-1", "feature", head); err != nil || !ok {
 		t.Fatalf("recorded attempt = %v, %v; want true", ok, err)
 	}
 	if data, err := os.ReadFile(originalMarker); err != nil || strings.TrimSpace(string(data)) != "original" {
@@ -73,14 +79,15 @@ func TestInstallDoesNotRecordAFailedPushAsSucceeded(t *testing.T) {
 
 	dataDir := t.TempDir()
 	sessionID := domain.SessionID("ao-1")
-	if err := Install(context.Background(), repo, dataDir, sessionID); err != nil {
+	if err := Install(context.Background(), repo, dataDir, sessionID, "inst-1"); err != nil {
 		t.Fatal(err)
 	}
 	push := exec.Command("git", "-C", repo, "push", "origin", "feature")
+	push.Env = append(os.Environ(), "AO_RUNTIME_LAUNCH_ID=gen-1")
 	if err := push.Run(); err == nil {
 		t.Fatal("push unexpectedly succeeded, want rejection")
 	}
-	if ok, err := Attempted(dataDir, sessionID, "feature", head); err != nil || !ok {
+	if ok, err := Attempted(dataDir, sessionID, "inst-1", "gen-1", "feature", head); err != nil || !ok {
 		t.Fatalf("failed push attempt = %v, %v; want recorded attempt", ok, err)
 	}
 }
@@ -106,6 +113,7 @@ func newPushableRepo(t *testing.T) (repo, remote string) {
 func runGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "AO_RUNTIME_LAUNCH_ID=gen-1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)

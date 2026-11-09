@@ -3,7 +3,9 @@ package session
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,7 +93,7 @@ func TestDeriveIssuePublicationOutcomes(t *testing.T) {
 			wantPush:   domain.IssuePublicationPushUnknown,
 		},
 		{
-			name: "durable failed push is distinguished from an unknown push",
+			name: "direct failed result remains a closed classification",
 			mutate: func(rec *domain.SessionRecord, _ *[]domain.PRFacts) {
 				rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
 				rec.BranchState.Unpushed = 1
@@ -359,6 +361,17 @@ func TestIssuePublicationReadUsesDurableOwnershipEvidence(t *testing.T) {
 		SessionInstanceID: rec.InstanceID, RepoKey: publicationRepoKey,
 		Branch: pr.SourceBranch, HeadSHA: pr.HeadSHA,
 	}}
+	rec.BranchState.RemoteBranch = ""
+	rec.BranchState.Unpushed = 1
+	rec.Metadata.RuntimeLaunchID = "gen-1"
+	writePushAttempt(t, svc.dataDir, rec, rec.InstanceID, rec.Metadata.RuntimeLaunchID, rec.BranchState.HeadSHA, rec.BranchState.Branch)
+	got = read()
+	if got.State == domain.IssuePublicationPRReady || got.Push != domain.IssuePublicationPushAttemptedUnconfirmed {
+		t.Fatalf("outcome with an unconfirmed push = %+v, want incomplete attempted_unconfirmed", got)
+	}
+	rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
+	rec.BranchState.RemoteHeadSHA = rec.BranchState.HeadSHA
+	rec.BranchState.Unpushed = 0
 	got = read()
 	if got.State != domain.IssuePublicationPRReady || !got.OwnershipVerified || got.Push != domain.IssuePublicationPushSucceeded {
 		t.Fatalf("outcome with exact ownership = %+v, want pr_ready with verified ownership and successful push", got)
@@ -381,26 +394,133 @@ func TestIssuePublicationReadUsesDurableOwnershipEvidence(t *testing.T) {
 	}
 }
 
-func TestIssuePublicationReadDistinguishesRecordedPushFailure(t *testing.T) {
+func TestIssuePublicationReadKeepsAttemptedPushUnconfirmed(t *testing.T) {
 	rec := publicationRecord()
-	dir := pushobservation.Dir(t.TempDir(), rec.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "attempts"), []byte("head-1\trefs/heads/ao/worker-1/task\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	rec.Metadata.RuntimeLaunchID = "gen-1"
 	rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
 	rec.BranchState.Unpushed = 1
+	dataDir := t.TempDir()
+	writePushAttempt(t, dataDir, rec, "inst-1", "gen-1", "head-1", "ao/worker-1/task")
 	st := newFakeStore()
 	st.sessions[rec.ID] = rec
-	svc := &Service{store: st, dataDir: filepath.Dir(filepath.Dir(dir))}
+	svc := &Service{store: st, dataDir: dataDir}
 	sess, err := svc.toSessionWithFacts(context.Background(), rec, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sess.IssuePublication == nil || sess.IssuePublication.Push != domain.IssuePublicationPushFailed || sess.IssuePublication.Reason != domain.IssuePublicationReasonPushFailed {
-		t.Fatalf("outcome = %+v, want durable push failure", sess.IssuePublication)
+	if sess.IssuePublication == nil || sess.IssuePublication.Push != domain.IssuePublicationPushAttemptedUnconfirmed {
+		t.Fatalf("outcome = %+v, want attempted_unconfirmed", sess.IssuePublication)
+	}
+	if sess.IssuePublication.Reason != domain.IssuePublicationReasonBranchNotPushed || sess.IssuePublication.State == domain.IssuePublicationPRReady {
+		t.Fatalf("outcome = %+v, want incomplete branch_not_pushed", sess.IssuePublication)
+	}
+}
+
+func TestPushForSuccessfulPushBeforeReconcileRemainsUnconfirmed(t *testing.T) {
+	repo := newPushableRepo(t)
+	runGit(t, repo, "checkout", "-b", "feature")
+	commitFile(t, repo, "diagnostic.go")
+	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+
+	dataDir := t.TempDir()
+	id := domain.SessionID("worker-1")
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["p"] = domain.ProjectRecord{ID: "p", RepoOriginURL: "https://github.com/acme/demo.git"}
+	st.sessions[id] = domain.SessionRecord{
+		ID: id, ProjectID: "p", IssueID: "github:acme/demo#1", InstanceID: "inst-1",
+		Kind: domain.KindWorker,
+		Metadata: domain.SessionMetadata{
+			Branch: "feature", WorkspacePath: repo,
+			DiffBaseRef: "refs/remotes/origin/main", RuntimeLaunchID: "gen-1",
+		},
+	}
+	svc := &Service{store: st, dataDir: dataDir}
+	if err := svc.ReconcileSessionBranchState(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if got := st.sessions[id].BranchState; got == nil || got.HeadSHA != head || got.Unpushed == 0 || got.RemoteBranch != "" {
+		t.Fatalf("pre-push branch state = %+v, want exact local head with no remote", got)
+	}
+	if err := pushobservation.Install(context.Background(), repo, dataDir, id, "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+	push := exec.Command("git", "-C", repo, "push", "-u", "origin", "feature")
+	push.Env = append(os.Environ(), "AO_RUNTIME_LAUNCH_ID=gen-1")
+	if out, err := push.CombinedOutput(); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+
+	// The push succeeded, but the branch observer has not persisted the remote
+	// ref. The attempt must remain unconfirmed rather than becoming failed.
+	if got := pushFor(st.sessions[id], dataDir); got != domain.IssuePublicationPushAttemptedUnconfirmed {
+		t.Fatalf("pre-reconcile push = %s, want attempted_unconfirmed", got)
+	}
+	if err := svc.ReconcileSessionBranchState(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if got := pushFor(st.sessions[id], dataDir); got != domain.IssuePublicationPushSucceeded {
+		t.Fatalf("post-reconcile push = %s, want succeeded", got)
+	}
+}
+
+func TestPushForClassificationUsesOnlyCurrentEvidence(t *testing.T) {
+	rec := publicationRecord()
+	rec.Metadata.RuntimeLaunchID = "gen-1"
+	rec.InstanceID = "inst-1"
+	dataDir := t.TempDir()
+
+	if got := pushFor(rec, dataDir); got != domain.IssuePublicationPushUnknown {
+		t.Fatalf("no marker = %s, want unknown", got)
+	}
+
+	writePushAttempt(t, dataDir, rec, "inst-1", "gen-1", "head-1", "ao/worker-1/task")
+	if got := pushFor(rec, dataDir); got != domain.IssuePublicationPushAttemptedUnconfirmed {
+		t.Fatalf("exact marker = %s, want attempted_unconfirmed", got)
+	}
+
+	for _, tt := range []struct {
+		name       string
+		instance   string
+		generation string
+		branch     string
+		head       string
+	}{
+		{name: "other instance", instance: "inst-2", generation: "gen-1", branch: "ao/worker-1/task", head: "head-1"},
+		{name: "other generation", instance: "inst-1", generation: "gen-2", branch: "ao/worker-1/task", head: "head-1"},
+		{name: "other branch", instance: "inst-1", generation: "gen-1", branch: "ao/worker-1/other", head: "head-1"},
+		{name: "other head", instance: "inst-1", generation: "gen-1", branch: "ao/worker-1/task", head: "head-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writePushAttempt(t, dir, rec, tt.instance, tt.generation, tt.head, tt.branch)
+			if got := pushFor(rec, dir); got != domain.IssuePublicationPushUnknown {
+				t.Fatalf("stale marker = %s, want unknown", got)
+			}
+		})
+	}
+
+	rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
+	rec.BranchState.RemoteHeadSHA = "head-2"
+	rec.BranchState.Unpushed = 0
+	if got := pushFor(rec, dataDir); got == domain.IssuePublicationPushSucceeded {
+		t.Fatalf("remote-ahead branch = %s, want not succeeded", got)
+	}
+	rec.BranchState.RemoteHeadSHA = rec.BranchState.HeadSHA
+	rec.BranchState.Unpushed = 0
+	if got := pushFor(rec, dataDir); got != domain.IssuePublicationPushSucceeded {
+		t.Fatalf("confirmed remote = %s, want succeeded", got)
+	}
+}
+
+func writePushAttempt(t *testing.T, dataDir string, rec domain.SessionRecord, instanceID, generation, head, branch string) {
+	t.Helper()
+	dir := pushobservation.Dir(dataDir, rec.ID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := instanceID + "\t" + generation + "\t" + head + "\trefs/heads/" + branch + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "attempts"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

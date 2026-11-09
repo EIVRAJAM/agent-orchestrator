@@ -258,15 +258,28 @@ func pushFor(rec domain.SessionRecord, dataDir string) domain.IssuePublicationPu
 	if rec.BranchState == nil || rec.BranchState.Branch == "" || rec.BranchState.HeadSHA == "" {
 		return domain.IssuePublicationPushUnknown
 	}
-	if rec.BranchState.RemoteBranch != "" && rec.BranchState.Unpushed == 0 {
+	if rec.BranchState.RemoteBranch != "" && rec.BranchState.Unpushed == 0 &&
+		rec.BranchState.RemoteHeadSHA == rec.BranchState.HeadSHA {
 		return domain.IssuePublicationPushSucceeded
 	}
-	attempted, err := pushobservation.Attempted(dataDir, rec.ID, rec.BranchState.Branch, rec.BranchState.HeadSHA)
+	// A pre-push hook proves only that an attempt started. The observer may not
+	// have persisted the resulting remote ref yet, so an attempt without a
+	// confirmed remote head is not a failure. The current flow has no safe point
+	// to capture git's exit code; a direct failure would need its own durable
+	// result fact before this can ever return PushFailed.
+	attempted, err := pushobservation.Attempted(
+		dataDir,
+		rec.ID,
+		rec.InstanceID,
+		strings.TrimSpace(rec.Metadata.RuntimeLaunchID),
+		rec.BranchState.Branch,
+		rec.BranchState.HeadSHA,
+	)
 	if err != nil {
 		return domain.IssuePublicationPushUnknown
 	}
 	if attempted {
-		return domain.IssuePublicationPushFailed
+		return domain.IssuePublicationPushAttemptedUnconfirmed
 	}
 	return domain.IssuePublicationPushUnknown
 }

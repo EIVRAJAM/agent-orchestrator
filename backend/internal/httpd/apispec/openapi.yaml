@@ -14714,6 +14714,7 @@ components:
         push:
           enum:
           - unknown
+          - attempted_unconfirmed
           - failed
           - succeeded
           type: string
@@ -16433,6 +16434,8 @@ components:
         headSHA:
           type: string
         remoteBranch:
+          type: string
+        remoteHeadSHA:
           type: string
         unpushed:
           type: integer

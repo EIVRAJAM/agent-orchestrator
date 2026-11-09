@@ -5016,7 +5016,7 @@ export interface components {
             ownershipVerified: boolean;
             prURL?: string;
             /** @enum {string} */
-            push: "unknown" | "failed" | "succeeded";
+            push: "unknown" | "attempted_unconfirmed" | "failed" | "succeeded";
             /** @enum {string} */
             reason?: "branch_not_pushed" | "issue_pr_missing" | "pr_association_invalid" | "ownership_unavailable" | "pr_not_ready" | "push_failed";
             /** @enum {string} */
@@ -5680,6 +5680,7 @@ export interface components {
             commits: number;
             headSHA?: string;
             remoteBranch?: string;
+            remoteHeadSHA?: string;
             unpushed: number;
         };
         SessionInterfaceTransition: {
