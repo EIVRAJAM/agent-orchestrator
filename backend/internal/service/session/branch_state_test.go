@@ -114,6 +114,33 @@ func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
 	}
 }
 
+func TestReconcileBranchStatesUsesCanonicalRepoForTipOwnership(t *testing.T) {
+	repo := newPushableRepo(t)
+	runGit(t, repo, "checkout", "-b", "feature/canonical")
+	commitFile(t, repo, "canonical.go")
+	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["p"] = domain.ProjectRecord{
+		ID: "p", RepoOriginURL: "https://github.com/fork/demo.git",
+		Config: domain.ProjectConfig{CanonicalRepoURL: "https://github.com/upstream/demo"},
+	}
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", ProjectID: "p", Metadata: domain.SessionMetadata{
+		Branch: "feature/canonical", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
+	}}
+	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "ao-1"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range st.recorded {
+		if record == "github|github.com|upstream/demo|feature/canonical@"+head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recorded exact branch tips = %v, want canonical upstream key", st.recorded)
+	}
+}
+
 func TestReconcileBranchStatesDoesNotAdoptRemoteOnlyBranchTip(t *testing.T) {
 	repo := newPushableRepo(t)
 	// Simulate a remote branch left behind by another session/data dir. It is

@@ -5013,13 +5013,16 @@ export interface components {
             localCommits: number;
             /** Format: date-time */
             observedAt: string;
+            ownershipVerified: boolean;
             prURL?: string;
             /** @enum {string} */
-            reason?: "branch_not_pushed" | "issue_pr_missing" | "pr_association_invalid" | "pr_not_ready";
+            push: "unknown" | "failed" | "succeeded";
+            /** @enum {string} */
+            reason?: "branch_not_pushed" | "issue_pr_missing" | "pr_association_invalid" | "ownership_unavailable" | "pr_not_ready" | "push_failed";
             /** @enum {string} */
             state: "pr_ready" | "incomplete";
             /** @enum {string} */
-            turn: "completed" | "interrupted";
+            turn: "completed" | "interrupted" | "unknown";
         };
         KillReviewResponse: {
             reviewerHandleId: string;

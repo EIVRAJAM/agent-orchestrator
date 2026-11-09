@@ -379,37 +379,61 @@ const (
 	// IssuePublicationReasonPRAssociationBad means an attributed PR does not
 	// match the exact local branch and head.
 	IssuePublicationReasonPRAssociationBad IssuePublicationReason = "pr_association_invalid"
+	// IssuePublicationReasonOwnershipUnavailable means durable ownership facts
+	// could not be read, so the PR association cannot be trusted.
+	IssuePublicationReasonOwnershipUnavailable IssuePublicationReason = "ownership_unavailable"
 	// IssuePublicationReasonPRNotReady means the matching PR is draft, closed,
 	// or merged and therefore not ready for review.
 	IssuePublicationReasonPRNotReady IssuePublicationReason = "pr_not_ready"
+	// IssuePublicationReasonPushFailed means a durable push attempt for this
+	// exact branch head did not reach the remote.
+	IssuePublicationReasonPushFailed IssuePublicationReason = "push_failed"
 )
 
-// IssuePublicationTurn describes whether the observed worker turn reached an
-// idle completion boundary or was interrupted by process exit.
+// IssuePublicationTurn describes whether the observed worker turn reached a
+// durable completion boundary or was interrupted by process exit.
 type IssuePublicationTurn string
 
 // Issue publication turn boundaries.
 const (
-	// IssuePublicationTurnCompleted means the worker was observed idle after
-	// starting the issue task.
+	// IssuePublicationTurnCompleted means a durable completed-conversation
+	// checkpoint exists for the worker's current turn.
 	IssuePublicationTurnCompleted IssuePublicationTurn = "completed"
 	// IssuePublicationTurnInterrupted means the worker process exited before a
-	// clean idle completion was observed.
+	// durable completion boundary was observed.
 	IssuePublicationTurnInterrupted IssuePublicationTurn = "interrupted"
+	// IssuePublicationTurnUnknown means the worker is idle but no durable
+	// completion boundary exists. Idle alone does not prove a turn completed.
+	IssuePublicationTurnUnknown IssuePublicationTurn = "unknown"
+)
+
+// IssuePublicationPush is the durable push result for the issue worker's exact
+// branch head. Unknown means there is no proof either that a push was attempted
+// or that it failed; it is never presented as a failure.
+type IssuePublicationPush string
+
+// Issue publication push results.
+const (
+	IssuePublicationPushUnknown   IssuePublicationPush = "unknown"
+	IssuePublicationPushFailed    IssuePublicationPush = "failed"
+	IssuePublicationPushSucceeded IssuePublicationPush = "succeeded"
 )
 
 // IssuePublication is the explicit publication result of an issue-backed
-// worker session. It is derived from durable branch and attributed-PR facts at
-// read time; it is never stored as a presentation status.
+// worker session. It is derived from durable branch, push-attempt, ownership,
+// and attributed-PR facts at read time; it is never stored as a presentation
+// status.
 type IssuePublication struct {
-	State        IssuePublicationState  `json:"state" enum:"pr_ready,incomplete"`
-	Reason       IssuePublicationReason `json:"reason,omitempty" enum:"branch_not_pushed,issue_pr_missing,pr_association_invalid,pr_not_ready"`
-	Turn         IssuePublicationTurn   `json:"turn" enum:"completed,interrupted"`
-	LocalCommits int                    `json:"localCommits"`
-	BranchPushed bool                   `json:"branchPushed"`
-	PRURL        string                 `json:"prURL,omitempty"`
-	HeadSHA      string                 `json:"headSHA,omitempty"`
-	ObservedAt   time.Time              `json:"observedAt"`
+	State             IssuePublicationState  `json:"state" enum:"pr_ready,incomplete"`
+	Reason            IssuePublicationReason `json:"reason,omitempty" enum:"branch_not_pushed,issue_pr_missing,pr_association_invalid,ownership_unavailable,pr_not_ready,push_failed"`
+	Turn              IssuePublicationTurn   `json:"turn" enum:"completed,interrupted,unknown"`
+	Push              IssuePublicationPush   `json:"push" enum:"unknown,failed,succeeded"`
+	LocalCommits      int                    `json:"localCommits"`
+	BranchPushed      bool                   `json:"branchPushed"`
+	OwnershipVerified bool                   `json:"ownershipVerified"`
+	PRURL             string                 `json:"prURL,omitempty"`
+	HeadSHA           string                 `json:"headSHA,omitempty"`
+	ObservedAt        time.Time              `json:"observedAt"`
 }
 
 // SessionProvisionStepID names one stage of an asynchronous Chat start.

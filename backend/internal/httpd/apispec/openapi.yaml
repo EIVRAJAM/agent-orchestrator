@@ -14707,14 +14707,24 @@ components:
         observedAt:
           format: date-time
           type: string
+        ownershipVerified:
+          type: boolean
         prURL:
+          type: string
+        push:
+          enum:
+          - unknown
+          - failed
+          - succeeded
           type: string
         reason:
           enum:
           - branch_not_pushed
           - issue_pr_missing
           - pr_association_invalid
+          - ownership_unavailable
           - pr_not_ready
+          - push_failed
           type: string
         state:
           enum:
@@ -14725,12 +14735,15 @@ components:
           enum:
           - completed
           - interrupted
+          - unknown
           type: string
       required:
       - state
       - turn
+      - push
       - localCommits
       - branchPushed
+      - ownershipVerified
       - observedAt
       type: object
     KillReviewResponse:

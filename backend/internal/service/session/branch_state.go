@@ -106,7 +106,11 @@ func (s *Service) reconcileBranchStates(ctx context.Context, writer branchStateW
 			continue
 		}
 		repoKey := ""
-		if identity, err := domain.ParseRepositoryIdentity(project.rec.RepoOriginURL); err == nil && identity.Provider != "" && identity.Host != "" {
+		origin := project.rec.RepoOriginURL
+		if canonical := strings.TrimSpace(project.rec.Config.CanonicalRepoURL); canonical != "" {
+			origin = canonical
+		}
+		if identity, err := domain.ParseRepositoryIdentity(origin); err == nil && identity.Provider != "" && identity.Host != "" {
 			repoKey = identity.Key()
 		}
 		repos[commonDir] = append(repos[commonDir], branchTarget{
