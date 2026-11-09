@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 )
@@ -307,4 +309,127 @@ func runHookScript(t *testing.T, path string, args []string, input string, extra
 	}
 	t.Fatalf("run hook: %v", err)
 	return -1
+}
+
+func TestHookPreviousHookOpensStdinAndExitsWithoutReading(t *testing.T) {
+	repo, _ := newPushableRepo(t)
+	argsLog := filepath.Join(t.TempDir(), "args")
+	original := filepath.Join(repo, ".git", "hooks", "pre-push")
+	writeExecutable(t, original, "#!/bin/sh\nexec 0<&0\nprintf '%s\\n' \"$@\" > "+shellQuote(argsLog)+"\nexit 7\n")
+
+	dataDir := t.TempDir()
+	id := domain.SessionID("ao-1")
+	if err := Install(context.Background(), repo, dataDir, id, "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+	input := "refs/heads/feature abc refs/heads/feature 000\nsmall input\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", hookPath(dataDir, id), "origin", "https://example.invalid/repo")
+	setHookProcessGroup(cmd)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Env = append(os.Environ(), "AO_RUNTIME_LAUNCH_ID=gen-1")
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+			if ctx.Err() != nil {
+				t.Fatal("hook blocked until context timeout")
+			}
+			t.Fatalf("hook error = %v, want previous hook exit 7", err)
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatal("hook blocked until context timeout")
+	}
+	if cmd.Process != nil && hookProcessGroupAlive(cmd.Process.Pid) {
+		t.Fatal("hook process group still has a live tee/hook/fifo writer")
+	}
+	gotArgs, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotArgs) != "origin\nhttps://example.invalid/repo\n" {
+		t.Fatalf("previous hook args = %q", gotArgs)
+	}
+	if ok, err := Attempted(dataDir, id, "inst-1", "gen-1", "feature", "abc"); err != nil || !ok {
+		t.Fatalf("attempt = %v, %v; want true", ok, err)
+	}
+	assertNoHookArtifacts(t, dataDir, id)
+}
+
+func TestHookFallbackWithoutTeeDoesNotInventMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("absolute /bin/sh and /bin/cat setup is Unix-only")
+	}
+	repo, _ := newPushableRepo(t)
+	inputLog := filepath.Join(t.TempDir(), "stdin")
+	argsLog := filepath.Join(t.TempDir(), "args")
+	original := filepath.Join(repo, ".git", "hooks", "pre-push")
+	writeExecutable(t, original, "#!/bin/sh\n/bin/cat > "+shellQuote(inputLog)+"\nprintf '%s\\n' \"$@\" > "+shellQuote(argsLog)+"\nexit 7\n")
+
+	dataDir := t.TempDir()
+	id := domain.SessionID("ao-1")
+	if err := Install(context.Background(), repo, dataDir, id, "inst-1"); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	for _, name := range []string{"mkdir", "rm", "dirname"} {
+		target, err := exec.LookPath(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, filepath.Join(bin, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	input := "refs/heads/feature abc refs/heads/feature 000\nfallback input\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", hookPath(dataDir, id), "origin", "https://example.invalid/repo")
+	setHookProcessGroup(cmd)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Env = append(os.Environ(), "AO_RUNTIME_LAUNCH_ID=gen-1", "PATH="+bin)
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatal("hook blocked until context timeout")
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("hook error = %v, want previous hook exit 7", err)
+	}
+	if cmd.Process != nil && hookProcessGroupAlive(cmd.Process.Pid) {
+		t.Fatal("hook process group still has a live hook/fifo writer")
+	}
+	gotInput, err := os.ReadFile(inputLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotInput) != input {
+		t.Fatalf("previous hook stdin = %q, want %q", gotInput, input)
+	}
+	gotArgs, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotArgs) != "origin\nhttps://example.invalid/repo\n" {
+		t.Fatalf("previous hook args = %q", gotArgs)
+	}
+	if ok, _ := Attempted(dataDir, id, "inst-1", "gen-1", "feature", "abc"); ok {
+		t.Fatal("fallback fabricated a marker")
+	}
+	assertNoHookArtifacts(t, dataDir, id)
+}
+
+func assertNoHookArtifacts(t *testing.T, dataDir string, id domain.SessionID) {
+	t.Helper()
+	dir := Dir(dataDir, id)
+	for _, pattern := range []string{"*.fifo", attemptsFile + ".*"} {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) > 0 {
+			t.Fatalf("leftover hook artifact %s: %v", pattern, matches)
+		}
+	}
 }
