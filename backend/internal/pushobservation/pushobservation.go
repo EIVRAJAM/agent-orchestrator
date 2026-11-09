@@ -195,12 +195,18 @@ umask 077
 attempts=` + shellQuote(attemptsPath) + `
 instance=` + shellQuote(instanceID) + `
 tmp="$attempts.$$"
-mkdir -p "$(dirname "$attempts")" 2>/dev/null
-if ! cat > "$tmp"; then
-  tmp=/dev/null
-  cat >/dev/null
-fi
-if [ -s "$tmp" ]; then
+original=` + shellQuote(original) + `
+
+run_original() {
+  if [ -n "$original" ] && [ -x "$original" ]; then
+    "$original" "$@"
+  else
+    cat >/dev/null
+  fi
+}
+
+record_attempts() {
+  [ -s "$tmp" ] || return 0
   while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
     case "$local_ref" in
       refs/heads/*)
@@ -208,18 +214,49 @@ if [ -s "$tmp" ]; then
         ;;
     esac
   done < "$tmp"
-fi
-`
-	if original != "" {
-		script += `if [ -x ` + shellQuote(original) + ` ]; then
-  ` + shellQuote(original) + ` "$@" < "$tmp"
-  rc=$?
+}
+
+# Prepare the capture target before consuming stdin. If that is impossible,
+# run the prior hook unfiltered; do not consume its stdin.
+if ! mkdir -p "$(dirname "$attempts")" 2>/dev/null || ! : > "$tmp" 2>/dev/null; then
   rm -f "$tmp"
-  exit $rc
+  run_original "$@"
+  exit $?
 fi
-`
-	}
-	script += `rm -f "$tmp"
+
+if [ -n "$original" ] && [ -x "$original" ]; then
+  fifo="$attempts.$$.fifo"
+  rm -f "$fifo" 2>/dev/null
+  if command -v tee >/dev/null 2>&1 && mkfifo "$fifo" 2>/dev/null; then
+    # Stream the original stdin to the previous hook while tee copies the same
+    # bytes to the capture file. If the previous hook does not read all of its
+    # stdin or tee cannot write the file, keep writing the capture and return
+    # the previous hook's own status. The original hook runs in a subshell
+    # with the normal SIGPIPE disposition; only tee ignores it so a hook that
+    # exits without reading stdin cannot prevent the capture.
+    trap '' PIPE
+    ( trap - PIPE; "$original" "$@" < "$fifo" ) &
+    hook_pid=$!
+    tee "$tmp" > "$fifo" 2>/dev/null
+    tee_rc=$?
+    wait "$hook_pid"
+    hook_rc=$?
+    trap - PIPE
+    if [ "$tee_rc" -eq 0 ]; then
+      record_attempts
+    fi
+    rm -f "$fifo" "$tmp"
+    exit "$hook_rc"
+  fi
+  rm -f "$tmp"
+  "$original" "$@"
+  exit $?
+fi
+
+if cat > "$tmp" 2>/dev/null; then
+  record_attempts
+fi
+rm -f "$tmp"
 exit 0
 `
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // git requires an executable hook.
