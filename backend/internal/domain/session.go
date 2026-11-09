@@ -337,6 +337,10 @@ type SessionRecord struct {
 
 // SessionBranchState is the session branch's commit and push facts.
 type SessionBranchState struct {
+	// Branch is the exact local branch observed in the session worktree.
+	Branch string `json:"branch,omitempty"`
+	// HeadSHA is the exact local branch tip at the last observation.
+	HeadSHA string `json:"headSHA,omitempty"`
 	// Commits is how many commits the branch has on top of its base.
 	Commits int `json:"commits"`
 	// RemoteBranch is the remote-tracking branch, such as "origin/feat/x".
@@ -345,6 +349,67 @@ type SessionBranchState struct {
 	// Unpushed is how many branch commits are not on RemoteBranch. It equals
 	// Commits while RemoteBranch is empty.
 	Unpushed int `json:"unpushed"`
+}
+
+// IssuePublicationState is the durable-fact-derived publication outcome for an
+// issue-backed worker task. It is not a presentation status and does not change
+// ActivityIdle semantics.
+type IssuePublicationState string
+
+// Issue publication states.
+const (
+	// IssuePublicationPRReady means the exact local branch tip is published by
+	// an attributed, open, non-draft PR.
+	IssuePublicationPRReady IssuePublicationState = "pr_ready"
+	// IssuePublicationIncomplete means the issue task stopped without a valid
+	// published PR.
+	IssuePublicationIncomplete IssuePublicationState = "incomplete"
+)
+
+// IssuePublicationReason is the closed reason for an incomplete issue task.
+type IssuePublicationReason string
+
+// Issue publication failure reasons.
+const (
+	// IssuePublicationReasonBranchNotPushed means local commits exist without a
+	// fully published remote branch.
+	IssuePublicationReasonBranchNotPushed IssuePublicationReason = "branch_not_pushed"
+	// IssuePublicationReasonIssuePRMissing means the work has no attributed PR.
+	IssuePublicationReasonIssuePRMissing IssuePublicationReason = "issue_pr_missing"
+	// IssuePublicationReasonPRAssociationBad means an attributed PR does not
+	// match the exact local branch and head.
+	IssuePublicationReasonPRAssociationBad IssuePublicationReason = "pr_association_invalid"
+	// IssuePublicationReasonPRNotReady means the matching PR is draft, closed,
+	// or merged and therefore not ready for review.
+	IssuePublicationReasonPRNotReady IssuePublicationReason = "pr_not_ready"
+)
+
+// IssuePublicationTurn describes whether the observed worker turn reached an
+// idle completion boundary or was interrupted by process exit.
+type IssuePublicationTurn string
+
+// Issue publication turn boundaries.
+const (
+	// IssuePublicationTurnCompleted means the worker was observed idle after
+	// starting the issue task.
+	IssuePublicationTurnCompleted IssuePublicationTurn = "completed"
+	// IssuePublicationTurnInterrupted means the worker process exited before a
+	// clean idle completion was observed.
+	IssuePublicationTurnInterrupted IssuePublicationTurn = "interrupted"
+)
+
+// IssuePublication is the explicit publication result of an issue-backed
+// worker session. It is derived from durable branch and attributed-PR facts at
+// read time; it is never stored as a presentation status.
+type IssuePublication struct {
+	State        IssuePublicationState  `json:"state" enum:"pr_ready,incomplete"`
+	Reason       IssuePublicationReason `json:"reason,omitempty" enum:"branch_not_pushed,issue_pr_missing,pr_association_invalid,pr_not_ready"`
+	Turn         IssuePublicationTurn   `json:"turn" enum:"completed,interrupted"`
+	LocalCommits int                    `json:"localCommits"`
+	BranchPushed bool                   `json:"branchPushed"`
+	PRURL        string                 `json:"prURL,omitempty"`
+	HeadSHA      string                 `json:"headSHA,omitempty"`
+	ObservedAt   time.Time              `json:"observedAt"`
 }
 
 // SessionProvisionStepID names one stage of an asynchronous Chat start.
@@ -482,6 +547,10 @@ type Session struct {
 	TerminalHandleID  string                `json:"terminalHandleId,omitempty"`
 	ArtifactFiles     []SessionArtifactFile `json:"-"`
 	ActiveAgentSwitch *AgentSwitch          `json:"-"`
+	// IssuePublication is the explicit publication result for issue-backed
+	// worker tasks. It is derived at read time from durable branch/PR facts,
+	// not persisted as a display status.
+	IssuePublication *IssuePublication `json:"issuePublication,omitempty"`
 	// PRs are the session's attributed pull requests (one session can own many).
 	// They feed status derivation and are surfaced on the API read model. Not
 	// serialized here: the HTTP boundary maps them to the curated wire shape.

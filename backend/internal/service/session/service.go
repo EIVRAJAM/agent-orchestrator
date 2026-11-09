@@ -1373,6 +1373,7 @@ func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionReco
 		TerminalHandleID: rec.Metadata.RuntimeHandleID,
 		ArtifactFiles:    artifactFiles,
 		PRs:              prs,
+		IssuePublication: deriveIssuePublication(rec, prs, now),
 	}, nil
 }
 
