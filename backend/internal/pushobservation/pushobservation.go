@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -116,7 +117,14 @@ func Install(ctx context.Context, workspacePath, dataDir string, id domain.Sessi
 	if err := writeOriginalHookPath(hooksDir, originalPath); err != nil {
 		return err
 	}
-	if err := writeHookScript(filepath.Join(hooksDir, prePushName), filepath.Join(dir, attemptsFile), instanceID, originalPath); err != nil {
+	if runtime.GOOS == "windows" {
+		// Git for Windows does not provide a reliable filesystem FIFO. Keep the
+		// Windows hook as a direct delegation: no tee, FIFO, marker, or auxiliary
+		// process can affect the previous hook's stdin or exit status.
+		if err := writeDirectHookScript(filepath.Join(hooksDir, prePushName), originalPath); err != nil {
+			return err
+		}
+	} else if err := writeHookScript(filepath.Join(hooksDir, prePushName), filepath.Join(dir, attemptsFile), instanceID, originalPath); err != nil {
 		return err
 	}
 	// Worktree-scoped configuration keeps this hook out of the human checkout
@@ -176,6 +184,32 @@ func originalHookPath(ctx context.Context, workspacePath, hooksDir string) (stri
 func writeOriginalHookPath(hooksDir, originalPath string) error {
 	if err := os.WriteFile(filepath.Join(hooksDir, originalFile), []byte(originalPath+"\n"), 0o600); err != nil {
 		return fmt.Errorf("push observation: save original hook: %w", err)
+	}
+	return nil
+}
+
+func writeDirectHookScript(path, originalPath string) error {
+	original := ""
+	if originalPath != "" {
+		if info, err := os.Stat(originalPath); err == nil && info.Mode().IsRegular() {
+			original = originalPath
+		}
+	}
+	script := `#!/bin/sh
+# Managed by agent-orchestrator. Windows direct fallback: delegate exactly to
+# the previous hook, or consume stdin when there is no previous hook. It does
+# not record an attempt or inspect repository/remote data.
+set +e
+original=` + shellQuote(filepath.ToSlash(original)) + `
+if [ -n "$original" ] && [ -x "$original" ]; then
+  "$original" "$@"
+  exit $?
+fi
+cat >/dev/null
+exit 0
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil { //nolint:gosec // git requires an executable hook.
+		return fmt.Errorf("push observation: write direct pre-push hook: %w", err)
 	}
 	return nil
 }
