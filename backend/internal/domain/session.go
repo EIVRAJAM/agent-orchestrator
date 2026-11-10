@@ -337,14 +337,120 @@ type SessionRecord struct {
 
 // SessionBranchState is the session branch's commit and push facts.
 type SessionBranchState struct {
+	// Branch is the exact local branch observed in the session worktree.
+	Branch string `json:"branch,omitempty"`
+	// HeadSHA is the exact local branch tip at the last observation.
+	HeadSHA string `json:"headSHA,omitempty"`
 	// Commits is how many commits the branch has on top of its base.
 	Commits int `json:"commits"`
 	// RemoteBranch is the remote-tracking branch, such as "origin/feat/x".
 	// Empty means the branch has never been pushed.
 	RemoteBranch string `json:"remoteBranch,omitempty"`
+	// RemoteHeadSHA is the exact tip observed for RemoteBranch. Push success
+	// requires it to equal HeadSHA; a remote that merely contains HeadSHA (for
+	// example, has moved ahead) is not an exact confirmation.
+	RemoteHeadSHA string `json:"remoteHeadSHA,omitempty"`
 	// Unpushed is how many branch commits are not on RemoteBranch. It equals
 	// Commits while RemoteBranch is empty.
 	Unpushed int `json:"unpushed"`
+}
+
+// IssuePublicationState is the durable-fact-derived publication outcome for an
+// issue-backed worker task. It is not a presentation status and does not change
+// ActivityIdle semantics.
+type IssuePublicationState string
+
+// Issue publication states.
+const (
+	// IssuePublicationPRReady means the exact local branch tip is published by
+	// an attributed, open, non-draft PR.
+	IssuePublicationPRReady IssuePublicationState = "pr_ready"
+	// IssuePublicationIncomplete means the issue task stopped without a valid
+	// published PR.
+	IssuePublicationIncomplete IssuePublicationState = "incomplete"
+)
+
+// IssuePublicationReason is the closed reason for an incomplete issue task.
+type IssuePublicationReason string
+
+// Issue publication failure reasons.
+const (
+	// IssuePublicationReasonBranchNotPushed means local commits exist without a
+	// fully published remote branch.
+	IssuePublicationReasonBranchNotPushed IssuePublicationReason = "branch_not_pushed"
+	// IssuePublicationReasonIssuePRMissing means the work has no attributed PR.
+	IssuePublicationReasonIssuePRMissing IssuePublicationReason = "issue_pr_missing"
+	// IssuePublicationReasonPRAssociationBad means an attributed PR does not
+	// match the exact local branch and head.
+	IssuePublicationReasonPRAssociationBad IssuePublicationReason = "pr_association_invalid"
+	// IssuePublicationReasonOwnershipUnavailable means durable ownership facts
+	// could not be read, so the PR association cannot be trusted.
+	IssuePublicationReasonOwnershipUnavailable IssuePublicationReason = "ownership_unavailable"
+	// IssuePublicationReasonPRNotReady means the matching PR is draft, closed,
+	// or merged and therefore not ready for review.
+	IssuePublicationReasonPRNotReady IssuePublicationReason = "pr_not_ready"
+	// IssuePublicationReasonPushFailed is reserved for a direct, durable push
+	// failure result. The current pre-push-only flow cannot produce it and
+	// therefore reports an attempted-but-unconfirmed push as incomplete.
+	IssuePublicationReasonPushFailed IssuePublicationReason = "push_failed"
+)
+
+// IssuePublicationTurn describes whether the observed worker turn reached a
+// durable completion boundary or was interrupted by process exit.
+type IssuePublicationTurn string
+
+// Issue publication turn boundaries.
+const (
+	// IssuePublicationTurnCompleted means a durable completed-conversation
+	// checkpoint exists for the worker's current turn.
+	IssuePublicationTurnCompleted IssuePublicationTurn = "completed"
+	// IssuePublicationTurnInterrupted means the worker process exited before a
+	// durable completion boundary was observed.
+	IssuePublicationTurnInterrupted IssuePublicationTurn = "interrupted"
+	// IssuePublicationTurnUnknown means the worker is idle but no durable
+	// completion boundary exists. Idle alone does not prove a turn completed.
+	IssuePublicationTurnUnknown IssuePublicationTurn = "unknown"
+)
+
+// IssuePublicationPush is the durable push result for the issue worker's exact
+// branch head. Unknown means there is no proof that a push was attempted.
+// AttemptedUnconfirmed means a current-generation pre-push attempt exists for
+// the exact head, but no direct result or remote confirmation is available yet;
+// it is never presented as a failure.
+type IssuePublicationPush string
+
+// Issue publication push results.
+const (
+	// IssuePublicationPushUnknown means no current-generation attempt marker
+	// proves that a push was attempted.
+	IssuePublicationPushUnknown IssuePublicationPush = "unknown"
+	// IssuePublicationPushAttemptedUnconfirmed means a current-generation
+	// pre-push attempt exists for the exact head, but the remote result has not
+	// been confirmed. It is not a failure.
+	IssuePublicationPushAttemptedUnconfirmed IssuePublicationPush = "attempted_unconfirmed"
+	// IssuePublicationPushFailed is reserved for a direct durable push-failure
+	// result. The pre-push-only flow never produces it.
+	IssuePublicationPushFailed IssuePublicationPush = "failed"
+	// IssuePublicationPushSucceeded means branch observation confirmed the
+	// exact branch head on the remote.
+	IssuePublicationPushSucceeded IssuePublicationPush = "succeeded"
+)
+
+// IssuePublication is the explicit publication result of an issue-backed
+// worker session. It is derived from durable branch, push-attempt, ownership,
+// and attributed-PR facts at read time; it is never stored as a presentation
+// status.
+type IssuePublication struct {
+	State             IssuePublicationState  `json:"state" enum:"pr_ready,incomplete"`
+	Reason            IssuePublicationReason `json:"reason,omitempty" enum:"branch_not_pushed,issue_pr_missing,pr_association_invalid,ownership_unavailable,pr_not_ready,push_failed"`
+	Turn              IssuePublicationTurn   `json:"turn" enum:"completed,interrupted,unknown"`
+	Push              IssuePublicationPush   `json:"push" enum:"unknown,attempted_unconfirmed,failed,succeeded"`
+	LocalCommits      int                    `json:"localCommits"`
+	BranchPushed      bool                   `json:"branchPushed"`
+	OwnershipVerified bool                   `json:"ownershipVerified"`
+	PRURL             string                 `json:"prURL,omitempty"`
+	HeadSHA           string                 `json:"headSHA,omitempty"`
+	ObservedAt        time.Time              `json:"observedAt"`
 }
 
 // SessionProvisionStepID names one stage of an asynchronous Chat start.
@@ -482,6 +588,10 @@ type Session struct {
 	TerminalHandleID  string                `json:"terminalHandleId,omitempty"`
 	ArtifactFiles     []SessionArtifactFile `json:"-"`
 	ActiveAgentSwitch *AgentSwitch          `json:"-"`
+	// IssuePublication is the explicit publication result for issue-backed
+	// worker tasks. It is derived at read time from durable branch/PR facts,
+	// not persisted as a display status.
+	IssuePublication *IssuePublication `json:"issuePublication,omitempty"`
 	// PRs are the session's attributed pull requests (one session can own many).
 	// They feed status derivation and are surfaced on the API read model. Not
 	// serialized here: the HTTP boundary maps them to the curated wire shape.

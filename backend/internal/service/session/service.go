@@ -1338,6 +1338,7 @@ func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionReco
 	// the no-signal rule, and two reads could put them either side of its grace
 	// period and have the card contradict its own status.
 	now := s.now()
+	publicationEvidence := s.loadIssuePublicationEvidence(ctx, rec, prs)
 	// rec.OutputType is the persisted column (lifecycle.Manager.
 	// ReconcileSessionOutputType is the sole writer); it is deliberately not
 	// recomputed here so the API and Kanban see the same durable
@@ -1373,6 +1374,7 @@ func (s *Service) toSessionWithFacts(ctx context.Context, rec domain.SessionReco
 		TerminalHandleID: rec.Metadata.RuntimeHandleID,
 		ArtifactFiles:    artifactFiles,
 		PRs:              prs,
+		IssuePublication: deriveIssuePublication(rec, prs, publicationEvidence, now),
 	}, nil
 }
 

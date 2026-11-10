@@ -106,7 +106,11 @@ func (s *Service) reconcileBranchStates(ctx context.Context, writer branchStateW
 			continue
 		}
 		repoKey := ""
-		if identity, err := domain.ParseRepositoryIdentity(project.rec.RepoOriginURL); err == nil && identity.Provider != "" && identity.Host != "" {
+		origin := project.rec.RepoOriginURL
+		if canonical := strings.TrimSpace(project.rec.Config.CanonicalRepoURL); canonical != "" {
+			origin = canonical
+		}
+		if identity, err := domain.ParseRepositoryIdentity(origin); err == nil && identity.Provider != "" && identity.Host != "" {
 			repoKey = identity.Key()
 		}
 		repos[commonDir] = append(repos[commonDir], branchTarget{
@@ -259,7 +263,7 @@ func (s *Service) reconcileBranchTarget(ctx context.Context, writer branchStateW
 	}
 
 	root := rec.Metadata.WorkspacePath
-	var state domain.SessionBranchState
+	state := domain.SessionBranchState{Branch: target.branch, HeadSHA: local}
 	if base != "" {
 		commits, ok := gitRevListCount(ctx, root, base+".."+local)
 		if !ok {
@@ -273,12 +277,14 @@ func (s *Service) reconcileBranchTarget(ctx context.Context, writer branchStateW
 		state.Unpushed = state.Commits
 	case local:
 		state.RemoteBranch = branchStateRemote + "/" + target.branch
+		state.RemoteHeadSHA = remote
 	default:
 		unpushed, ok := gitRevListCount(ctx, root, remote+".."+local)
 		if !ok {
 			return nil
 		}
 		state.RemoteBranch = branchStateRemote + "/" + target.branch
+		state.RemoteHeadSHA = remote
 		state.Unpushed = unpushed
 	}
 	if rec.BranchState == nil || *rec.BranchState != state {

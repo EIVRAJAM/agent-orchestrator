@@ -55,6 +55,7 @@ func TestReconcileSessionBranchStateTracksCommitsAndPushes(t *testing.T) {
 	runGit(t, repo, "checkout", "-b", "feat/x")
 	commitFile(t, repo, "a.go")
 	commitFile(t, repo, "b.go")
+	head2 := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
 
 	st := &branchStateStore{fakeStore: newFakeStore()}
 	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", Metadata: domain.SessionMetadata{
@@ -73,16 +74,17 @@ func TestReconcileSessionBranchStateTracksCommitsAndPushes(t *testing.T) {
 
 	// Tracking origin/main is not a push: the branch itself is not on the remote.
 	runGit(t, repo, "branch", "--set-upstream-to", "origin/main")
-	reconcile(domain.SessionBranchState{Commits: 2, Unpushed: 2})
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head2, Commits: 2, Unpushed: 2})
 
 	runGit(t, repo, "push", "-u", "origin", "feat/x")
-	reconcile(domain.SessionBranchState{Commits: 2, RemoteBranch: "origin/feat/x", Unpushed: 0})
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head2, Commits: 2, RemoteBranch: "origin/feat/x", RemoteHeadSHA: head2, Unpushed: 0})
 
 	commitFile(t, repo, "c.go")
-	reconcile(domain.SessionBranchState{Commits: 3, RemoteBranch: "origin/feat/x", Unpushed: 1})
+	head3 := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head3, Commits: 3, RemoteBranch: "origin/feat/x", RemoteHeadSHA: head2, Unpushed: 1})
 
 	writes := st.writes
-	reconcile(domain.SessionBranchState{Commits: 3, RemoteBranch: "origin/feat/x", Unpushed: 1})
+	reconcile(domain.SessionBranchState{Branch: "feat/x", HeadSHA: head3, Commits: 3, RemoteBranch: "origin/feat/x", RemoteHeadSHA: head2, Unpushed: 1})
 	if st.writes != writes {
 		t.Fatalf("unchanged facts were rewritten (%d writes, want %d)", st.writes, writes)
 	}
@@ -109,6 +111,33 @@ func TestReconcileBranchStatesRecordsExactWorkspaceTip(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("recorded exact branch tips = %v, want feature/owned@%s", st.recorded, head)
+	}
+}
+
+func TestReconcileBranchStatesUsesCanonicalRepoForTipOwnership(t *testing.T) {
+	repo := newPushableRepo(t)
+	runGit(t, repo, "checkout", "-b", "feature/canonical")
+	commitFile(t, repo, "canonical.go")
+	head := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	st := &branchStateStore{fakeStore: newFakeStore()}
+	st.projects["p"] = domain.ProjectRecord{
+		ID: "p", RepoOriginURL: "https://github.com/fork/demo.git",
+		Config: domain.ProjectConfig{CanonicalRepoURL: "https://github.com/upstream/demo"},
+	}
+	st.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", ProjectID: "p", Metadata: domain.SessionMetadata{
+		Branch: "feature/canonical", WorkspacePath: repo, DiffBaseRef: "refs/remotes/origin/main",
+	}}
+	if err := (&Service{store: st}).ReconcileSessionBranchState(context.Background(), "ao-1"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range st.recorded {
+		if record == "github|github.com|upstream/demo|feature/canonical@"+head {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("recorded exact branch tips = %v, want canonical upstream key", st.recorded)
 	}
 }
 
@@ -170,6 +199,7 @@ func TestReconcileBranchStatesFollowsTheWorktreeBranch(t *testing.T) {
 	// The agent moved to its own branch; the recorded branch is stale.
 	runGit(t, worktree, "checkout", "-b", "ao/s1/feature")
 	commitFile(t, worktree, "a.go")
+	head := strings.TrimSpace(runGit(t, worktree, "rev-parse", "HEAD"))
 
 	st := &branchStateStore{fakeStore: newFakeStore()}
 	st.sessions["s1"] = domain.SessionRecord{ID: "s1", Metadata: domain.SessionMetadata{
@@ -178,7 +208,7 @@ func TestReconcileBranchStatesFollowsTheWorktreeBranch(t *testing.T) {
 	if err := (&Service{store: st}).ReconcileBranchStates(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	want := domain.SessionBranchState{Commits: 1, Unpushed: 1}
+	want := domain.SessionBranchState{Branch: "ao/s1/feature", HeadSHA: head, Commits: 1, Unpushed: 1}
 	if got := st.sessions["s1"].BranchState; got == nil || *got != want {
 		t.Fatalf("branch state = %+v, want %+v", got, want)
 	}
@@ -220,10 +250,11 @@ func TestReconcileBranchStatesRunsGitOnlyWhenTipsMove(t *testing.T) {
 		t.Fatalf("idle pass ran %d git processes, want only the for-each-ref", got)
 	}
 	commitFile(t, worktrees["s1"], "more.go")
+	head := strings.TrimSpace(runGit(t, worktrees["s1"], "rev-parse", "HEAD"))
 	if got := pass(); got != 2 {
 		t.Fatalf("pass after one commit ran %d git processes, want 2", got)
 	}
-	want := domain.SessionBranchState{Commits: 2, Unpushed: 2}
+	want := domain.SessionBranchState{Branch: "ao/s1", HeadSHA: head, Commits: 2, Unpushed: 2}
 	if got := st.sessions["s1"].BranchState; got == nil || *got != want {
 		t.Fatalf("s1 branch state = %+v, want %+v", got, want)
 	}

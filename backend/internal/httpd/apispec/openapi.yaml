@@ -12757,6 +12757,8 @@ components:
           type: boolean
         issueId:
           type: string
+        issuePublication:
+          $ref: '#/components/schemas/IssuePublication'
         kanbanColumn:
           enum:
           - building
@@ -14694,6 +14696,57 @@ components:
       required:
       - kind
       type: object
+    IssuePublication:
+      properties:
+        branchPushed:
+          type: boolean
+        headSHA:
+          type: string
+        localCommits:
+          type: integer
+        observedAt:
+          format: date-time
+          type: string
+        ownershipVerified:
+          type: boolean
+        prURL:
+          type: string
+        push:
+          enum:
+          - unknown
+          - attempted_unconfirmed
+          - failed
+          - succeeded
+          type: string
+        reason:
+          enum:
+          - branch_not_pushed
+          - issue_pr_missing
+          - pr_association_invalid
+          - ownership_unavailable
+          - pr_not_ready
+          - push_failed
+          type: string
+        state:
+          enum:
+          - pr_ready
+          - incomplete
+          type: string
+        turn:
+          enum:
+          - completed
+          - interrupted
+          - unknown
+          type: string
+      required:
+      - state
+      - turn
+      - push
+      - localCommits
+      - branchPushed
+      - ownershipVerified
+      - observedAt
+      type: object
     KillReviewResponse:
       properties:
         reviewerHandleId:
@@ -16374,9 +16427,15 @@ components:
       type: object
     SessionBranchState:
       properties:
+        branch:
+          type: string
         commits:
           type: integer
+        headSHA:
+          type: string
         remoteBranch:
+          type: string
+        remoteHeadSHA:
           type: string
         unpushed:
           type: integer

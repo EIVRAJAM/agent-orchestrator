@@ -4303,6 +4303,7 @@ export interface components {
             isPinned: boolean;
             isTerminated: boolean;
             issueId?: string;
+            issuePublication?: components["schemas"]["IssuePublication"];
             /** @enum {string} */
             kanbanColumn: "building" | "validating" | "needs_review" | "ready" | "archive";
             kind: string;
@@ -5006,6 +5007,23 @@ export interface components {
             /** @description For command cues, the normal shell terminal that received the command. */
             shellTerminal?: components["schemas"]["ShellTerminalResponse"];
         };
+        IssuePublication: {
+            branchPushed: boolean;
+            headSHA?: string;
+            localCommits: number;
+            /** Format: date-time */
+            observedAt: string;
+            ownershipVerified: boolean;
+            prURL?: string;
+            /** @enum {string} */
+            push: "unknown" | "attempted_unconfirmed" | "failed" | "succeeded";
+            /** @enum {string} */
+            reason?: "branch_not_pushed" | "issue_pr_missing" | "pr_association_invalid" | "ownership_unavailable" | "pr_not_ready" | "push_failed";
+            /** @enum {string} */
+            state: "pr_ready" | "incomplete";
+            /** @enum {string} */
+            turn: "completed" | "interrupted" | "unknown";
+        };
         KillReviewResponse: {
             reviewerHandleId: string;
             reviewerHarness?: string;
@@ -5658,8 +5676,11 @@ export interface components {
             updatedAt: string;
         };
         SessionBranchState: {
+            branch?: string;
             commits: number;
+            headSHA?: string;
             remoteBranch?: string;
+            remoteHeadSHA?: string;
             unpushed: number;
         };
         SessionInterfaceTransition: {

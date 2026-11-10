@@ -80,6 +80,9 @@ type fakeStore struct {
 	comments            map[string][]domain.PullRequestComment
 	commentsErr         error
 	reviewRuns          map[domain.SessionID][]domain.CurrentHeadReviewRun
+	prOwnerships        map[string]domain.SessionPROwnership
+	branchTips          map[string][]domain.SessionBranchTip
+	ownershipErr        error
 	listPRFactsCalls    int
 	listReviewRunsCalls int
 	num                 int
@@ -100,6 +103,8 @@ func newFakeStore() *fakeStore {
 		threads:        map[string][]domain.PullRequestReviewThread{},
 		comments:       map[string][]domain.PullRequestComment{},
 		reviewRuns:     map[domain.SessionID][]domain.CurrentHeadReviewRun{},
+		prOwnerships:   map[string]domain.SessionPROwnership{},
+		branchTips:     map[string][]domain.SessionBranchTip{},
 	}
 }
 
@@ -491,6 +496,21 @@ func (f *fakeStore) GetProject(_ context.Context, id string) (domain.ProjectReco
 
 func (f *fakeStore) ListSessionWorktrees(_ context.Context, id domain.SessionID) ([]domain.SessionWorktreeRecord, error) {
 	return append([]domain.SessionWorktreeRecord(nil), f.worktrees[id]...), nil
+}
+
+func (f *fakeStore) GetSessionPROwnership(_ context.Context, prURL string) (domain.SessionPROwnership, bool, error) {
+	if f.ownershipErr != nil {
+		return domain.SessionPROwnership{}, false, f.ownershipErr
+	}
+	ownership, ok := f.prOwnerships[prURL]
+	return ownership, ok, nil
+}
+
+func (f *fakeStore) ListSessionBranchTips(_ context.Context, instanceID string) ([]domain.SessionBranchTip, error) {
+	if f.ownershipErr != nil {
+		return nil, f.ownershipErr
+	}
+	return append([]domain.SessionBranchTip(nil), f.branchTips[instanceID]...), nil
 }
 
 func TestSessionListAppliesActivityBeforePRFacts(t *testing.T) {
