@@ -142,3 +142,22 @@ func windowsShell(t *testing.T) string {
 	t.Fatalf("Git Bash shell unavailable; checked PATH and %v", candidates)
 	return ""
 }
+
+func TestWindowsPushObservationIgnoresInheritedMarker(t *testing.T) {
+	dataDir := t.TempDir()
+	id := domain.SessionID("ao-1")
+	dir := Dir(dataDir, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := "inst-1\tgen-1\thead-1\trefs/heads/feature\n"
+	if err := os.WriteFile(filepath.Join(dir, attemptsFile), []byte(marker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := attemptedFromObservation(dataDir, id, "inst-1", "gen-1", "feature", "head-1"); err != nil || !ok {
+		t.Fatalf("parser fixture = %v, %v; want marker recognized", ok, err)
+	}
+	if ok, err := Attempted(dataDir, id, "inst-1", "gen-1", "feature", "head-1"); err != nil || ok {
+		t.Fatalf("Windows Attempted = %v, %v; want inherited marker ignored", ok, err)
+	}
+}

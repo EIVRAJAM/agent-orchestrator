@@ -28,19 +28,19 @@ func TestAttemptedRequiresExactBranchAndHead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-1", "ao/ao-1", "sha-1"); err != nil || !ok {
+	if ok, err := attemptedFromObservation(dir, sessionID, "inst-1", "gen-1", "ao/ao-1", "sha-1"); err != nil || !ok {
 		t.Fatalf("exact attempt = %v, %v; want true", ok, err)
 	}
-	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-1", "ao/ao-1", "sha-3"); err != nil || ok {
+	if ok, err := attemptedFromObservation(dir, sessionID, "inst-1", "gen-1", "ao/ao-1", "sha-3"); err != nil || ok {
 		t.Fatalf("other head = %v, %v; want false", ok, err)
 	}
-	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-1", "ao/other", "sha-1"); err != nil || ok {
+	if ok, err := attemptedFromObservation(dir, sessionID, "inst-1", "gen-1", "ao/other", "sha-1"); err != nil || ok {
 		t.Fatalf("other branch = %v, %v; want false", ok, err)
 	}
-	if ok, err := Attempted(dir, sessionID, "inst-2", "gen-1", "ao/ao-1", "sha-1"); err != nil || ok {
+	if ok, err := attemptedFromObservation(dir, sessionID, "inst-2", "gen-1", "ao/ao-1", "sha-1"); err != nil || ok {
 		t.Fatalf("other instance = %v, %v; want false", ok, err)
 	}
-	if ok, err := Attempted(dir, sessionID, "inst-1", "gen-2", "ao/ao-1", "sha-1"); err != nil || ok {
+	if ok, err := attemptedFromObservation(dir, sessionID, "inst-1", "gen-2", "ao/ao-1", "sha-1"); err != nil || ok {
 		t.Fatalf("other generation = %v, %v; want false", ok, err)
 	}
 }

@@ -54,6 +54,19 @@ func Dir(dataDir string, id domain.SessionID) string {
 // exact instance, branch and head. A missing file or a stale generation is a
 // normal "no evidence", not an error.
 func Attempted(dataDir string, id domain.SessionID, instanceID, generation, branch, headSHA string) (bool, error) {
+	// Windows uses the direct delegation hook and never creates a valid
+	// attempt marker. Ignore any inherited marker from an older Windows build
+	// rather than attributing its attempt to the current generation.
+	if runtime.GOOS == "windows" {
+		return false, nil
+	}
+	return attemptedFromObservation(dataDir, id, instanceID, generation, branch, headSHA)
+}
+
+// attemptedFromObservation is the platform-independent marker parser. It is
+// kept separate from Attempted so Linux/macOS parser coverage remains strong
+// even though Windows intentionally ignores inherited markers.
+func attemptedFromObservation(dataDir string, id domain.SessionID, instanceID, generation, branch, headSHA string) (bool, error) {
 	instanceID = strings.TrimSpace(instanceID)
 	generation = strings.TrimSpace(generation)
 	branch = strings.TrimSpace(branch)
