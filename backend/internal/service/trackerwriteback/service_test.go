@@ -23,6 +23,7 @@ type fakeStore struct {
 	projects      map[string]domain.ProjectRecord
 	prs           map[string]domain.PullRequest
 	ownership     map[string]domain.SessionPROwnership
+	branchTips    map[string][]domain.SessionBranchTip
 	fresh         ports.SCMObservation
 	freshErr      error
 	rows          map[string]domain.TrackerWriteback
@@ -34,12 +35,13 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		sessions:  map[domain.SessionID]domain.SessionRecord{},
-		projects:  map[string]domain.ProjectRecord{},
-		prs:       map[string]domain.PullRequest{},
-		ownership: map[string]domain.SessionPROwnership{},
-		rows:      map[string]domain.TrackerWriteback{},
-		key:       map[string]string{},
+		sessions:   map[domain.SessionID]domain.SessionRecord{},
+		projects:   map[string]domain.ProjectRecord{},
+		prs:        map[string]domain.PullRequest{},
+		ownership:  map[string]domain.SessionPROwnership{},
+		branchTips: map[string][]domain.SessionBranchTip{},
+		rows:       map[string]domain.TrackerWriteback{},
+		key:        map[string]string{},
 	}
 }
 
@@ -62,6 +64,12 @@ func (f *fakeStore) GetSessionPROwnership(_ context.Context, prURL string) (doma
 	defer f.mu.Unlock()
 	ownership, ok := f.ownership[prURL]
 	return ownership, ok, nil
+}
+
+func (f *fakeStore) ListSessionBranchTips(_ context.Context, instanceID string) ([]domain.SessionBranchTip, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.SessionBranchTip(nil), f.branchTips[instanceID]...), nil
 }
 
 func (f *fakeStore) FetchPullRequestsFresh(_ context.Context, _ []ports.SCMPRRef) ([]ports.SCMObservation, error) {
@@ -235,12 +243,16 @@ func seedWriteback(t *testing.T, enabled bool) (*Service, *fakeStore, *fakeComme
 	prURL := "https://github.com/acme/demo/pull/1"
 	st.prs[prURL] = domain.PullRequest{
 		URL: prURL, SessionID: "proj-1", Number: 1, Provider: "github", Host: "github.com", Repo: "acme/demo",
-		SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
+		SourceBranch: "feat/x", HeadSHA: "sha1", CI: domain.CIPassing, CreatedAtProvider: time.Unix(101, 0).UTC(),
 	}
 	st.ownership[prURL] = domain.SessionPROwnership{
 		PRURL: prURL, SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo",
 		SourceBranch: "feat/x", HeadSHA: "sha1", RegisteredAt: time.Unix(101, 0).UTC(),
 	}
+	st.branchTips["inst-proj-1"] = []domain.SessionBranchTip{{
+		SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo",
+		Branch: "feat/x", HeadSHA: "sha1",
+	}}
 	st.fresh = ports.SCMObservation{
 		Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/demo",
 		PR: ports.SCMPRObservation{URL: prURL, Number: 1, State: "open", SourceBranch: "feat/x", HeadSHA: "sha1"},
@@ -428,9 +440,10 @@ func TestTerminalLoggingIsSanitized(t *testing.T) {
 	prURL := "https://github.com/acme/demo/pull/1"
 	st.prs[prURL] = domain.PullRequest{
 		URL: prURL, SessionID: "proj-1", Number: 1, Provider: "github", Host: "github.com", Repo: "acme/demo",
-		SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
+		SourceBranch: "feat/x", HeadSHA: "sha1", CI: domain.CIPassing, CreatedAtProvider: time.Unix(101, 0).UTC(),
 	}
 	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo", SourceBranch: "feat/x", HeadSHA: "sha1"}
+	st.branchTips["inst-proj-1"] = []domain.SessionBranchTip{{SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo", Branch: "feat/x", HeadSHA: "sha1"}}
 	st.fresh = ports.SCMObservation{
 		Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/demo",
 		PR: ports.SCMPRObservation{URL: prURL, Number: 1, State: "open", SourceBranch: "feat/x", HeadSHA: "sha1"},
@@ -539,9 +552,10 @@ func TestFailedTerminalLogIsVisibleWithoutIssueContent(t *testing.T) {
 	prURL := "https://github.com/acme/demo/pull/1"
 	st.prs[prURL] = domain.PullRequest{
 		URL: prURL, SessionID: "proj-1", Number: 1, Provider: "github", Host: "github.com", Repo: "acme/demo",
-		SourceBranch: "feat/x", HeadSHA: "sha1", CreatedAtProvider: time.Unix(101, 0).UTC(),
+		SourceBranch: "feat/x", HeadSHA: "sha1", CI: domain.CIPassing, CreatedAtProvider: time.Unix(101, 0).UTC(),
 	}
 	st.ownership[prURL] = domain.SessionPROwnership{PRURL: prURL, SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo", SourceBranch: "feat/x", HeadSHA: "sha1"}
+	st.branchTips["inst-proj-1"] = []domain.SessionBranchTip{{SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo", Branch: "feat/x", HeadSHA: "sha1"}}
 	st.fresh = ports.SCMObservation{
 		Fetched: true, Provider: "github", Host: "github.com", Repo: "acme/demo",
 		PR: ports.SCMPRObservation{URL: prURL, Number: 1, State: "open", SourceBranch: "feat/x", HeadSHA: "sha1"},
@@ -604,6 +618,12 @@ func TestEnqueueRequiresExactDurableOwnership(t *testing.T) {
 		"wrong repository": func(_ *fakeStore, pr *domain.PullRequest) {
 			pr.Repo = "acme/other"
 		},
+		"wrong branch": func(_ *fakeStore, pr *domain.PullRequest) {
+			pr.SourceBranch = "feat/other"
+		},
+		"missing branch tip": func(st *fakeStore, _ *domain.PullRequest) {
+			delete(st.branchTips, "inst-proj-1")
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc, st, _ := seedWriteback(t, true)
@@ -617,6 +637,113 @@ func TestEnqueueRequiresExactDurableOwnership(t *testing.T) {
 				t.Fatal("ambiguous PR association was enqueued")
 			}
 		})
+	}
+}
+
+func TestEnqueueRequiresReadyPublication(t *testing.T) {
+	for name, mutate := range map[string]func(*domain.PullRequest){
+		"draft":  func(pr *domain.PullRequest) { pr.Draft = true },
+		"merged": func(pr *domain.PullRequest) { pr.Merged = true },
+		"closed": func(pr *domain.PullRequest) { pr.Closed = true },
+		"ci pending": func(pr *domain.PullRequest) {
+			pr.CI = domain.CIPending
+		},
+		"ci failing": func(pr *domain.PullRequest) {
+			pr.CI = domain.CIFailing
+		},
+		"ci unknown": func(pr *domain.PullRequest) {
+			pr.CI = ""
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, st, _ := seedWriteback(t, true)
+			pr := st.prs["https://github.com/acme/demo/pull/1"]
+			mutate(&pr)
+			st.prs[pr.URL] = pr
+			if err := svc.Enqueue(context.Background(), "proj-1", pr.URL, "sha1"); err != nil {
+				t.Fatal(err)
+			}
+			if st.rowCount() != 0 {
+				t.Fatal("non-ready PR was enqueued")
+			}
+		})
+	}
+}
+
+func TestProcessOnceRejectsMissingOrMismatchedBranchTip(t *testing.T) {
+	for name, mutate := range map[string]func(*fakeStore){
+		"missing": func(st *fakeStore) { delete(st.branchTips, "inst-proj-1") },
+		"wrong branch": func(st *fakeStore) {
+			st.branchTips["inst-proj-1"] = []domain.SessionBranchTip{{
+				SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo",
+				Branch: "feat/other", HeadSHA: "sha1",
+			}}
+		},
+		"wrong head": func(st *fakeStore) {
+			st.branchTips["inst-proj-1"] = []domain.SessionBranchTip{{
+				SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo",
+				Branch: "feat/x", HeadSHA: "sha-other",
+			}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, st, commenter := seedWriteback(t, true)
+			prURL := "https://github.com/acme/demo/pull/1"
+			if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
+				t.Fatal(err)
+			}
+			mutate(st)
+			if err := svc.ProcessOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if commenter.calls != 0 {
+				t.Fatalf("comment calls = %d, want 0", commenter.calls)
+			}
+			if got := st.row("wb-1"); got.Status != domain.TrackerWritebackFailed || got.FailureCode != "pr_association_invalid" {
+				t.Fatalf("row = %+v, want failed pr_association_invalid", got)
+			}
+		})
+	}
+}
+
+func TestWritebackAcceptsOwnedEffectiveBranchWithDifferentSessionRoot(t *testing.T) {
+	svc, st, commenter := seedWriteback(t, true)
+	const (
+		rootBranch      = "ao/proj-1/root"
+		effectiveBranch = "ao/proj-1/completion-percentage"
+	)
+	rec := st.sessions["proj-1"]
+	rec.Metadata.Branch = rootBranch
+	st.sessions["proj-1"] = rec
+	prURL := "https://github.com/acme/demo/pull/1"
+	pr := st.prs[prURL]
+	pr.SourceBranch = effectiveBranch
+	st.prs[prURL] = pr
+	ownership := st.ownership[prURL]
+	ownership.SourceBranch = effectiveBranch
+	st.ownership[prURL] = ownership
+	st.branchTips["inst-proj-1"] = []domain.SessionBranchTip{{
+		SessionInstanceID: "inst-proj-1", RepoKey: "github|github.com|acme/demo",
+		Branch: effectiveBranch, HeadSHA: "sha1",
+	}}
+	fresh := st.fresh
+	fresh.PR.SourceBranch = effectiveBranch
+	st.fresh = fresh
+
+	if err := svc.Enqueue(context.Background(), "proj-1", prURL, "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	if st.rowCount() != 1 {
+		t.Fatalf("rows = %d, want one exact-owned effective-branch intent", st.rowCount())
+	}
+	if err := svc.ProcessOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if commenter.calls != 1 {
+		t.Fatalf("comment calls = %d, want 1", commenter.calls)
+	}
+	if got := st.row("wb-1"); got.Status != domain.TrackerWritebackSent {
+		t.Fatalf("row = %+v, want sent", got)
 	}
 }
 

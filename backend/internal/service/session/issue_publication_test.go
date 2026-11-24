@@ -62,7 +62,7 @@ func publicationEvidenceFor(prs []domain.PRFacts, push domain.IssuePublicationPu
 func TestDeriveIssuePublicationOutcomes(t *testing.T) {
 	now := time.Unix(200, 0).UTC()
 	validPR := domain.PRFacts{
-		URL: "https://github.com/acme/demo/pull/29", SourceBranch: "ao/worker-1/task", HeadSHA: "head-1",
+		URL: "https://github.com/acme/demo/pull/29", SourceBranch: "ao/worker-1/task", HeadSHA: "head-1", CI: domain.CIPassing,
 	}
 	tests := []struct {
 		name       string
@@ -129,15 +129,17 @@ func TestDeriveIssuePublicationOutcomes(t *testing.T) {
 			wantPush:  domain.IssuePublicationPushSucceeded,
 		},
 		{
-			name: "pr for another branch is rejected",
-			mutate: func(_ *domain.SessionRecord, prs *[]domain.PRFacts) {
+			name: "matching pr with non-green ci is not ready",
+			mutate: func(rec *domain.SessionRecord, prs *[]domain.PRFacts) {
+				rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
+				rec.BranchState.Unpushed = 0
 				pr := validPR
-				pr.SourceBranch = "ao/worker-1/other"
+				pr.CI = domain.CIPending
 				*prs = []domain.PRFacts{pr}
 			},
 			push:       domain.IssuePublicationPushSucceeded,
 			wantState:  domain.IssuePublicationIncomplete,
-			wantReason: domain.IssuePublicationReasonPRAssociationBad,
+			wantReason: domain.IssuePublicationReasonPRNotReady,
 			wantTurn:   domain.IssuePublicationTurnCompleted,
 			wantPush:   domain.IssuePublicationPushSucceeded,
 		},
@@ -212,10 +214,60 @@ func TestDeriveIssuePublicationOutcomes(t *testing.T) {
 	}
 }
 
+func TestDeriveIssuePublicationUsesOwnedEffectiveBranchWithoutPushConfirmation(t *testing.T) {
+	const (
+		rootBranch      = "ao/worker-1/root"
+		effectiveBranch = "ao/worker-1/completion-percentage"
+	)
+	now := time.Unix(200, 0).UTC()
+	rec := publicationRecord()
+	rec.Metadata.Branch = rootBranch
+	rec.BranchState.Branch = rootBranch
+	rec.Metadata.ConversationCheckpointState = domain.ConversationCheckpointPrompt
+	pr := domain.PRFacts{
+		URL: "https://github.com/acme/demo/pull/29", SourceBranch: effectiveBranch,
+		HeadSHA: "head-1", CI: domain.CIPassing,
+	}
+	got := deriveIssuePublication(rec, []domain.PRFacts{pr}, publicationEvidenceFor([]domain.PRFacts{pr}, domain.IssuePublicationPushUnknown), now)
+	if got == nil {
+		t.Fatal("deriveIssuePublication returned nil")
+	}
+	if got.State != domain.IssuePublicationPRReady || got.Reason != "" {
+		t.Fatalf("outcome = %+v, want pr_ready despite an unconfirmed push", got)
+	}
+	if got.Turn != domain.IssuePublicationTurnUnknown {
+		t.Fatalf("turn = %q, want unknown without a durable completion checkpoint", got.Turn)
+	}
+	if !got.OwnershipVerified || !got.BranchPushed || got.Push != domain.IssuePublicationPushUnknown {
+		t.Fatalf("evidence = %+v, want exact ownership with unknown push preserved", got)
+	}
+	if got.PRURL != pr.URL || got.HeadSHA != pr.HeadSHA {
+		t.Fatalf("published PR = %q/%q, want %q/%q", got.PRURL, got.HeadSHA, pr.URL, pr.HeadSHA)
+	}
+}
+
+func TestDeriveIssuePublicationRejectsRootBranchPrefixForEffectivePR(t *testing.T) {
+	now := time.Unix(200, 0).UTC()
+	rec := publicationRecord()
+	rec.Metadata.Branch = "ao/worker-1/root"
+	rec.BranchState.Branch = "ao/worker-1/root"
+	effective := domain.PRFacts{
+		URL: "https://github.com/acme/demo/pull/29", SourceBranch: "ao/worker-1/completion-percentage",
+		HeadSHA: "head-1", CI: domain.CIPassing,
+	}
+	rootOwned := effective
+	rootOwned.SourceBranch = "ao/worker-1/root"
+	got := deriveIssuePublication(rec, []domain.PRFacts{effective},
+		publicationEvidenceFor([]domain.PRFacts{rootOwned}, domain.IssuePublicationPushSucceeded), now)
+	if got == nil || got.State != domain.IssuePublicationIncomplete || got.Reason != domain.IssuePublicationReasonPRAssociationBad {
+		t.Fatalf("outcome = %+v, want incomplete association invalid without the effective branch tip", got)
+	}
+}
+
 func TestDeriveIssuePublicationRequiresDurablePROwnership(t *testing.T) {
 	now := time.Unix(200, 0).UTC()
 	validPR := domain.PRFacts{
-		URL: "https://github.com/acme/demo/pull/29", SourceBranch: "ao/worker-1/task", HeadSHA: "head-1",
+		URL: "https://github.com/acme/demo/pull/29", SourceBranch: "ao/worker-1/task", HeadSHA: "head-1", CI: domain.CIPassing,
 	}
 	rec := publicationRecord()
 	rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
@@ -250,6 +302,14 @@ func TestDeriveIssuePublicationRequiresDurablePROwnership(t *testing.T) {
 			mutate: func(e *issuePublicationEvidence) {
 				own := e.Ownership[validPR.URL]
 				own.RepoKey = "github|github.com|other/repo"
+				e.Ownership[validPR.URL] = own
+			},
+		},
+		{
+			name: "foreign branch",
+			mutate: func(e *issuePublicationEvidence) {
+				own := e.Ownership[validPR.URL]
+				own.SourceBranch = "ao/worker-1/other"
 				e.Ownership[validPR.URL] = own
 			},
 		},
@@ -328,7 +388,7 @@ func TestIssuePublicationReadUsesDurableOwnershipEvidence(t *testing.T) {
 	rec := publicationRecord()
 	rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
 	rec.BranchState.Unpushed = 0
-	pr := domain.PRFacts{URL: prURL, SourceBranch: "ao/worker-1/task", HeadSHA: "head-1"}
+	pr := domain.PRFacts{URL: prURL, SourceBranch: "ao/worker-1/task", HeadSHA: "head-1", CI: domain.CIPassing}
 
 	st := newFakeStore()
 	st.projects["p"] = domain.ProjectRecord{ID: "p", RepoOriginURL: "https://github.com/acme/demo.git"}
@@ -366,8 +426,9 @@ func TestIssuePublicationReadUsesDurableOwnershipEvidence(t *testing.T) {
 	rec.Metadata.RuntimeLaunchID = "gen-1"
 	writePushAttempt(t, svc.dataDir, rec, rec.InstanceID, rec.Metadata.RuntimeLaunchID, rec.BranchState.HeadSHA, rec.BranchState.Branch)
 	got = read()
-	if got.State == domain.IssuePublicationPRReady || got.Push != domain.IssuePublicationPushAttemptedUnconfirmed {
-		t.Fatalf("outcome with an unconfirmed push = %+v, want incomplete attempted_unconfirmed", got)
+	if got.State != domain.IssuePublicationPRReady || !got.OwnershipVerified || !got.BranchPushed ||
+		got.Push != domain.IssuePublicationPushAttemptedUnconfirmed {
+		t.Fatalf("outcome with an unconfirmed push = %+v, want pr_ready with attempted_unconfirmed push", got)
 	}
 	rec.BranchState.RemoteBranch = "origin/ao/worker-1/task"
 	rec.BranchState.RemoteHeadSHA = rec.BranchState.HeadSHA

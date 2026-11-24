@@ -76,8 +76,12 @@ func deriveIssuePublication(rec domain.SessionRecord, prs []domain.PRFacts, evid
 		if pr.URL == "" || pr.SourceBranch == "" || pr.HeadSHA == "" {
 			continue
 		}
+		// The session may retain its root branch name while the worker owns a
+		// different effective branch. The branch name in BranchState is not the
+		// attribution source: the PR must match the exact owned branch tip and
+		// the exact local head. Never accept a root branch by prefix.
 		if rec.BranchState == nil || rec.BranchState.Branch == "" || rec.BranchState.HeadSHA == "" ||
-			pr.SourceBranch != rec.BranchState.Branch || pr.HeadSHA != rec.BranchState.HeadSHA {
+			pr.HeadSHA != rec.BranchState.HeadSHA {
 			mismatched = true
 			continue
 		}
@@ -85,20 +89,17 @@ func deriveIssuePublication(rec domain.SessionRecord, prs []domain.PRFacts, evid
 			ownershipUnavailable = true
 			continue
 		}
-		if !evidenceOwnsExactPR(rec, pr, evidence) {
+		candidate, ok := publicationCandidate(rec, pr, evidence)
+		if !ok || !candidate.Exact() {
 			mismatched = true
 			continue
 		}
 		out.OwnershipVerified = true
-		if out.Push != domain.IssuePublicationPushSucceeded {
-			if out.Push == domain.IssuePublicationPushFailed {
-				out.Reason = domain.IssuePublicationReasonPushFailed
-			} else {
-				out.Reason = domain.IssuePublicationReasonBranchNotPushed
-			}
+		if out.Push == domain.IssuePublicationPushFailed {
+			out.Reason = domain.IssuePublicationReasonPushFailed
 			continue
 		}
-		if pr.Draft || pr.Merged || pr.Closed {
+		if !candidate.Ready() {
 			notReady = true
 			continue
 		}
@@ -106,6 +107,9 @@ func deriveIssuePublication(rec domain.SessionRecord, prs []domain.PRFacts, evid
 		out.Reason = ""
 		out.PRURL = pr.URL
 		out.HeadSHA = pr.HeadSHA
+		// The exact open PR at this head is durable publication evidence even
+		// when the local push-observer marker/remote-tracking ref is unknown.
+		out.BranchPushed = true
 		return out
 	}
 
@@ -137,28 +141,28 @@ func deriveIssuePublication(rec domain.SessionRecord, prs []domain.PRFacts, evid
 	return out
 }
 
-func evidenceOwnsExactPR(rec domain.SessionRecord, pr domain.PRFacts, evidence issuePublicationEvidence) bool {
-	if rec.InstanceID == "" || evidence.RepoKey == "" {
-		return false
-	}
+func publicationCandidate(rec domain.SessionRecord, pr domain.PRFacts, evidence issuePublicationEvidence) (domain.PRPublicationEvidence, bool) {
 	ownership, ok := evidence.Ownership[pr.URL]
 	if !ok {
-		return false
+		return domain.PRPublicationEvidence{}, false
 	}
-	if _, ok := evidence.SessionPRs[pr.URL]; !ok {
-		return false
-	}
-	if ownership.PRURL != pr.URL ||
-		ownership.SessionInstanceID != rec.InstanceID ||
-		ownership.RepoKey != evidence.RepoKey ||
-		ownership.SourceBranch != pr.SourceBranch ||
-		ownership.HeadSHA != pr.HeadSHA {
-		return false
-	}
-	if _, ok := evidence.Tips[branchTipKey(evidence.RepoKey, pr.SourceBranch, pr.HeadSHA)]; !ok {
-		return false
-	}
-	return true
+	_, sessionPR := evidence.SessionPRs[pr.URL]
+	_, tipRegistered := evidence.Tips[branchTipKey(evidence.RepoKey, pr.SourceBranch, pr.HeadSHA)]
+	return domain.PRPublicationEvidence{
+		SessionID:     rec.ID,
+		InstanceID:    rec.InstanceID,
+		RepoKey:       evidence.RepoKey,
+		SessionPR:     sessionPR,
+		PRURL:         pr.URL,
+		SourceBranch:  pr.SourceBranch,
+		HeadSHA:       pr.HeadSHA,
+		Draft:         pr.Draft,
+		Merged:        pr.Merged,
+		Closed:        pr.Closed,
+		CI:            pr.CI,
+		Ownership:     ownership,
+		TipRegistered: tipRegistered,
+	}, true
 }
 
 func branchTipKey(repoKey, branch, headSHA string) string {
