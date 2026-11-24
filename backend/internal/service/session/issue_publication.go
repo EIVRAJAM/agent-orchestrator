@@ -76,16 +76,10 @@ func deriveIssuePublication(rec domain.SessionRecord, prs []domain.PRFacts, evid
 		if pr.URL == "" || pr.SourceBranch == "" || pr.HeadSHA == "" {
 			continue
 		}
-		// The session may retain its root branch name while the worker owns a
-		// different effective branch. The branch name in BranchState is not the
-		// attribution source: the PR must match the exact owned branch tip and
-		// the exact local head. Never accept a root branch by prefix.
-		if rec.BranchState == nil || rec.BranchState.Branch == "" || rec.BranchState.HeadSHA == "" ||
-			pr.HeadSHA != rec.BranchState.HeadSHA {
-			mismatched = true
-			continue
-		}
-		if !evidence.Available {
+		// The PR's effective branch and head are attributed from the durable
+		// ownership/tip chain, not from the session's root branch or a local
+		// BranchState observation. Never accept a root branch by prefix.
+		if !evidence.Available || rec.InstanceID == "" || evidence.RepoKey == "" {
 			ownershipUnavailable = true
 			continue
 		}
@@ -95,10 +89,6 @@ func deriveIssuePublication(rec domain.SessionRecord, prs []domain.PRFacts, evid
 			continue
 		}
 		out.OwnershipVerified = true
-		if out.Push == domain.IssuePublicationPushFailed {
-			out.Reason = domain.IssuePublicationReasonPushFailed
-			continue
-		}
 		if !candidate.Ready() {
 			notReady = true
 			continue
