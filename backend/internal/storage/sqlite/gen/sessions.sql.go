@@ -1199,6 +1199,7 @@ UPDATE sessions SET
     provision_error = '',
     client_request_id = ?18,
     client_request_hash = ?19,
+    recovery_eligible = CASE WHEN ?1 <> '' THEN 1 ELSE recovery_eligible END,
     is_task_preparation = 0
 WHERE id = ?20 AND is_task_preparation = 1
 `

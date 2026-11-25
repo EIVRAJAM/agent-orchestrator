@@ -642,7 +642,16 @@ func Run() error {
 	sessMgr = wiredSessMgr
 	// Recovery uses the existing publication read and session send paths. It
 	// never creates sessions or performs push/PR/comment side effects itself.
-	issueRecovery := issuerecovery.New(store, sessionSvc, sessMgr, log, 30*time.Second)
+	recoverySender, ok := wiredSessMgr.(issuerecovery.Sender)
+	if !ok {
+		stop()
+		lcStack.Stop()
+		if cdcErr := cdcPipe.Stop(); cdcErr != nil {
+			log.Error("cdc pipeline shutdown", "err", cdcErr)
+		}
+		return fmt.Errorf("wire issue recovery: session manager does not expose protected delivery")
+	}
+	issueRecovery := issuerecovery.New(store, sessionSvc, recoverySender, log, 30*time.Second)
 	lcStack.issueRecoveryDone = issueRecovery.Start(ctx)
 	if runner, ok := sessMgr.(interface {
 		RunPromptSuggestionTask(context.Context, domain.SessionID, string, string, string) (string, error)

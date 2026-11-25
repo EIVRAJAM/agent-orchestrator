@@ -2644,6 +2644,25 @@ func (s *Service) RelaySessionChatTurn(ctx context.Context, id domain.SessionID,
 	return s.relayChatTurn(ctx, id, text, clientMessageID, options)
 }
 
+// RelaySessionChatTurnIfIdle is the protected issue-recovery delivery boundary.
+// It refuses to append or queue when the controller is busy, has a backlog, or
+// is in a send/compaction transition. The controller holds sendMu across the
+// check and append, so another send cannot turn an observed idle controller into
+// a queued mid-turn recovery prompt.
+func (s *Service) RelaySessionChatTurnIfIdle(ctx context.Context, id domain.SessionID, text string) error {
+	controller, release, err := s.workingController(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer release()
+	_, err = controller.SendIfIdle(ctx, ports.ChatUserMessage{
+		Text:          text,
+		Origin:        domain.MessageOriginAutomation,
+		InteractionAt: s.now(),
+	})
+	return err
+}
+
 // StopChat releases a session's controller.
 func (s *Service) StopChat(ctx context.Context, id domain.SessionID) error {
 	return s.Stop(ctx, id)

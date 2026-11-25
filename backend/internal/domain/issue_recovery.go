@@ -11,8 +11,15 @@ const (
 	// IssueRecoveryObserving means the worker was seen without a valid PR and
 	// has not yet been continued.
 	IssueRecoveryObserving IssueRecoveryState = "observing"
-	// IssueRecoveryContinued means the one allowed continuation was delivered.
-	IssueRecoveryContinued IssueRecoveryState = "continued"
+	// IssueRecoveryClaimed means the one attempt was atomically reserved, but
+	// delivery has not yet been demonstrated.
+	IssueRecoveryClaimed IssueRecoveryState = "claimed"
+	// IssueRecoverySent means the protected send returned successfully and the
+	// sent fact was durably recorded.
+	IssueRecoverySent IssueRecoveryState = "sent"
+	// IssueRecoveryUncertain means the process could have sent the continuation
+	// but did not settle the result. It is never retried.
+	IssueRecoveryUncertain IssueRecoveryState = "uncertain"
 	// IssueRecoveryComplete means an exact valid PR exists; no continuation is
 	// needed.
 	IssueRecoveryComplete IssueRecoveryState = "complete"
@@ -29,17 +36,23 @@ type IssueRecoveryReason string
 // Recovery reasons are closed and sanitized; they never include prompts or
 // arbitrary provider output.
 const (
-	IssueRecoveryReasonPRReady              IssueRecoveryReason = "pr_ready"
-	IssueRecoveryReasonIssuePRMissing       IssueRecoveryReason = "issue_pr_missing"
-	IssueRecoveryReasonBranchNotPushed      IssueRecoveryReason = "branch_not_pushed"
-	IssueRecoveryReasonPRNotReady           IssueRecoveryReason = "pr_not_ready"
-	IssueRecoveryReasonPushFailed           IssueRecoveryReason = "push_failed"
-	IssueRecoveryReasonAssociationInvalid   IssueRecoveryReason = "pr_association_invalid"
-	IssueRecoveryReasonOwnershipUnavailable IssueRecoveryReason = "ownership_unavailable"
-	IssueRecoveryReasonWorkerExited         IssueRecoveryReason = "worker_exited"
-	IssueRecoveryReasonContinuationSent     IssueRecoveryReason = "continuation_sent"
-	IssueRecoveryReasonContinuationFailed   IssueRecoveryReason = "continuation_failed"
-	IssueRecoveryReasonExhausted            IssueRecoveryReason = "continuation_exhausted"
+	IssueRecoveryReasonPRReady               IssueRecoveryReason = "pr_ready"
+	IssueRecoveryReasonIssuePRMissing        IssueRecoveryReason = "issue_pr_missing"
+	IssueRecoveryReasonBranchNotPushed       IssueRecoveryReason = "branch_not_pushed"
+	IssueRecoveryReasonPRNotReady            IssueRecoveryReason = "pr_not_ready"
+	IssueRecoveryReasonPushFailed            IssueRecoveryReason = "push_failed"
+	IssueRecoveryReasonAssociationInvalid    IssueRecoveryReason = "pr_association_invalid"
+	IssueRecoveryReasonOwnershipUnavailable  IssueRecoveryReason = "ownership_unavailable"
+	IssueRecoveryReasonWorkerExited          IssueRecoveryReason = "worker_exited"
+	IssueRecoveryReasonContinuationClaimed   IssueRecoveryReason = "continuation_claimed"
+	IssueRecoveryReasonContinuationSent      IssueRecoveryReason = "continuation_sent"
+	IssueRecoveryReasonContinuationUncertain IssueRecoveryReason = "continuation_uncertain"
+	IssueRecoveryReasonContinuationFailed    IssueRecoveryReason = "continuation_failed"
+	IssueRecoveryReasonExhausted             IssueRecoveryReason = "continuation_exhausted"
+	IssueRecoveryReasonDeliveryUnsupported   IssueRecoveryReason = "delivery_unsupported"
+	IssueRecoveryReasonDeliveryNotIdle       IssueRecoveryReason = "delivery_not_idle"
+	IssueRecoveryReasonTurnNotCompleted      IssueRecoveryReason = "turn_not_completed"
+	IssueRecoveryReasonFinalValidation       IssueRecoveryReason = "final_validation_failed"
 )
 
 // IssueRecovery is the durable, at-most-once continuation record for one
@@ -62,5 +75,6 @@ type IssueRecovery struct {
 	HeadSHA           string
 	ObservedAt        time.Time
 	AttemptedAt       *time.Time
+	SentAt            *time.Time
 	UpdatedAt         time.Time
 }

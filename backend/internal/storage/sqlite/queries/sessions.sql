@@ -355,6 +355,7 @@ UPDATE sessions SET
     provision_error = '',
     client_request_id = sqlc.arg(client_request_id),
     client_request_hash = sqlc.arg(client_request_hash),
+    recovery_eligible = CASE WHEN sqlc.arg(issue_id) <> '' THEN 1 ELSE recovery_eligible END,
     is_task_preparation = 0
 WHERE id = sqlc.arg(id) AND is_task_preparation = 1;
 

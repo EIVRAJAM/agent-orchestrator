@@ -13,10 +13,11 @@ import (
 
 const claimIssueRecovery = `-- name: ClaimIssueRecovery :execrows
 UPDATE issue_recovery
-SET state = 'continued',
-    reason = 'continuation_sent',
+SET state = 'claimed',
+    reason = 'continuation_claimed',
     attempts = 1,
     attempted_at = ?1,
+    sent_at = NULL,
     updated_at = ?2
 WHERE session_id = ?3
   AND instance_id = ?4
@@ -154,14 +155,34 @@ func (q *Queries) FinishIssueRecovery(ctx context.Context, arg FinishIssueRecove
 const getIssueRecovery = `-- name: GetIssueRecovery :one
 SELECT session_id, issue_id, instance_id, state, reason, attempts,
        local_commits, local_changes, local_changes_known, push, turn, pr_url, head_sha, observed_at,
-       attempted_at, updated_at
+       attempted_at, sent_at, updated_at
 FROM issue_recovery
 WHERE session_id = ?
 `
 
-func (q *Queries) GetIssueRecovery(ctx context.Context, sessionID string) (IssueRecovery, error) {
+type GetIssueRecoveryRow struct {
+	SessionID         string
+	IssueID           string
+	InstanceID        string
+	State             string
+	Reason            string
+	Attempts          int64
+	LocalCommits      int64
+	LocalChanges      int64
+	LocalChangesKnown int64
+	Push              string
+	Turn              string
+	PRURL             string
+	HeadSha           string
+	ObservedAt        time.Time
+	AttemptedAt       sql.NullTime
+	SentAt            sql.NullTime
+	UpdatedAt         time.Time
+}
+
+func (q *Queries) GetIssueRecovery(ctx context.Context, sessionID string) (GetIssueRecoveryRow, error) {
 	row := q.db.QueryRowContext(ctx, getIssueRecovery, sessionID)
-	var i IssueRecovery
+	var i GetIssueRecoveryRow
 	err := row.Scan(
 		&i.SessionID,
 		&i.IssueID,
@@ -178,9 +199,65 @@ func (q *Queries) GetIssueRecovery(ctx context.Context, sessionID string) (Issue
 		&i.HeadSha,
 		&i.ObservedAt,
 		&i.AttemptedAt,
+		&i.SentAt,
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const markIssueRecoverySent = `-- name: MarkIssueRecoverySent :execrows
+UPDATE issue_recovery
+SET state = 'sent',
+    reason = 'continuation_sent',
+    sent_at = ?1,
+    updated_at = ?2
+WHERE session_id = ?3
+  AND instance_id = ?4
+  AND state = 'claimed'
+`
+
+type MarkIssueRecoverySentParams struct {
+	SentAt     sql.NullTime
+	UpdatedAt  time.Time
+	SessionID  string
+	InstanceID string
+}
+
+func (q *Queries) MarkIssueRecoverySent(ctx context.Context, arg MarkIssueRecoverySentParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markIssueRecoverySent,
+		arg.SentAt,
+		arg.UpdatedAt,
+		arg.SessionID,
+		arg.InstanceID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markIssueRecoveryUncertain = `-- name: MarkIssueRecoveryUncertain :execrows
+UPDATE issue_recovery
+SET state = 'uncertain',
+    reason = 'continuation_uncertain',
+    updated_at = ?1
+WHERE session_id = ?2
+  AND instance_id = ?3
+  AND state IN ('claimed', 'continued')
+`
+
+type MarkIssueRecoveryUncertainParams struct {
+	UpdatedAt  time.Time
+	SessionID  string
+	InstanceID string
+}
+
+func (q *Queries) MarkIssueRecoveryUncertain(ctx context.Context, arg MarkIssueRecoveryUncertainParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markIssueRecoveryUncertain, arg.UpdatedAt, arg.SessionID, arg.InstanceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const updateIssueRecoveryObservation = `-- name: UpdateIssueRecoveryObservation :execrows
@@ -197,7 +274,7 @@ SET reason = ?1,
     updated_at = ?10
 WHERE session_id = ?11
   AND instance_id = ?12
-  AND state IN ('observing', 'continued')
+  AND state IN ('observing', 'claimed', 'continued')
 `
 
 type UpdateIssueRecoveryObservationParams struct {

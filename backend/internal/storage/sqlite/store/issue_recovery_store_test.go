@@ -41,6 +41,13 @@ func TestIssueRecoveryAttemptSurvivesReopen(t *testing.T) {
 	if claimed, err := store.ClaimIssueRecovery(ctx, created.ID, created.InstanceID, now); err != nil || !claimed {
 		t.Fatalf("claim = claimed=%v err=%v", claimed, err)
 	}
+	claimed, found, err := store.GetIssueRecovery(ctx, created.ID)
+	if err != nil || !found || claimed.State != domain.IssueRecoveryClaimed || claimed.SentAt != nil || claimed.Attempts != 1 {
+		t.Fatalf("claimed recovery = found=%v row=%+v err=%v, want claimed without sent_at", found, claimed, err)
+	}
+	if marked, err := store.MarkIssueRecoverySent(ctx, created.ID, created.InstanceID, now); err != nil || !marked {
+		t.Fatalf("mark sent = marked=%v err=%v", marked, err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -58,8 +65,8 @@ func TestIssueRecoveryAttemptSurvivesReopen(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("get after reopen = found=%v err=%v", found, err)
 	}
-	if got.Attempts != 1 || got.State != domain.IssueRecoveryContinued || got.AttemptedAt == nil || !got.LocalChanges || !got.LocalChangesKnown {
-		t.Fatalf("persisted recovery = %+v, want one continued attempt", got)
+	if got.Attempts != 1 || got.State != domain.IssueRecoverySent || got.AttemptedAt == nil || got.SentAt == nil || !got.LocalChanges || !got.LocalChangesKnown {
+		t.Fatalf("persisted recovery = %+v, want one sent attempt", got)
 	}
 	if claimed, err := reopened.ClaimIssueRecovery(ctx, created.ID, created.InstanceID, now.Add(time.Minute)); err != nil || claimed {
 		t.Fatalf("second claim after reopen = claimed=%v err=%v, want false", claimed, err)
@@ -71,5 +78,45 @@ func TestIssueRecoveryAttemptSurvivesReopen(t *testing.T) {
 	}
 	if claimed, err := reopened.ClaimIssueRecovery(ctx, created.ID, created.InstanceID, now.Add(2*time.Minute)); err != nil || claimed {
 		t.Fatalf("claim after terminal = claimed=%v err=%v, want false", claimed, err)
+	}
+}
+
+func TestTaskPreparationPromotionControlsRecoveryEligibility(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	store, err := sqlitetest.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedProject(t, store, "prep-recovery")
+	prepRec := sampleRecord("prep-recovery")
+	prepRec.IsTaskPreparation = true
+	prepRec.IssueID = ""
+	created, err := store.CreateSession(ctx, prepRec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.RecoveryEligible {
+		t.Fatal("unpromoted task preparation was marked recovery eligible")
+	}
+
+	visible := created
+	visible.IsTaskPreparation = false
+	visible.IssueID = "github:acme/demo#1"
+	visible.Kind = domain.KindWorker
+	if promoted, err := store.PromoteTaskPreparation(ctx, created.ID, visible); err != nil || !promoted {
+		t.Fatalf("promote = promoted=%v err=%v", promoted, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopened.Close() }()
+	got, found, err := reopened.GetSession(ctx, created.ID)
+	if err != nil || !found || !got.RecoveryEligible {
+		t.Fatalf("reopened promoted preparation = found=%v eligible=%v err=%v, want eligible", found, got.RecoveryEligible, err)
 	}
 }

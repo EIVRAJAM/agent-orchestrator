@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
-	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
 )
 
@@ -24,6 +24,8 @@ type Store interface {
 	EnsureIssueRecovery(ctx context.Context, rec domain.IssueRecovery) (bool, error)
 	UpdateIssueRecoveryObservation(ctx context.Context, rec domain.IssueRecovery) (bool, error)
 	ClaimIssueRecovery(ctx context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error)
+	MarkIssueRecoverySent(ctx context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error)
+	MarkIssueRecoveryUncertain(ctx context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error)
 	FinishIssueRecovery(ctx context.Context, rec domain.IssueRecovery, now time.Time) (bool, error)
 }
 
@@ -33,11 +35,11 @@ type Sessions interface {
 	Get(ctx context.Context, id domain.SessionID) (domain.Session, error)
 }
 
-// Sender delivers a recovery prompt through the normal session path. It must
-// target the same session; this package never creates a session or invokes a
-// provider directly.
+// Sender delivers a recovery prompt through the manager's protected send
+// boundary. It must target the same session and fail closed if the worker is
+// active, its turn is incomplete, or an exact PR appeared before delivery.
 type Sender interface {
-	Send(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment) error
+	SendRecovery(ctx context.Context, id domain.SessionID, message, expectedInstanceID string, expectedIssueID domain.IssueID) error
 }
 
 // Service is a bounded issue-worker continuation loop.
@@ -49,6 +51,9 @@ type Service struct {
 	clock    func() time.Time
 	tick     time.Duration
 	inspect  func(context.Context, string) (bool, bool)
+	// inFlight distinguishes this process's active claim from a claimed row
+	// recovered after a crash or owned by another process.
+	inFlight sync.Map
 }
 
 // New constructs a recovery service. A nil logger uses the package default.
@@ -161,6 +166,55 @@ func (s *Service) evaluate(ctx context.Context, sess domain.Session, now time.Ti
 	if prior.State == domain.IssueRecoveryComplete {
 		return
 	}
+	switch prior.State {
+	case domain.IssueRecoveryClaimed:
+		// This service must not treat its own in-flight claim as a crash. A row
+		// claimed by a previous process is ambiguous; it is terminal uncertainty,
+		// never a reason to send a second prompt.
+		if _, active := s.inFlight.Load(rec.ID); active {
+			return
+		}
+		if _, err := s.store.MarkIssueRecoveryUncertain(ctx, rec.ID, rec.InstanceID, now); err != nil {
+			s.logger.Warn("issue recovery: uncertain state write failed", "session", rec.ID)
+		}
+		return
+	case domain.IssueRecoveryUncertain:
+		return
+	case domain.IssueRecoverySent:
+		// The one continuation was demonstrably sent. Never send again.
+		if rec.Activity.State == domain.ActivityExited {
+			s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonWorkerExited, now)
+			return
+		}
+		if rec.Activity.State == domain.ActivityIdle {
+			s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonExhausted, now)
+		}
+		return
+	case domain.IssueRecoveryIncomplete:
+		return
+	case domain.IssueRecoveryState("continued"):
+		// Compatibility with the unshipped intermediate shape. A claim without
+		// a settled sent result is uncertain, not proof of delivery.
+		if _, err := s.store.MarkIssueRecoveryUncertain(ctx, rec.ID, rec.InstanceID, now); err != nil {
+			s.logger.Warn("issue recovery: uncertain state write failed", "session", rec.ID)
+		}
+		return
+	}
+	if prior.State != domain.IssueRecoveryObserving {
+		return
+	}
+	if prior.Attempts >= 1 {
+		// A row in observing with a consumed attempt is a pre-existing/incomplete
+		// claim shape. Never try to claim it again.
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonExhausted, now)
+		return
+	}
+	// A turn is eligible only when a durable completed checkpoint exists. Idle
+	// alone, an interrupted turn, or an unknown turn cannot consume the attempt.
+	if pub.Turn != domain.IssuePublicationTurnCompleted {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonTurnNotCompleted, now)
+		return
+	}
 	if !recoverable(pub) {
 		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, recoveryReason(pub), now)
 		return
@@ -169,13 +223,13 @@ func (s *Service) evaluate(ctx context.Context, sess domain.Session, now time.Ti
 		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonWorkerExited, now)
 		return
 	}
-	if prior.State == domain.IssueRecoveryIncomplete || prior.Attempts >= 1 {
-		// A prior continuation either failed or was already consumed. Idle again
-		// without a valid PR is terminal; never start another execution.
-		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonExhausted, now)
+	if rec.Activity.State != domain.ActivityIdle {
 		return
 	}
-	if prior.State != domain.IssueRecoveryObserving {
+	if domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat {
+		// Recovery has no atomic pane-write primitive for TUI. Fail closed rather
+		// than claim an attempt whose protected delivery cannot be guaranteed.
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonDeliveryUnsupported, now)
 		return
 	}
 	observed.State = domain.IssueRecoveryObserving
@@ -190,11 +244,49 @@ func (s *Service) evaluate(ctx context.Context, sess domain.Session, now time.Ti
 		}
 		return
 	}
-	if err := s.sender.Send(ctx, rec.ID, continuationPrompt(rec, pub), nil); err != nil {
-		observed.State = domain.IssueRecoveryIncomplete
-		observed.Reason = domain.IssueRecoveryReasonContinuationFailed
+	s.inFlight.Store(rec.ID, struct{}{})
+	defer s.inFlight.Delete(rec.ID)
+	// Re-read exactly before the protected send. This closes the ordinary
+	// publication/active window as far as the external SCM observer permits;
+	// the session manager still performs its own atomic idle/send check.
+	latest, err := s.sessions.Get(ctx, rec.ID)
+	if err != nil {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonFinalValidation, now)
+		return
+	}
+	if latest.InstanceID != rec.InstanceID || latest.IssueID != rec.IssueID ||
+		latest.IsTerminated || latest.IssuePublication == nil {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonFinalValidation, now)
+		return
+	}
+	latestPub := latest.IssuePublication
+	if latestPub.State == domain.IssuePublicationPRReady {
+		s.finish(ctx, observed, domain.IssueRecoveryComplete, domain.IssueRecoveryReasonPRReady, now)
+		return
+	}
+	if latestPub.Turn != domain.IssuePublicationTurnCompleted {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonTurnNotCompleted, now)
+		return
+	}
+	if !recoverable(latestPub) {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, recoveryReason(latestPub), now)
+		return
+	}
+	if latest.Activity.State == domain.ActivityExited {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonWorkerExited, now)
+		return
+	}
+	if latest.Activity.State != domain.ActivityIdle || domain.NormalizeSessionMode(latest.Mode) != domain.SessionModeChat {
+		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonDeliveryNotIdle, now)
+		return
+	}
+	if err := s.sender.SendRecovery(ctx, rec.ID, continuationPrompt(latest.SessionRecord, latestPub), rec.InstanceID, rec.IssueID); err != nil {
 		s.finish(ctx, observed, domain.IssueRecoveryIncomplete, domain.IssueRecoveryReasonContinuationFailed, now)
-		s.logger.Warn("issue recovery: continuation delivery failed", "session", rec.ID)
+		s.logger.Warn("issue recovery: protected continuation delivery failed", "session", rec.ID)
+		return
+	}
+	if _, err := s.store.MarkIssueRecoverySent(ctx, rec.ID, rec.InstanceID, now); err != nil {
+		s.logger.Warn("issue recovery: sent state write failed; leaving claim uncertain", "session", rec.ID)
 		return
 	}
 	s.logger.Info("issue recovery: continuation delivered", "session", rec.ID, "attempts", 1)

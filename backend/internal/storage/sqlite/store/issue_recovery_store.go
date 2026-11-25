@@ -71,6 +71,40 @@ func (s *Store) ClaimIssueRecovery(ctx context.Context, id domain.SessionID, ins
 	return rows > 0, nil
 }
 
+// MarkIssueRecoverySent records that the protected send returned successfully.
+// It only transitions a row still in claimed, so a crash or a competing process
+// cannot turn an unproven delivery into sent.
+func (s *Store) MarkIssueRecoverySent(ctx context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.MarkIssueRecoverySent(ctx, gen.MarkIssueRecoverySentParams{
+		SentAt:     sql.NullTime{Time: now, Valid: true},
+		UpdatedAt:  now,
+		SessionID:  string(id),
+		InstanceID: instanceID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("mark issue recovery sent %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
+// MarkIssueRecoveryUncertain makes a claimed attempt terminal without claiming
+// delivery. It is used when the process cannot prove the send result.
+func (s *Store) MarkIssueRecoveryUncertain(ctx context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	rows, err := s.qw.MarkIssueRecoveryUncertain(ctx, gen.MarkIssueRecoveryUncertainParams{
+		UpdatedAt:  now,
+		SessionID:  string(id),
+		InstanceID: instanceID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("mark issue recovery uncertain %s: %w", id, err)
+	}
+	return rows > 0, nil
+}
+
 // UpdateIssueRecoveryObservation refreshes sanitized publication evidence on a
 // non-terminal recovery row without changing its attempt count.
 func (s *Store) UpdateIssueRecoveryObservation(ctx context.Context, rec domain.IssueRecovery) (bool, error) {
@@ -121,11 +155,16 @@ func (s *Store) FinishIssueRecovery(ctx context.Context, rec domain.IssueRecover
 	return rows > 0, nil
 }
 
-func issueRecoveryFromRow(row gen.IssueRecovery) domain.IssueRecovery {
+func issueRecoveryFromRow(row gen.GetIssueRecoveryRow) domain.IssueRecovery {
 	var attemptedAt *time.Time
 	if row.AttemptedAt.Valid {
 		t := row.AttemptedAt.Time
 		attemptedAt = &t
+	}
+	var sentAt *time.Time
+	if row.SentAt.Valid {
+		t := row.SentAt.Time
+		sentAt = &t
 	}
 	return domain.IssueRecovery{
 		SessionID:         domain.SessionID(row.SessionID),
@@ -143,6 +182,7 @@ func issueRecoveryFromRow(row gen.IssueRecovery) domain.IssueRecovery {
 		HeadSHA:           row.HeadSha,
 		ObservedAt:        row.ObservedAt,
 		AttemptedAt:       attemptedAt,
+		SentAt:            sentAt,
 		UpdatedAt:         row.UpdatedAt,
 	}
 }

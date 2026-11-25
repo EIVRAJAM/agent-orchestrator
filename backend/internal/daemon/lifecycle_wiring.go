@@ -699,6 +699,10 @@ func (c chatLauncher) RelaySessionChatTurn(ctx context.Context, id domain.Sessio
 	return c.svc.RelaySessionChatTurn(ctx, id, text, clientMessageID, options)
 }
 
+func (c chatLauncher) RelaySessionChatTurnIfIdle(ctx context.Context, id domain.SessionID, text string) error {
+	return c.svc.RelaySessionChatTurnIfIdle(ctx, id, text)
+}
+
 func (c chatLauncher) QueueChatPrompt(ctx context.Context, id domain.SessionID, text string) (string, error) {
 	turn, err := c.svc.QueueUserMessage(ctx, id, ports.ChatUserMessage{
 		Text: text,

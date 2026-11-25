@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
-	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 type fakeStore struct {
@@ -55,7 +54,7 @@ func (f *fakeStore) UpdateIssueRecoveryObservation(_ context.Context, rec domain
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	row, ok := f.rows[rec.SessionID]
-	if !ok || row.InstanceID != rec.InstanceID || (row.State != domain.IssueRecoveryObserving && row.State != domain.IssueRecoveryContinued) {
+	if !ok || row.InstanceID != rec.InstanceID || (row.State != domain.IssueRecoveryObserving && row.State != domain.IssueRecoveryClaimed) {
 		return false, nil
 	}
 	row.Reason, row.LocalCommits, row.Push, row.Turn = rec.Reason, rec.LocalCommits, rec.Push, rec.Turn
@@ -72,10 +71,39 @@ func (f *fakeStore) ClaimIssueRecovery(_ context.Context, id domain.SessionID, i
 	if !ok || row.InstanceID != instanceID || row.State != domain.IssueRecoveryObserving || row.Attempts != 0 {
 		return false, nil
 	}
-	row.State = domain.IssueRecoveryContinued
-	row.Reason = domain.IssueRecoveryReasonContinuationSent
+	row.State = domain.IssueRecoveryClaimed
+	row.Reason = domain.IssueRecoveryReasonContinuationClaimed
 	row.Attempts = 1
 	row.AttemptedAt = &now
+	row.SentAt = nil
+	f.rows[id] = row
+	return true, nil
+}
+
+func (f *fakeStore) MarkIssueRecoverySent(_ context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[id]
+	if !ok || row.InstanceID != instanceID || row.State != domain.IssueRecoveryClaimed {
+		return false, nil
+	}
+	row.State = domain.IssueRecoverySent
+	row.Reason = domain.IssueRecoveryReasonContinuationSent
+	row.SentAt = &now
+	f.rows[id] = row
+	return true, nil
+}
+
+func (f *fakeStore) MarkIssueRecoveryUncertain(_ context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row, ok := f.rows[id]
+	if !ok || row.InstanceID != instanceID || row.State != domain.IssueRecoveryClaimed && row.State != domain.IssueRecoveryState("continued") {
+		return false, nil
+	}
+	row.State = domain.IssueRecoveryUncertain
+	row.Reason = domain.IssueRecoveryReasonContinuationUncertain
+	row.UpdatedAt = now
 	f.rows[id] = row
 	return true, nil
 }
@@ -107,6 +135,23 @@ func (f fakeSessions) Get(_ context.Context, id domain.SessionID) (domain.Sessio
 	return sess, nil
 }
 
+type sequenceSessions struct {
+	mu    sync.Mutex
+	first domain.Session
+	after domain.Session
+	calls int
+}
+
+func (s *sequenceSessions) Get(_ context.Context, _ domain.SessionID) (domain.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == 1 {
+		return s.first, nil
+	}
+	return s.after, nil
+}
+
 type fakeSender struct {
 	mu      sync.Mutex
 	ids     []domain.SessionID
@@ -114,7 +159,7 @@ type fakeSender struct {
 	err     error
 }
 
-func (f *fakeSender) Send(_ context.Context, id domain.SessionID, message string, _ *ports.SpawnAttachment) error {
+func (f *fakeSender) SendRecovery(_ context.Context, id domain.SessionID, message, _ string, _ domain.IssueID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ids = append(f.ids, id)
@@ -128,9 +173,11 @@ func recoveryFixture(incompleteReason domain.IssuePublicationReason, commits int
 		IssueID:          "github:acme/demo#1",
 		InstanceID:       "inst-1",
 		Kind:             domain.KindWorker,
+		Mode:             domain.SessionModeChat,
 		RecoveryEligible: true,
 		Activity:         domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Unix(100, 0).UTC()},
 		FirstSignalAt:    time.Unix(100, 0).UTC(),
+		Metadata:         domain.SessionMetadata{ConversationCheckpointState: domain.ConversationCheckpointComplete},
 	}
 	if commits > 0 {
 		rec.BranchState = &domain.SessionBranchState{Branch: "ao/worker-1/task", HeadSHA: "head-1", Commits: commits, Unpushed: commits}
@@ -138,7 +185,7 @@ func recoveryFixture(incompleteReason domain.IssuePublicationReason, commits int
 	pub := &domain.IssuePublication{
 		State:             domain.IssuePublicationIncomplete,
 		Reason:            incompleteReason,
-		Turn:              domain.IssuePublicationTurnUnknown,
+		Turn:              domain.IssuePublicationTurnCompleted,
 		Push:              domain.IssuePublicationPushUnknown,
 		LocalCommits:      commits,
 		BranchPushed:      false,
@@ -170,7 +217,7 @@ func TestIncompleteWorkerGetsAtMostOneContinuation(t *testing.T) {
 		t.Fatalf("continuation prompt = %q", sender.prompts[0])
 	}
 	row := store.rows["worker-1"]
-	if row.State != domain.IssueRecoveryContinued || row.Attempts != 1 || row.AttemptedAt == nil {
+	if row.State != domain.IssueRecoverySent || row.Attempts != 1 || row.AttemptedAt == nil || row.SentAt == nil {
 		t.Fatalf("recovery row = %+v, want continued with one attempt", row)
 	}
 	runScan(t, sess, store, sender)
@@ -381,6 +428,112 @@ func TestActivityIdleRemainsActivityOnly(t *testing.T) {
 	}
 }
 
+func TestTurnUnknownDoesNotClaimOrSend(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sess.IssuePublication.Turn = domain.IssuePublicationTurnUnknown
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 0 || store.claims != 0 {
+		t.Fatalf("unknown turn started recovery: sends=%d claims=%d", len(sender.ids), store.claims)
+	}
+	row := store.rows["worker-1"]
+	if row.State != domain.IssueRecoveryIncomplete || row.Reason != domain.IssueRecoveryReasonTurnNotCompleted || row.Attempts != 0 {
+		t.Fatalf("unknown turn row = %+v, want incomplete/turn_not_completed with zero attempts", row)
+	}
+}
+
+func TestCompletedTurnAllowsOneContinuation(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sess.IssuePublication.Turn = domain.IssuePublicationTurnCompleted
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 1 || store.claims != 1 {
+		t.Fatalf("completed turn = sends=%d claims=%d, want one each", len(sender.ids), store.claims)
+	}
+	row := store.rows["worker-1"]
+	if row.State != domain.IssueRecoverySent || row.SentAt == nil {
+		t.Fatalf("completed turn row = %+v, want sent with sent_at", row)
+	}
+}
+
+func TestFinalExactPRBeforeProtectedSendDoesNotSend(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	after := sess
+	after.IssuePublication = &domain.IssuePublication{
+		State: domain.IssuePublicationPRReady, Turn: domain.IssuePublicationTurnCompleted,
+		PRURL: "https://example.test/pull/1", HeadSHA: "head-1", BranchPushed: true,
+	}
+	seq := &sequenceSessions{first: sess, after: after}
+	svc := New(store, seq, sender, nil, time.Minute)
+	svc.clock = func() time.Time { return time.Unix(200, 0).UTC() }
+	if err := svc.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.ids) != 0 {
+		t.Fatalf("sent after final PR-ready revalidation: %d", len(sender.ids))
+	}
+	row := store.rows["worker-1"]
+	if row.State != domain.IssueRecoveryComplete || row.Attempts != 1 || row.SentAt != nil {
+		t.Fatalf("final PR row = %+v, want complete without sent_at", row)
+	}
+}
+
+func TestActiveBeforeProtectedSendDoesNotSend(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	after := sess
+	after.Activity.State = domain.ActivityActive
+	after.IssuePublication = nil
+	seq := &sequenceSessions{first: sess, after: after}
+	svc := New(store, seq, sender, nil, time.Minute)
+	svc.clock = func() time.Time { return time.Unix(200, 0).UTC() }
+	if err := svc.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.ids) != 0 {
+		t.Fatalf("active worker received %d protected sends", len(sender.ids))
+	}
+	if row := store.rows["worker-1"]; row.State != domain.IssueRecoveryIncomplete || row.SentAt != nil {
+		t.Fatalf("active final row = %+v, want incomplete without sent_at", row)
+	}
+}
+
+func TestTUIWorkerFailsClosedWithoutClaim(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sess.Mode = domain.SessionModeTUI
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 0 || store.claims != 0 {
+		t.Fatalf("TUI worker started recovery: sends=%d claims=%d", len(sender.ids), store.claims)
+	}
+	row := store.rows["worker-1"]
+	if row.State != domain.IssueRecoveryIncomplete || row.Reason != domain.IssueRecoveryReasonDeliveryUnsupported {
+		t.Fatalf("TUI row = %+v, want delivery_unsupported", row)
+	}
+}
+
+func TestClaimedAttemptAfterCrashBecomesUncertainWithoutSend(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	store.rows["worker-1"] = domain.IssueRecovery{
+		SessionID: "worker-1", IssueID: sess.IssueID, InstanceID: "inst-1",
+		State: domain.IssueRecoveryClaimed, Attempts: 1,
+	}
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 0 {
+		t.Fatalf("sent after a claimed/crashed attempt: %d", len(sender.ids))
+	}
+	row := store.rows["worker-1"]
+	if row.State != domain.IssueRecoveryUncertain || row.SentAt != nil || row.Attempts != 1 {
+		t.Fatalf("claimed crash row = %+v, want uncertain without sent_at", row)
+	}
+}
+
+func TestSendFailureIsNotRecordedAsSent(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sender.err = errors.New("protected delivery unavailable")
+	runScan(t, sess, store, sender)
+	row := store.rows["worker-1"]
+	if row.State != domain.IssueRecoveryIncomplete || row.Reason != domain.IssueRecoveryReasonContinuationFailed || row.SentAt != nil {
+		t.Fatalf("send failure row = %+v, want incomplete without sent_at", row)
+	}
+}
+
 func TestClaimFailureDoesNotSend(t *testing.T) {
 	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
 	store.rows["worker-1"] = domain.IssueRecovery{
@@ -390,5 +543,8 @@ func TestClaimFailureDoesNotSend(t *testing.T) {
 	runScan(t, sess, store, sender)
 	if len(sender.ids) != 0 {
 		t.Fatalf("sent after an already consumed attempt: %d", len(sender.ids))
+	}
+	if row := store.rows["worker-1"]; row.State != domain.IssueRecoveryIncomplete || row.Reason != domain.IssueRecoveryReasonExhausted {
+		t.Fatalf("consumed attempt row = %+v, want exhausted", row)
 	}
 }

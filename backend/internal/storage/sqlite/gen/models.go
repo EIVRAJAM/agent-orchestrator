@@ -419,6 +419,7 @@ type IssueRecovery struct {
 	ObservedAt        time.Time
 	AttemptedAt       sql.NullTime
 	UpdatedAt         time.Time
+	SentAt            sql.NullTime
 }
 
 type ModelUsageEvent struct {
