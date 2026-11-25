@@ -61,6 +61,7 @@ type lifecycleStack struct {
 	scmDone              <-chan struct{}
 	trackerDone          <-chan struct{}
 	trackerWritebackDone <-chan struct{}
+	issueRecoveryDone    <-chan struct{}
 	herdr                *herdr.Server
 	automationDone       <-chan struct{}
 }
@@ -188,6 +189,9 @@ func (l *lifecycleStack) Stop() {
 	}
 	if l.trackerWritebackDone != nil {
 		<-l.trackerWritebackDone
+	}
+	if l.issueRecoveryDone != nil {
+		<-l.issueRecoveryDone
 	}
 	if l.automationDone != nil {
 		<-l.automationDone

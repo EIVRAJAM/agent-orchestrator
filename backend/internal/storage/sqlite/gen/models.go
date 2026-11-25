@@ -402,6 +402,25 @@ type Cue struct {
 	UpdatedAt time.Time
 }
 
+type IssueRecovery struct {
+	SessionID         string
+	IssueID           string
+	InstanceID        string
+	State             string
+	Reason            string
+	Attempts          int64
+	LocalCommits      int64
+	LocalChanges      int64
+	LocalChangesKnown int64
+	Push              string
+	Turn              string
+	PRURL             string
+	HeadSha           string
+	ObservedAt        time.Time
+	AttemptedAt       sql.NullTime
+	UpdatedAt         time.Time
+}
+
 type ModelUsageEvent struct {
 	ID                    int64
 	BindingID             int64

@@ -61,6 +61,7 @@ import (
 	fsbrowsersvc "github.com/aoagents/agent-orchestrator/backend/internal/service/fsbrowser"
 	"github.com/aoagents/agent-orchestrator/backend/internal/service/githubpat"
 	importsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/importer"
+	issuerecovery "github.com/aoagents/agent-orchestrator/backend/internal/service/issuerecovery"
 	linkpreviewsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/linkpreview"
 	notificationsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/notification"
 	prsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/pr"
@@ -639,6 +640,10 @@ func Run() error {
 		},
 	})
 	sessMgr = wiredSessMgr
+	// Recovery uses the existing publication read and session send paths. It
+	// never creates sessions or performs push/PR/comment side effects itself.
+	issueRecovery := issuerecovery.New(store, sessionSvc, sessMgr, log, 30*time.Second)
+	lcStack.issueRecoveryDone = issueRecovery.Start(ctx)
 	if runner, ok := sessMgr.(interface {
 		RunPromptSuggestionTask(context.Context, domain.SessionID, string, string, string) (string, error)
 	}); ok {
