@@ -46,6 +46,10 @@ var nativeHistoryLoadAttemptLimit = 30 * time.Second
 
 var errNativeHistoryLoadAttemptTimeout = errors.New("native history load attempt exceeded its time limit")
 
+// ErrControllerBusy means a protected send found a live turn, dispatch marker,
+// or queued backlog. It is a refusal, never a queued delivery.
+var ErrControllerBusy = errors.New("chat controller is busy")
+
 // Store is the durable conversation surface the controller needs. Implemented by
 // the SQLite store.
 type Store interface {
@@ -1573,6 +1577,33 @@ func (c *Controller) Send(ctx context.Context, msg ports.ChatUserMessage) (domai
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	return c.sendLocked(ctx, msg, true)
+}
+
+// SendIfIdle dispatches only when the controller has no running turn, no
+// dispatch in progress, and no queued/retained backlog. The check and append are
+// both under sendMu, so no ordinary send can slip between them and queue a
+// recovery prompt into an active turn.
+func (c *Controller) SendIfIdle(ctx context.Context, msg ports.ChatUserMessage) (domain.ConversationTurn, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	c.mu.Lock()
+	dispatching := c.dispatchingTurnID != ""
+	c.mu.Unlock()
+	if c.busy() || dispatching {
+		return domain.ConversationTurn{}, ErrControllerBusy
+	}
+	retained, err := c.retainedBacklog(ctx)
+	if err != nil || retained {
+		return domain.ConversationTurn{}, ErrControllerBusy
+	}
+	backlog, err := c.hasQueuedBacklog(ctx)
+	if err != nil || backlog {
+		return domain.ConversationTurn{}, ErrControllerBusy
+	}
+	if c.queueRecoveryHeld() {
+		return domain.ConversationTurn{}, ErrControllerBusy
+	}
+	return c.sendLocked(ctx, msg, false)
 }
 
 func (c *Controller) sendLocked(

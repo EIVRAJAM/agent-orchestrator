@@ -61,6 +61,7 @@ type lifecycleStack struct {
 	scmDone              <-chan struct{}
 	trackerDone          <-chan struct{}
 	trackerWritebackDone <-chan struct{}
+	issueRecoveryDone    <-chan struct{}
 	herdr                *herdr.Server
 	automationDone       <-chan struct{}
 }
@@ -188,6 +189,9 @@ func (l *lifecycleStack) Stop() {
 	}
 	if l.trackerWritebackDone != nil {
 		<-l.trackerWritebackDone
+	}
+	if l.issueRecoveryDone != nil {
+		<-l.issueRecoveryDone
 	}
 	if l.automationDone != nil {
 		<-l.automationDone
@@ -693,6 +697,10 @@ func (c chatLauncher) StartChatTurn(ctx context.Context, id domain.SessionID, te
 
 func (c chatLauncher) RelaySessionChatTurn(ctx context.Context, id domain.SessionID, text, clientMessageID string, options ports.MessageDeliveryOptions) (string, error) {
 	return c.svc.RelaySessionChatTurn(ctx, id, text, clientMessageID, options)
+}
+
+func (c chatLauncher) RelaySessionChatTurnIfIdle(ctx context.Context, id domain.SessionID, text string) error {
+	return c.svc.RelaySessionChatTurnIfIdle(ctx, id, text)
 }
 
 func (c chatLauncher) QueueChatPrompt(ctx context.Context, id domain.SessionID, text string) (string, error) {

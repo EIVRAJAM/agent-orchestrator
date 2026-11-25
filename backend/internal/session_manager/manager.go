@@ -107,7 +107,10 @@ var (
 	ErrAlreadyUsingHarness = errors.New("session: already using requested harness")
 	// ErrSwitchNotFound is returned for a switch id outside the requested AO
 	// session (the same response is used for absent and cross-session ids).
-	ErrSwitchNotFound = errors.New("session: agent switch not found")
+	ErrSwitchNotFound              = errors.New("session: agent switch not found")
+	ErrRecoveryDeliveryUnsupported = errors.New("session: protected recovery delivery is unsupported")
+	ErrRecoveryDeliveryNotIdle     = errors.New("session: protected recovery delivery requires an idle chat worker")
+	ErrRecoveryTurnNotComplete     = errors.New("session: protected recovery delivery requires a completed turn")
 	// ErrSwitchRecoveryNotRequired rejects recovery requests for switches that
 	// are terminal or do not carry a durable source-restore marker.
 	ErrSwitchRecoveryNotRequired = errors.New("session: agent switch does not require source recovery")
@@ -4591,6 +4594,53 @@ func (m *Manager) Send(ctx context.Context, id domain.SessionID, message string,
 	// Chat keeps its established automation relay attribution unless a trusted
 	// caller supplies the explicit user-authored fact through SendWithOptions.
 	return m.SendWithOptions(ctx, id, message, attachment, ports.MessageDeliveryOptions{})
+}
+
+// SendRecovery is the bounded issue-recovery send boundary. It re-reads the
+// exact session and only dispatches through a Chat controller that can prove it
+// is idle at the controller's send lock. A TUI worker, an active turn, an
+// incomplete checkpoint, or a queued backlog all fail closed without writing.
+func (m *Manager) SendRecovery(
+	ctx context.Context,
+	id domain.SessionID,
+	message, expectedInstanceID string,
+	expectedIssueID domain.IssueID,
+) error {
+	rec, ok, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	if rec.IsTerminated {
+		return ErrTerminated
+	}
+	if expectedInstanceID == "" || rec.InstanceID != expectedInstanceID || rec.IssueID != expectedIssueID {
+		return ErrRecoveryDeliveryNotIdle
+	}
+	if domain.NormalizeSessionMode(rec.Mode) != domain.SessionModeChat {
+		return ErrRecoveryDeliveryUnsupported
+	}
+	if rec.Activity.State != domain.ActivityIdle {
+		return ErrRecoveryDeliveryNotIdle
+	}
+	if rec.Metadata.ConversationCheckpointState != domain.ConversationCheckpointComplete ||
+		rec.FirstSignalAt.IsZero() {
+		return ErrRecoveryTurnNotComplete
+	}
+	if m.SessionMutationInProgress(id) {
+		return ErrRecoveryDeliveryNotIdle
+	}
+	launcher, ok := m.chat.(recoveryChatLauncher)
+	if !ok {
+		return ErrRecoveryDeliveryUnsupported
+	}
+	return launcher.RelaySessionChatTurnIfIdle(ctx, id, message)
+}
+
+type recoveryChatLauncher interface {
+	RelaySessionChatTurnIfIdle(ctx context.Context, id domain.SessionID, text string) error
 }
 
 // SendWithOptions delivers a message with caller-supplied authorship facts that

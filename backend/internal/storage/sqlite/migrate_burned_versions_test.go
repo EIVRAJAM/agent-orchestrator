@@ -207,6 +207,9 @@ var shippedMigrations = map[int64]string{
 	202: "0202_session_pr_ownership.sql",
 	203: "0203_tracker_writeback_head.sql",
 	204: "0204_repo_scoped_ownership.sql",
+	205: "0205_issue_recovery.sql",
+	206: "0206_session_recovery_eligibility.sql",
+	207: "0207_issue_recovery_delivery_state.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

@@ -251,7 +251,7 @@ SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     requested_output,
     provision_state, provision_error, provision_steps, branch_state, is_task_preparation, automation_run_id, automation_launch_completed,
     claude_activity_facts, codex_activity_facts,
-    hibernated_at
+    hibernated_at, recovery_eligible
 FROM sessions WHERE id = ?
 `
 
@@ -325,6 +325,7 @@ type GetSessionRow struct {
 	ClaudeActivityFacts              string
 	CodexActivityFacts               string
 	HibernatedAt                     sql.NullTime
+	RecoveryEligible                 int64
 }
 
 func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessionRow, error) {
@@ -400,6 +401,7 @@ func (q *Queries) GetSession(ctx context.Context, id domain.SessionID) (GetSessi
 		&i.ClaudeActivityFacts,
 		&i.CodexActivityFacts,
 		&i.HibernatedAt,
+		&i.RecoveryEligible,
 	)
 	return i, err
 }
@@ -421,7 +423,7 @@ SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     requested_output,
     provision_state, provision_error, provision_steps, branch_state, is_task_preparation, automation_run_id, automation_launch_completed,
     claude_activity_facts, codex_activity_facts,
-    hibernated_at
+    hibernated_at, recovery_eligible
 FROM sessions WHERE automation_run_id = ?
 `
 
@@ -495,6 +497,7 @@ type GetSessionByAutomationRunIDRow struct {
 	ClaudeActivityFacts              string
 	CodexActivityFacts               string
 	HibernatedAt                     sql.NullTime
+	RecoveryEligible                 int64
 }
 
 func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRunID *domain.AutomationRunID) (GetSessionByAutomationRunIDRow, error) {
@@ -570,6 +573,7 @@ func (q *Queries) GetSessionByAutomationRunID(ctx context.Context, automationRun
 		&i.ClaudeActivityFacts,
 		&i.CodexActivityFacts,
 		&i.HibernatedAt,
+		&i.RecoveryEligible,
 	)
 	return i, err
 }
@@ -590,7 +594,7 @@ INSERT INTO sessions (
     requested_output,
     created_at, updated_at, is_pinned, pinned_at, auto_inject_review, auto_inject_ci,
     provision_state, provision_error, is_task_preparation, automation_run_id, automation_launch_completed,
-    client_request_id, client_request_hash
+    client_request_id, client_request_hash, recovery_eligible
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
@@ -598,7 +602,7 @@ INSERT INTO sessions (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?
+    ?, ?, ?, ?
 )
 `
 
@@ -667,6 +671,7 @@ type InsertSessionParams struct {
 	AutomationLaunchCompleted        bool
 	ClientRequestID                  string
 	ClientRequestHash                string
+	RecoveryEligible                 int64
 }
 
 func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
@@ -735,6 +740,7 @@ func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) er
 		arg.AutomationLaunchCompleted,
 		arg.ClientRequestID,
 		arg.ClientRequestHash,
+		arg.RecoveryEligible,
 	)
 	return err
 }
@@ -756,7 +762,7 @@ SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     requested_output,
     provision_state, provision_error, provision_steps, branch_state, is_task_preparation, automation_run_id, automation_launch_completed,
     claude_activity_facts, codex_activity_facts,
-    hibernated_at
+    hibernated_at, recovery_eligible
 FROM sessions ORDER BY project_id, num
 `
 
@@ -830,6 +836,7 @@ type ListAllSessionsRow struct {
 	ClaudeActivityFacts              string
 	CodexActivityFacts               string
 	HibernatedAt                     sql.NullTime
+	RecoveryEligible                 int64
 }
 
 func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, error) {
@@ -911,6 +918,7 @@ func (q *Queries) ListAllSessions(ctx context.Context) ([]ListAllSessionsRow, er
 			&i.ClaudeActivityFacts,
 			&i.CodexActivityFacts,
 			&i.HibernatedAt,
+			&i.RecoveryEligible,
 		); err != nil {
 			return nil, err
 		}
@@ -975,7 +983,7 @@ SELECT id, instance_id, project_id, num, issue_id, kind, harness,
     requested_output,
     provision_state, provision_error, provision_steps, branch_state, is_task_preparation, automation_run_id, automation_launch_completed,
     claude_activity_facts, codex_activity_facts,
-    hibernated_at
+    hibernated_at, recovery_eligible
 FROM sessions WHERE project_id IS ? ORDER BY num
 `
 
@@ -1049,6 +1057,7 @@ type ListSessionsByProjectRow struct {
 	ClaudeActivityFacts              string
 	CodexActivityFacts               string
 	HibernatedAt                     sql.NullTime
+	RecoveryEligible                 int64
 }
 
 func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.ProjectID) ([]ListSessionsByProjectRow, error) {
@@ -1130,6 +1139,7 @@ func (q *Queries) ListSessionsByProject(ctx context.Context, projectID *domain.P
 			&i.ClaudeActivityFacts,
 			&i.CodexActivityFacts,
 			&i.HibernatedAt,
+			&i.RecoveryEligible,
 		); err != nil {
 			return nil, err
 		}
@@ -1189,6 +1199,7 @@ UPDATE sessions SET
     provision_error = '',
     client_request_id = ?18,
     client_request_hash = ?19,
+    recovery_eligible = CASE WHEN ?1 <> '' THEN 1 ELSE recovery_eligible END,
     is_task_preparation = 0
 WHERE id = ?20 AND is_task_preparation = 1
 `

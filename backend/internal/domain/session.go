@@ -283,7 +283,11 @@ type SessionRecord struct {
 	// surfaces as StatusNoSignal after a grace period. Internal fact, not part
 	// of the API read model.
 	FirstSignalAt time.Time `json:"-"`
-	IsTerminated  bool      `json:"isTerminated"`
+	// RecoveryEligible is a durable marker written only when this row is first
+	// created as an issue worker. Historical rows default false and must never
+	// be continued by an automatic recovery pass. Internal fact, not API state.
+	RecoveryEligible bool `json:"-"`
+	IsTerminated     bool `json:"isTerminated"`
 	// HibernatedAt records that the idle Chat controller was stopped while the
 	// session and conversation remain resumable. Nil means no recorded hibernation.
 	HibernatedAt *time.Time `json:"hibernatedAt,omitempty"`

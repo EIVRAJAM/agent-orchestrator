@@ -83,6 +83,8 @@ type recordingLauncher struct {
 	relayed             []string
 	relayOptions        []ports.MessageDeliveryOptions
 	relayIDs            []string
+	recoveryTexts       []string
+	recoveryErr         error
 	stopped             []domain.SessionID
 	backgroundHarnesses []domain.AgentHarness
 	background          []ports.ChatStartConfig
@@ -211,6 +213,11 @@ func (l *recordingLauncher) RelaySessionChatTurn(_ context.Context, _ domain.Ses
 	l.relayIDs = append(l.relayIDs, clientMessageID)
 	l.relayOptions = append(l.relayOptions, options)
 	return "turn-relay", l.turnErr
+}
+
+func (l *recordingLauncher) RelaySessionChatTurnIfIdle(_ context.Context, _ domain.SessionID, text string) error {
+	l.recoveryTexts = append(l.recoveryTexts, text)
+	return l.recoveryErr
 }
 
 func (l *recordingLauncher) StopChat(_ context.Context, id domain.SessionID) error { //nolint:unparam

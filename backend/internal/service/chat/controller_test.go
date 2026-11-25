@@ -7222,3 +7222,29 @@ func TestReservedBoundaryAdoptsSuccessorHandleWithoutRewritingHistory(t *testing
 		t.Fatalf("ancestor branch = %+v, want the recorded handle untouched", keptSource)
 	}
 }
+
+func TestRelaySessionChatTurnIfIdleDispatchesWhenIdle(t *testing.T) {
+	h := newHarness(t)
+	if err := h.svc.RelaySessionChatTurnIfIdle(context.Background(), testSession, "recovery"); err != nil {
+		t.Fatalf("RelaySessionChatTurnIfIdle: %v", err)
+	}
+	sent := h.conv.sentTexts()
+	if len(sent) != 1 || sent[0] != "recovery" {
+		t.Fatalf("idle protected delivery = %v, want one recovery prompt", sent)
+	}
+}
+
+func TestRelaySessionChatTurnIfIdleRefusesBusyWithoutQueuing(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "running", Origin: domain.MessageOriginHuman}); err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	before := len(h.conv.sentMessages())
+	if err := h.svc.RelaySessionChatTurnIfIdle(ctx, testSession, "must not queue"); !errors.Is(err, chatsvc.ErrControllerBusy) {
+		t.Fatalf("protected delivery error = %v, want ErrControllerBusy", err)
+	}
+	if after := len(h.conv.sentMessages()); after != before {
+		t.Fatalf("busy protected delivery reached provider: before=%d after=%d", before, after)
+	}
+}
