@@ -38,6 +38,7 @@ type Store interface {
 	GetProject(ctx context.Context, id string) (domain.ProjectRecord, bool, error)
 	GetPR(ctx context.Context, url string) (domain.PullRequest, bool, error)
 	GetSessionPROwnership(ctx context.Context, prURL string) (domain.SessionPROwnership, bool, error)
+	ListSessionBranchTips(ctx context.Context, instanceID string) ([]domain.SessionBranchTip, error)
 	EnqueueTrackerWriteback(ctx context.Context, w domain.TrackerWriteback) (bool, error)
 	ClaimTrackerWriteback(ctx context.Context, now time.Time) (domain.TrackerWriteback, bool, error)
 	FinishTrackerWriteback(ctx context.Context, id, status, commentURL, failureCode string, now time.Time) (bool, error)
@@ -132,12 +133,16 @@ func (s *Service) Enqueue(ctx context.Context, sessionID domain.SessionID, prURL
 		s.logger.Warn("tracker writeback: rejected PR head", "session", rec.ID, "reason", "pr_head_changed")
 		return nil
 	}
-	ownership, owned, err := s.store.GetSessionPROwnership(ctx, prURL)
+	candidate, ok, err := s.publicationCandidate(ctx, rec, pr)
 	if err != nil {
-		return fmt.Errorf("load PR ownership for tracker writeback: %w", err)
+		return fmt.Errorf("load PR publication evidence for tracker writeback: %w", err)
 	}
-	if !ok || !owned || !exactPROwnership(pr, rec, ownership) {
+	if !ok || !candidate.Exact() {
 		s.logger.Warn("tracker writeback: rejected PR association", "session", rec.ID, "reason", "pr_ownership_missing_or_mismatched")
+		return nil
+	}
+	if !candidate.Ready() {
+		s.logger.Warn("tracker writeback: rejected PR readiness", "session", rec.ID, "reason", "pr_not_ready")
 		return nil
 	}
 	now := s.now()
@@ -246,12 +251,7 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 		settle(domain.TrackerWritebackFailed, "", "pr_read")
 		return err
 	}
-	ownership, owned, err := s.store.GetSessionPROwnership(ctx, row.PRURL)
-	if err != nil {
-		settle(domain.TrackerWritebackFailed, "", "pr_ownership_read")
-		return err
-	}
-	if !ok || !owned || !exactPROwnership(pr, rec, ownership) {
+	if !ok {
 		settle(domain.TrackerWritebackFailed, "", "pr_association_invalid")
 		return nil
 	}
@@ -259,7 +259,16 @@ func (s *Service) ProcessOnce(ctx context.Context) error {
 		settle(domain.TrackerWritebackFailed, "", "pr_head_changed")
 		return nil
 	}
-	freshCode := s.verifyFreshPR(ctx, pr, ownership, row)
+	candidate, ok, err := s.publicationCandidate(ctx, rec, pr)
+	if err != nil {
+		settle(domain.TrackerWritebackFailed, "", "pr_ownership_read")
+		return err
+	}
+	if !ok || !candidate.Exact() {
+		settle(domain.TrackerWritebackFailed, "", "pr_association_invalid")
+		return nil
+	}
+	freshCode := s.verifyFreshPR(ctx, pr, candidate.Ownership, row)
 	if freshCode != "" {
 		settle(domain.TrackerWritebackFailed, "", freshCode)
 		return nil
@@ -326,18 +335,51 @@ func (s *Service) Start(ctx context.Context) <-chan struct{} {
 	return done
 }
 
-// exactPROwnership requires the durable instance/repository/branch/head chain
-// recorded by the observer. Timestamps and branch prefixes are never ownership
-// evidence.
-func exactPROwnership(pr domain.PullRequest, rec domain.SessionRecord, ownership domain.SessionPROwnership) bool {
+// publicationCandidate requires the durable instance/repository/branch/head
+// chain recorded by the observer, including the exact registered branch tip.
+// Timestamps, root branches, and branch prefixes are never ownership evidence.
+func (s *Service) publicationCandidate(ctx context.Context, rec domain.SessionRecord, pr domain.PullRequest) (domain.PRPublicationEvidence, bool, error) {
 	repoKey, _, ok := repositoryForPR(pr)
-	return ok && rec.InstanceID != "" &&
-		pr.SessionID == rec.ID &&
-		ownership.PRURL == pr.URL &&
-		ownership.SessionInstanceID == rec.InstanceID &&
-		ownership.RepoKey == repoKey &&
-		ownership.SourceBranch == pr.SourceBranch &&
-		ownership.HeadSHA == pr.HeadSHA
+	if !ok {
+		return domain.PRPublicationEvidence{}, false, nil
+	}
+	ownership, owned, err := s.store.GetSessionPROwnership(ctx, pr.URL)
+	if err != nil {
+		return domain.PRPublicationEvidence{}, false, err
+	}
+	if !owned {
+		return domain.PRPublicationEvidence{}, false, nil
+	}
+	tips, err := s.store.ListSessionBranchTips(ctx, rec.InstanceID)
+	if err != nil {
+		return domain.PRPublicationEvidence{}, false, err
+	}
+	tipRegistered := false
+	for _, tip := range tips {
+		if tip.SessionInstanceID == rec.InstanceID &&
+			tip.RepoKey == repoKey &&
+			tip.Branch == pr.SourceBranch &&
+			tip.HeadSHA == pr.HeadSHA {
+			tipRegistered = true
+			break
+		}
+	}
+	candidate := domain.PRPublicationEvidence{
+		SessionID:     rec.ID,
+		InstanceID:    rec.InstanceID,
+		RepoKey:       repoKey,
+		SessionPR:     pr.SessionID == rec.ID,
+		PRURL:         pr.URL,
+		SourceBranch:  pr.SourceBranch,
+		HeadSHA:       pr.HeadSHA,
+		Draft:         pr.Draft,
+		Merged:        pr.Merged,
+		Closed:        pr.Closed,
+		CI:            pr.CI,
+		Ownership:     ownership,
+		TipRegistered: tipRegistered,
+	}
+	return candidate, true, nil
 }
 
 // repositoryForPR reconstructs the canonical repository identity from the

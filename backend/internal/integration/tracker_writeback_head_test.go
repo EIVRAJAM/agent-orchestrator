@@ -93,6 +93,7 @@ func newTrackerHeadFixture(t *testing.T) *trackerHeadFixture {
 		SourceBranch:      "feat/x",
 		TargetBranch:      "main",
 		HeadSHA:           "sha-expected",
+		CI:                domain.CIPassing,
 		Title:             "PR",
 		CreatedAtProvider: now,
 		UpdatedAt:         now,

@@ -61,7 +61,7 @@ The equivalent full-config fragment is:
 
 This does not close or transition issues, change labels/assignees/milestones, or merge anything. Only the PR URL is written; issue titles, bodies, comments, prompts, and agent output are never echoed. Delivery uses the tracker authentication already configured for intake.
 
-AO records a durable intent keyed by project, canonical issue ID, and PR URL. Repeated observations or restarts cannot enqueue a second comment. If a provider response is lost after the request, the row is marked `uncertain` and is deliberately not retried: at-most-once is safer than risking a duplicate comment. A project opt-in does not guarantee a comment if the tracker token lacks comment scope; that failure remains visible in the write-back state and logs without exposing tokens or issue content.
+AO records a durable intent keyed by project, canonical issue ID, and PR URL. Repeated observations or restarts cannot enqueue a second comment. The intent is admitted only when the PR is owned by the session's exact instance, repository, source branch, head, and registered branch tip, and the PR is open with green CI; a session root-branch name or a branch prefix is never used to attribute a PR. If a provider response is lost after the request, the row is marked `uncertain` and is deliberately not retried: at-most-once is safer than risking a duplicate comment. A project opt-in does not guarantee a comment if the tracker token lacks comment scope; that failure remains visible in the write-back state and logs without exposing tokens or issue content.
 
 Inspect the durable states without mutating them:
 
