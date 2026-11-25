@@ -717,6 +717,7 @@ type Session struct {
 	BranchState                      string
 	RequestedOutput                  string
 	InstanceID                       string
+	RecoveryEligible                 int64
 }
 
 type SessionArtifactVersion struct {

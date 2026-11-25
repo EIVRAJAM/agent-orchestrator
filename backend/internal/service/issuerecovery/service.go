@@ -106,7 +106,7 @@ func (s *Service) ScanOnce(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if rec.IssueID == "" || rec.Kind != domain.KindWorker || rec.IsTerminated || rec.FirstSignalAt.IsZero() {
+		if rec.IssueID == "" || rec.Kind != domain.KindWorker || rec.IsTerminated || rec.FirstSignalAt.IsZero() || !rec.RecoveryEligible {
 			continue
 		}
 		if rec.Activity.State != domain.ActivityIdle && rec.Activity.State != domain.ActivityExited {

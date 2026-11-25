@@ -25,6 +25,9 @@ func TestIssueRecoveryAttemptSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !created.RecoveryEligible {
+		t.Fatal("new issue worker was not marked recovery eligible")
+	}
 	now := time.Now().UTC().Truncate(time.Second)
 	row := domain.IssueRecovery{
 		SessionID: created.ID, IssueID: created.IssueID, InstanceID: created.InstanceID,
@@ -47,6 +50,10 @@ func TestIssueRecoveryAttemptSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = reopened.Close() }()
+	reloaded, found, err := reopened.GetSession(ctx, created.ID)
+	if err != nil || !found || !reloaded.RecoveryEligible {
+		t.Fatalf("reopened session eligibility = found=%v eligible=%v err=%v", found, reloaded.RecoveryEligible, err)
+	}
 	got, found, err := reopened.GetIssueRecovery(ctx, created.ID)
 	if err != nil || !found {
 		t.Fatalf("get after reopen = found=%v err=%v", found, err)

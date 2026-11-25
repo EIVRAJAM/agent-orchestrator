@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 )
 
 type fakeStore struct {
+	mu       sync.Mutex
 	sessions []domain.SessionRecord
 	rows     map[domain.SessionID]domain.IssueRecovery
 	ensure   int
@@ -24,15 +26,21 @@ func newFakeStore(rec domain.SessionRecord) *fakeStore {
 }
 
 func (f *fakeStore) ListAllSessions(context.Context) ([]domain.SessionRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return append([]domain.SessionRecord(nil), f.sessions...), nil
 }
 
 func (f *fakeStore) GetIssueRecovery(_ context.Context, id domain.SessionID) (domain.IssueRecovery, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	row, ok := f.rows[id]
 	return row, ok, nil
 }
 
 func (f *fakeStore) EnsureIssueRecovery(_ context.Context, rec domain.IssueRecovery) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.ensure++
 	if _, ok := f.rows[rec.SessionID]; ok {
 		return false, nil
@@ -44,6 +52,8 @@ func (f *fakeStore) EnsureIssueRecovery(_ context.Context, rec domain.IssueRecov
 }
 
 func (f *fakeStore) UpdateIssueRecoveryObservation(_ context.Context, rec domain.IssueRecovery) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	row, ok := f.rows[rec.SessionID]
 	if !ok || row.InstanceID != rec.InstanceID || (row.State != domain.IssueRecoveryObserving && row.State != domain.IssueRecoveryContinued) {
 		return false, nil
@@ -55,6 +65,8 @@ func (f *fakeStore) UpdateIssueRecoveryObservation(_ context.Context, rec domain
 }
 
 func (f *fakeStore) ClaimIssueRecovery(_ context.Context, id domain.SessionID, instanceID string, now time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.claims++
 	row, ok := f.rows[id]
 	if !ok || row.InstanceID != instanceID || row.State != domain.IssueRecoveryObserving || row.Attempts != 0 {
@@ -69,6 +81,8 @@ func (f *fakeStore) ClaimIssueRecovery(_ context.Context, id domain.SessionID, i
 }
 
 func (f *fakeStore) FinishIssueRecovery(_ context.Context, rec domain.IssueRecovery, now time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.finishes++
 	row, ok := f.rows[rec.SessionID]
 	if !ok || row.State == domain.IssueRecoveryComplete || row.InstanceID != rec.InstanceID {
@@ -94,12 +108,15 @@ func (f fakeSessions) Get(_ context.Context, id domain.SessionID) (domain.Sessio
 }
 
 type fakeSender struct {
+	mu      sync.Mutex
 	ids     []domain.SessionID
 	prompts []string
 	err     error
 }
 
 func (f *fakeSender) Send(_ context.Context, id domain.SessionID, message string, _ *ports.SpawnAttachment) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.ids = append(f.ids, id)
 	f.prompts = append(f.prompts, message)
 	return f.err
@@ -107,12 +124,13 @@ func (f *fakeSender) Send(_ context.Context, id domain.SessionID, message string
 
 func recoveryFixture(incompleteReason domain.IssuePublicationReason, commits int) (domain.Session, *fakeStore, *fakeSender) {
 	rec := domain.SessionRecord{
-		ID:            "worker-1",
-		IssueID:       "github:acme/demo#1",
-		InstanceID:    "inst-1",
-		Kind:          domain.KindWorker,
-		Activity:      domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Unix(100, 0).UTC()},
-		FirstSignalAt: time.Unix(100, 0).UTC(),
+		ID:               "worker-1",
+		IssueID:          "github:acme/demo#1",
+		InstanceID:       "inst-1",
+		Kind:             domain.KindWorker,
+		RecoveryEligible: true,
+		Activity:         domain.Activity{State: domain.ActivityIdle, LastActivityAt: time.Unix(100, 0).UTC()},
+		FirstSignalAt:    time.Unix(100, 0).UTC(),
 	}
 	if commits > 0 {
 		rec.BranchState = &domain.SessionBranchState{Branch: "ao/worker-1/task", HeadSHA: "head-1", Commits: commits, Unpushed: commits}
@@ -273,6 +291,72 @@ func TestRestartDoesNotResetConsumedAttempt(t *testing.T) {
 	}
 	if row := store.rows["worker-1"]; row.Attempts != 1 || row.State != domain.IssueRecoveryIncomplete {
 		t.Fatalf("persisted row = %+v, want one consumed attempt", row)
+	}
+}
+
+func TestHistoricalIneligibleSessionIsNotContinued(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sess.RecoveryEligible = false
+	store.mu.Lock()
+	store.sessions[0].RecoveryEligible = false
+	store.mu.Unlock()
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 0 {
+		t.Fatalf("sent %d continuations for a historical ineligible session", len(sender.ids))
+	}
+	if len(store.rows) != 0 {
+		t.Fatalf("created recovery rows for ineligible session: %+v", store.rows)
+	}
+	if store.claims != 0 {
+		t.Fatalf("consumed %d claims for ineligible session", store.claims)
+	}
+}
+
+func TestConcurrentScansClaimOnlyOnce(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	svc := New(store, fakeSessions{sessions: map[domain.SessionID]domain.Session{sess.ID: sess}}, sender, nil, time.Minute)
+	svc.clock = func() time.Time { return time.Unix(200, 0).UTC() }
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := svc.ScanOnce(context.Background()); err != nil {
+				t.Errorf("scan: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if len(sender.ids) != 1 {
+		t.Fatalf("concurrent scans sent %d continuations, want exactly 1", len(sender.ids))
+	}
+	store.mu.Lock()
+	row := store.rows["worker-1"]
+	store.mu.Unlock()
+	if row.Attempts != 1 {
+		t.Fatalf("concurrent claims persisted %d attempts, want 1", row.Attempts)
+	}
+}
+
+func TestIdleWithoutPublicationDoesNotStart(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sess.IssuePublication = nil
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 0 || len(store.rows) != 0 || store.claims != 0 {
+		t.Fatalf("idle without publication started recovery: sends=%d rows=%d claims=%d", len(sender.ids), len(store.rows), store.claims)
+	}
+}
+
+func TestInterruptedTurnDoesNotConsumeAttempt(t *testing.T) {
+	sess, store, sender := recoveryFixture(domain.IssuePublicationReasonIssuePRMissing, 0)
+	sess.Activity.State = domain.ActivityExited
+	sess.IssuePublication.Turn = domain.IssuePublicationTurnInterrupted
+	runScan(t, sess, store, sender)
+	if len(sender.ids) != 0 || store.claims != 0 {
+		t.Fatalf("interrupted turn consumed recovery: sends=%d claims=%d", len(sender.ids), store.claims)
+	}
+	if row := store.rows["worker-1"]; row.Attempts != 0 || row.State != domain.IssueRecoveryIncomplete {
+		t.Fatalf("interrupted turn row = %+v, want incomplete with zero attempts", row)
 	}
 }
 

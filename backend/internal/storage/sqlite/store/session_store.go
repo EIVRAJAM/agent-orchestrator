@@ -131,6 +131,9 @@ func (s *Store) createSessionLocked(ctx context.Context, rec domain.SessionRecor
 	// copying a SessionRecord (as tests and some clone paths do) must never merge
 	// ownership namespaces.
 	rec.InstanceID = uuid.NewString()
+	if rec.IssueID != "" {
+		rec.RecoveryEligible = true
+	}
 	if err := s.qw.InsertSession(ctx, recordToInsert(rec, num)); err != nil {
 		if rec.ClientRequestID != "" {
 			existing, found, reloadErr := s.getSessionByClientRequestID(ctx, s.qw, rec.ClientRequestID)
@@ -858,6 +861,7 @@ func rowToRecord(row gen.GetSessionRow) domain.SessionRecord {
 			LastActivityAt: row.ActivityLastAt,
 		},
 		FirstSignalAt:      nullTimeToTime(row.FirstSignalAt),
+		RecoveryEligible:   row.RecoveryEligible != 0,
 		IsTerminated:       row.IsTerminated,
 		HibernatedAt:       nullTimeToTimePtr(row.HibernatedAt),
 		IsPinned:           row.IsPinned,
@@ -1020,6 +1024,7 @@ func recordToInsert(rec domain.SessionRecord, num int64) gen.InsertSessionParams
 		AutomationLaunchCompleted:        rec.AutomationLaunchCompleted,
 		ClientRequestID:                  rec.ClientRequestID,
 		ClientRequestHash:                rec.ClientRequestHash,
+		RecoveryEligible:                 boolInt(rec.RecoveryEligible),
 	}
 }
 
